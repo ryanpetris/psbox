@@ -44,13 +44,6 @@ func provideStarter(u *systemd.User) instance.Starter { return u }
 
 func provideControl(u *systemd.User) systemd.Control { return u }
 
-// NewLogger returns the CLI structured logger.
-func NewLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-}
-
 // Run constructs the CLI and executes it. It returns a process exit code.
 func Run() int {
 	var root *cobra.Command

@@ -207,6 +207,7 @@ ones.
 | `PSBOX_OBJECT_PATH` | `$XDG_CONFIG_HOME/psbox/objects` | Objects directory |
 | `PSBOX_ROOT` | `$HOME/Sandbox` | Default private-home parent |
 | `PSBOX_AGENT_BIN` | `/usr/bin/psboxa` | In-sandbox agent binary |
+| `PSBOX_LOG` | unset | CLI log presentation. Unset prints only the message. `structured` prints slog text. |
 | `XDG_CONFIG_HOME` | `~/.config` | Objects default, desktop install |
 | `XDG_DATA_HOME` | `~/.local/share` | Desktop install |
 | `XDG_RUNTIME_DIR` | `/run/user/<uid>` | Instance sockets, sandbox tmpfs |

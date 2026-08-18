@@ -3,7 +3,8 @@
 The `psbox` binary is the host CLI. Incidental status and warnings go
 to stderr. stdout is for `--print` / `--print-bwrap`, foreground
 application output, and scripting commands (`objects list`,
-`objects render`).
+`objects render`). Log lines are the message only. Set
+`PSBOX_LOG=structured` for slog text.
 
 ## `psbox launch`
 

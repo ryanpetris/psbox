@@ -114,7 +114,7 @@ func (l *Loader) loadFile(path string) ([]any, error) {
 		if err != nil {
 			// A syntax error leaves the decoder at the same
 			// position; continuing would warn forever.
-			l.log.Warn("skipping object", "file", path, "error", err)
+			l.skipObject(path, err)
 			break
 		}
 		raws = append(raws, raw)
@@ -124,7 +124,7 @@ func (l *Loader) loadFile(path string) ([]any, error) {
 	for i := range raws {
 		obj, err := parseObject(path, &raws[i])
 		if err != nil {
-			l.log.Warn("skipping object", "file", path, "error", err)
+			l.skipObject(path, err)
 			continue
 		}
 		objs = append(objs, obj)
@@ -499,31 +499,35 @@ func fixupSameFile(path string, objs []any) []any {
 	return objs
 }
 
+func (l *Loader) skipObject(path string, err error) {
+	l.log.Warn(fmt.Sprintf("skipping object %s: %v", path, err), "file", path, "error", err)
+}
+
 func (l *Loader) add(col *Collection, obj any) {
 	switch v := obj.(type) {
 	case *Application:
 		if v.Name == "" {
-			l.log.Warn("skipping object", "file", v.File, "error", "application name is empty")
+			l.skipObject(v.File, fmt.Errorf("application name is empty"))
 			return
 		}
 		if _, ok := col.Applications[v.Name]; ok {
-			l.log.Warn("duplicate application definition", "name", v.Name, "file", v.File)
+			l.log.Warn(fmt.Sprintf("duplicate application definition %s (%s)", v.Name, v.File), "name", v.Name, "file", v.File)
 		}
 		col.Applications[v.Name] = v
 	case *DesktopEntry:
 		if v.Name == "" {
-			l.log.Warn("skipping object", "file", v.File, "error", "desktop entry name is empty")
+			l.skipObject(v.File, fmt.Errorf("desktop entry name is empty"))
 			return
 		}
 		switch v.Kind {
 		case KindFreedesktopEntry:
 			if _, ok := col.FreedesktopEntries[v.Name]; ok {
-				l.log.Warn("duplicate desktop entry definition", "name", v.Name, "file", v.File)
+				l.log.Warn(fmt.Sprintf("duplicate desktop entry definition %s (%s)", v.Name, v.File), "name", v.Name, "file", v.File)
 			}
 			col.FreedesktopEntries[v.Name] = v
 		case KindFreedesktopAutostartEntry:
 			if _, ok := col.FreedesktopAutostartEntries[v.Name]; ok {
-				l.log.Warn("duplicate autostart entry definition", "name", v.Name, "file", v.File)
+				l.log.Warn(fmt.Sprintf("duplicate autostart entry definition %s (%s)", v.Name, v.File), "name", v.Name, "file", v.File)
 			}
 			col.FreedesktopAutostartEntries[v.Name] = v
 		}

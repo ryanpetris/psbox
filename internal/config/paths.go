@@ -14,6 +14,10 @@ const (
 	EnvObjectPath = "PSBOX_OBJECT_PATH"
 	EnvRoot       = "PSBOX_ROOT"
 	EnvAgent      = "PSBOX_AGENT_BIN"
+	// EnvLog selects CLI log presentation. Unset prints only the
+	// message. LogStructured enables slog text.
+	EnvLog        = "PSBOX_LOG"
+	LogStructured = "structured"
 
 	DefaultRootRelative      = "Sandbox"
 	DefaultObjectDirRelative = "psbox/objects"

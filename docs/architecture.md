@@ -63,8 +63,9 @@ and drops `DBUS_SESSION_BUS_PID` / `DBUS_SESSION_BUS_WINDOWID`.
 
 ## Logging
 
-JSON on stderr from `psboxd` and `psboxa`. The CLI writes plain text to
-stderr.
+JSON on stderr from `psboxd` and `psboxa`. The CLI prints only the log
+message on stderr. Set `PSBOX_LOG=structured` for slog text (time,
+level, message, and attributes).
 
 ## Packaging and objects
 
