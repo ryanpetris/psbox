@@ -72,8 +72,12 @@ warns when the hashes in `spawned` differ from the hashes it computed.
 
 ## Liveness and idle
 
-`psboxa` treats the private `dbus-daemon` as infrastructure. Other
-processes are workload. After 60 seconds with no workload it exits.
+`psboxa` treats the private `dbus-daemon` as infrastructure. A process
+first seen as its child stays infrastructure after it reparents to
+PID 1. Processes with `DBUS_STARTER_ADDRESS` or
+`DBUS_STARTER_BUS_TYPE` (D-Bus activation) are infrastructure too.
+Other processes are workload. After 60 seconds with no workload it
+exits.
 
 `psboxd` polls accept with a 1 second deadline. If `bwrap` is gone and
 no clients remain, `psboxd` exits. The socket unit stays and will start

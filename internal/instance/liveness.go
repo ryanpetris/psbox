@@ -24,15 +24,25 @@ type InfraRoot struct {
 	StartTime uint64
 }
 
-// WorkloadPresent reports whether any process is workload, not infrastructure.
-func WorkloadPresent(self, pid1 int, roots []InfraRoot, procs []Proc) bool {
+func expandInfra(self, pid1 int, seeds []InfraRoot, procs []Proc, extra func(Proc) bool) map[string]struct{} {
 	infra := map[string]struct{}{}
-	for _, r := range roots {
+	for _, r := range seeds {
 		if r.PID == self || r.PID == pid1 || r.PID <= 0 {
 			continue
 		}
 		infra[procKey(r.PID, r.StartTime)] = struct{}{}
 	}
+	if extra != nil {
+		for _, p := range procs {
+			if p.PID == self || p.PID == pid1 {
+				continue
+			}
+			if extra(p) {
+				infra[procKey(p.PID, p.StartTime)] = struct{}{}
+			}
+		}
+	}
+
 	byPID := map[int]Proc{}
 	for _, p := range procs {
 		byPID[p.PID] = p
@@ -41,7 +51,8 @@ func WorkloadPresent(self, pid1 int, roots []InfraRoot, procs []Proc) bool {
 	for changed {
 		changed = false
 		for _, p := range procs {
-			if _, ok := infra[procKey(p.PID, p.StartTime)]; ok {
+			key := procKey(p.PID, p.StartTime)
+			if _, ok := infra[key]; ok {
 				continue
 			}
 			parent, ok := byPID[p.PPID]
@@ -49,11 +60,15 @@ func WorkloadPresent(self, pid1 int, roots []InfraRoot, procs []Proc) bool {
 				continue
 			}
 			if _, ok := infra[procKey(parent.PID, parent.StartTime)]; ok {
-				infra[procKey(p.PID, p.StartTime)] = struct{}{}
+				infra[key] = struct{}{}
 				changed = true
 			}
 		}
 	}
+	return infra
+}
+
+func hasWorkload(self, pid1 int, infra map[string]struct{}, procs []Proc) bool {
 	for _, p := range procs {
 		if p.PID == self || p.PID == pid1 {
 			continue
@@ -62,6 +77,36 @@ func WorkloadPresent(self, pid1 int, roots []InfraRoot, procs []Proc) bool {
 			continue
 		}
 		return true
+	}
+	return false
+}
+
+func rememberInfra(infra map[string]struct{}, procs []Proc) []InfraRoot {
+	out := make([]InfraRoot, 0, len(infra))
+	for _, p := range procs {
+		if _, ok := infra[procKey(p.PID, p.StartTime)]; ok {
+			out = append(out, InfraRoot{PID: p.PID, StartTime: p.StartTime})
+		}
+	}
+	return out
+}
+
+func hasDBusStarter(procDir string, pid int) bool {
+	data, err := os.ReadFile(filepath.Join(procDir, strconv.Itoa(pid), "environ"))
+	if err != nil {
+		return false
+	}
+	return environHasDBusStarter(data)
+}
+
+func environHasDBusStarter(data []byte) bool {
+	for len(data) > 0 {
+		var kv []byte
+		kv, data, _ = bytes.Cut(data, []byte{0})
+		if bytes.HasPrefix(kv, []byte("DBUS_STARTER_ADDRESS=")) ||
+			bytes.HasPrefix(kv, []byte("DBUS_STARTER_BUS_TYPE=")) {
+			return true
+		}
 	}
 	return false
 }

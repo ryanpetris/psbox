@@ -30,6 +30,7 @@ type Agent struct {
 	spawns     map[string]*spawnSession
 	live       int
 	infra      []InfraRoot
+	infraSeen  []InfraRoot
 	busAddr    string
 	busProc    *os.Process
 	lastBusy   time.Time
@@ -193,7 +194,8 @@ func (a *Agent) spawn(conn *net.UnixConn, msg Message, files []*os.File) error {
 		cwd = "/"
 	}
 
-	proc, err := os.StartProcess(lookPath(msg.Argv[0], env), msg.Argv, &os.ProcAttr{
+	cmd := msg.Argv[0]
+	proc, err := os.StartProcess(lookPath(cmd, env), msg.Argv, &os.ProcAttr{
 		Dir:   cwd,
 		Env:   mapEnv(env),
 		Files: []*os.File{stdin, stdout, stderr},
@@ -214,6 +216,7 @@ func (a *Agent) spawn(conn *net.UnixConn, msg Message, files []*os.File) error {
 	a.live++
 	a.lastBusy = a.now()
 	a.mu.Unlock()
+	a.log.Info("command started", "command", cmd, "pid", proc.Pid)
 
 	if err := WriteMsg(conn, Message{Type: TypeSpawned, ID: msg.ID, PID: proc.Pid}, nil); err != nil {
 		return err
@@ -227,6 +230,7 @@ func (a *Agent) spawn(conn *net.UnixConn, msg Message, files []*os.File) error {
 		a.live--
 		a.lastBusy = a.now()
 		a.mu.Unlock()
+		a.log.Info("command exited", "command", cmd, "pid", proc.Pid, "code", code, "signal", sig)
 		_ = WriteMsg(conn, Message{Type: TypeExited, ID: msg.ID, Code: intPtr(code), Signal: sigPtr(sig)}, nil)
 	}()
 	return nil
@@ -254,12 +258,22 @@ func (a *Agent) workload() bool {
 	}
 	a.mu.Lock()
 	roots := append([]InfraRoot(nil), a.infra...)
+	seen := append([]InfraRoot(nil), a.infraSeen...)
 	live := a.live
+	procDir := a.procDir
 	a.mu.Unlock()
 	if live > 0 {
 		return true
 	}
-	return WorkloadPresent(os.Getpid(), 1, roots, procs)
+
+	seeds := append(append([]InfraRoot(nil), roots...), seen...)
+	infra := expandInfra(os.Getpid(), 1, seeds, procs, func(p Proc) bool {
+		return hasDBusStarter(procDir, p.PID)
+	})
+	a.mu.Lock()
+	a.infraSeen = rememberInfra(infra, procs)
+	a.mu.Unlock()
+	return hasWorkload(os.Getpid(), 1, infra, procs)
 }
 
 func (a *Agent) shouldExit() bool {

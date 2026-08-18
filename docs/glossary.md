@@ -70,7 +70,9 @@ tmpfs. `:none:` binds no home.
 
 An application process started by a spawn, plus any descendants that
 are not infrastructure. The private session `dbus-daemon` is
-infrastructure and does not keep an idle instance alive by itself.
+infrastructure, as are processes it activated (including after they
+reparent to PID 1). Those do not keep an idle instance alive by
+themselves.
 
 ## `psbox`
 

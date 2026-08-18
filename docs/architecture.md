@@ -63,9 +63,10 @@ and drops `DBUS_SESSION_BUS_PID` / `DBUS_SESSION_BUS_WINDOWID`.
 
 ## Logging
 
-JSON on stderr from `psboxd` and `psboxa`. The CLI prints only the log
-message on stderr. Set `PSBOX_LOG=structured` for slog text (time,
-level, message, and attributes).
+JSON on stderr from `psboxd` and `psboxa`. `psboxa` logs when a
+workload command starts and exits; `command` is `argv[0]` only. The
+CLI prints only the log message on stderr. Set `PSBOX_LOG=structured`
+for slog text (time, level, message, and attributes).
 
 ## Packaging and objects
 
