@@ -146,7 +146,8 @@ Before adding or updating a module:
 If a license is missing or ambiguous, stop before accepting the
 dependency. This Go-module policy does not apply to external programs
 psbox invokes (`bwrap`, `dbus-daemon`, `xdg-open`). The host CLI talks
-to the systemd user manager over its private D-Bus socket.
+to the systemd user manager on the session bus first, then
+`$XDG_RUNTIME_DIR/systemd/private`.
 Artifacts psbox redistributes still require review under their
 distribution terms.
 
