@@ -42,6 +42,19 @@ func TestComposeDownloads(t *testing.T) {
 	}
 }
 
+func TestComposeNewSession(t *testing.T) {
+	t.Parallel()
+
+	env := Env{Home: "/home/u", RuntimeDir: "/run/user/1000"}
+	got := Compose(Flags{NoHome: true, NoAudio: true, NoVideo: true, NoDBus: true, NoFontconfig: true, NoUdev: true, NoEvdev: true, NoDisplay: true}, env)
+	if !slices.Contains(got, "--new-session") {
+		t.Fatalf("missing --new-session: %v", got)
+	}
+	if !containsSeq(got, "--die-with-parent", "--unshare-pid", "--new-session") {
+		t.Fatalf("isolation flags should be together: %v", got)
+	}
+}
+
 func TestComposeDBusBinds(t *testing.T) {
 	t.Parallel()
 

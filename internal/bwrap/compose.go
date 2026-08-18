@@ -13,7 +13,7 @@ const BwrapPath = "/usr/bin/bwrap"
 // Compose builds the bwrap option flags (no trailing command).
 func Compose(f Flags, env Env) []string {
 	var args []string
-	args = append(args, "--die-with-parent", "--unshare-pid")
+	args = append(args, "--die-with-parent", "--unshare-pid", "--new-session")
 	args = append(args, "--proc", "/proc")
 	args = append(args, "--dev", "/dev")
 	args = append(args, "--tmpfs", "/tmp")

@@ -30,10 +30,10 @@ the workload. Those are not self-calls.
 
 ## Compose
 
-Every sandbox gets `--die-with-parent` and `--unshare-pid`, a fresh
-`/proc`, `/dev`, and `/tmp`, and read-only tries of `/usr`, `/etc`,
-`/opt`, `/sys`, plus usrmerge symlinks for `/bin`, `/sbin`, `/lib`, and
-`/lib64`.
+Every sandbox gets `--die-with-parent`, `--unshare-pid`, and
+`--new-session`, a fresh `/proc`, `/dev`, and `/tmp`, and read-only
+tries of `/usr`, `/etc`, `/opt`, `/sys`, plus usrmerge symlinks for
+`/bin`, `/sbin`, `/lib`, and `/lib64`.
 
 `$XDG_RUNTIME_DIR` is a tmpfs. Selected sockets are bound back in:
 Wayland, Pulse, PipeWire, and D-Bus sockets when enabled. `dbus:
