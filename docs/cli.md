@@ -73,7 +73,8 @@ identity (`firefox` or `firefox/work`), the full `sandbox/default`
 form, or a listed escaped `%i`. Unknown names are an error.
 
 `stop --all` stops every listed identity. It is not an error if none
-exist.
+exist. List and stop time out each user-manager D-Bus call and retry
+a timed-out or disconnected call up to three times.
 
 ## `psbox objects`
 

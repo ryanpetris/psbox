@@ -3,6 +3,8 @@ package systemd
 // User D-Bus client tests.
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/godbus/dbus/v5"
@@ -47,5 +49,30 @@ func TestParseJobRemoved(t *testing.T) {
 
 	if _, _, ok := parseJobRemoved([]any{"bad"}, want); ok {
 		t.Fatal("short body")
+	}
+}
+
+func TestWaitJobRemovedDone(t *testing.T) {
+	t.Parallel()
+
+	want := dbus.ObjectPath("/org/freedesktop/systemd1/job/3")
+	sigc := make(chan *dbus.Signal, 1)
+	sigc <- &dbus.Signal{
+		Name: jobSignal,
+		Body: []any{uint32(3), want, "psboxd@x.socket", "done"},
+	}
+	if err := waitJobRemoved(t.Context(), sigc, want, "StartUnit", "psboxd@x.socket"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitJobRemovedRespectsContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := waitJobRemoved(ctx, make(chan *dbus.Signal), "/job/1", "StartUnit", "u.socket")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
 	}
 }

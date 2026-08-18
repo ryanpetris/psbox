@@ -1,13 +1,11 @@
 package systemd
 
-// User-manager D-Bus client (same socket systemctl --user uses).
+// User-manager D-Bus client (session bus first, private socket fallback).
 
 import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -48,8 +46,9 @@ type User struct {
 	runtimeDir string
 	uid        int
 
-	mu   sync.Mutex
-	conn *dbus.Conn
+	mu    sync.Mutex
+	conn  *dbus.Conn
+	onBus bool
 }
 
 var _ Control = (*User)(nil)
@@ -65,68 +64,106 @@ func NewUser() *User {
 
 // Start starts unit and waits for the systemd job to finish.
 func (u *User) Start(ctx context.Context, unit string) error {
-	return u.runJob(ctx, "StartUnit", unit)
+	return u.retry(ctx, func(ctx context.Context) error {
+		err := u.runJob(ctx, "StartUnit", unit)
+		if err == nil {
+			return nil
+		}
+		if active, aerr := u.unitIsActive(ctx, unit); aerr == nil && active {
+			return nil
+		}
+		return err
+	})
 }
 
 // Stop stops unit and waits for the systemd job to finish.
 func (u *User) Stop(ctx context.Context, unit string) error {
-	return u.runJob(ctx, "StopUnit", unit)
+	return u.retry(ctx, func(ctx context.Context) error {
+		err := u.runJob(ctx, "StopUnit", unit)
+		if err == nil {
+			return nil
+		}
+		if active, aerr := u.unitIsActive(ctx, unit); aerr != nil || !active {
+			return nil
+		}
+		return err
+	})
 }
 
 // List returns units matching patterns (for example psboxd@*.socket).
 func (u *User) List(ctx context.Context, patterns []string) ([]Unit, error) {
-	conn, err := u.connection()
-	if err != nil {
-		return nil, err
-	}
+	var out []Unit
+	err := u.retry(ctx, func(ctx context.Context) error {
+		items, err := u.listOnce(ctx, patterns)
+		if err != nil {
+			return err
+		}
+		out = items
+		return nil
+	})
+	return out, err
+}
+
+func (u *User) listOnce(ctx context.Context, patterns []string) ([]Unit, error) {
 	var rows []listRow
-	err = conn.Object(dest, objPath).CallWithContext(ctx, iface+".ListUnitsByPatterns", 0, []string{}, patterns).Store(&rows)
+	err := u.managerCall(ctx, CallTimeout, "ListUnitsByPatterns", []any{[]string{}, patterns}, &rows)
 	if err != nil {
 		return nil, fmt.Errorf("list units: %w", err)
 	}
 	out := make([]Unit, 0, len(rows))
 	for _, row := range rows {
-		u := Unit{
+		item := Unit{
 			Name:        row.Name,
 			ActiveState: row.ActiveState,
 			SubState:    row.SubState,
 			Path:        string(row.Path),
 		}
-		u.enrich(ctx, conn)
-		out = append(out, u)
+		item.enrich(ctx, u)
+		out = append(out, item)
 	}
 	return out, nil
 }
 
-func (u *Unit) enrich(ctx context.Context, conn *dbus.Conn) {
-	if u.Path == "" {
+func (unit *Unit) enrich(ctx context.Context, u *User) {
+	if unit.Path == "" {
 		return
 	}
-	obj := conn.Object(dest, dbus.ObjectPath(u.Path))
-	u.ActiveEnterTimestamp = getUint64Prop(ctx, obj, "org.freedesktop.systemd1.Unit", "ActiveEnterTimestamp")
+	unit.ActiveEnterTimestamp = u.uint64Prop(ctx, dbus.ObjectPath(unit.Path), "org.freedesktop.systemd1.Unit", "ActiveEnterTimestamp")
 	switch {
-	case strings.HasSuffix(u.Name, ".service"):
-		u.MainPID = getUint32Prop(ctx, obj, "org.freedesktop.systemd1.Service", "MainPID")
-		u.NRestarts = getUint32Prop(ctx, obj, "org.freedesktop.systemd1.Service", "NRestarts")
-	case strings.HasSuffix(u.Name, ".socket"):
-		u.NAccepted = getUint32Prop(ctx, obj, "org.freedesktop.systemd1.Socket", "NAccepted")
+	case strings.HasSuffix(unit.Name, ".service"):
+		unit.MainPID = u.uint32Prop(ctx, dbus.ObjectPath(unit.Path), "org.freedesktop.systemd1.Service", "MainPID")
+		unit.NRestarts = u.uint32Prop(ctx, dbus.ObjectPath(unit.Path), "org.freedesktop.systemd1.Service", "NRestarts")
+	case strings.HasSuffix(unit.Name, ".socket"):
+		unit.NAccepted = u.uint32Prop(ctx, dbus.ObjectPath(unit.Path), "org.freedesktop.systemd1.Socket", "NAccepted")
 	}
 }
 
-func getUint32Prop(ctx context.Context, obj dbus.BusObject, iface, name string) uint32 {
-	var v dbus.Variant
-	if err := obj.CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, iface, name).Store(&v); err != nil {
+func (u *User) uint32Prop(ctx context.Context, path dbus.ObjectPath, iface, name string) uint32 {
+	v, err := u.getProp(ctx, path, iface, name)
+	if err != nil {
 		return 0
 	}
 	return variantUint32(v)
 }
 
-func getUint64Prop(ctx context.Context, obj dbus.BusObject, iface, name string) uint64 {
-	var v dbus.Variant
-	if err := obj.CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, iface, name).Store(&v); err != nil {
+func (u *User) uint64Prop(ctx context.Context, path dbus.ObjectPath, iface, name string) uint64 {
+	v, err := u.getProp(ctx, path, iface, name)
+	if err != nil {
 		return 0
 	}
 	return variantUint64(v)
+}
+
+func (u *User) getProp(ctx context.Context, path dbus.ObjectPath, iface, name string) (dbus.Variant, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	conn, err := u.connection(ctx)
+	if err != nil {
+		return dbus.Variant{}, err
+	}
+	var v dbus.Variant
+	err = conn.Object(dest, path).CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, iface, name).Store(&v)
+	return v, err
 }
 
 func variantUint32(v dbus.Variant) uint32 {
@@ -164,82 +201,18 @@ type listRow struct {
 	JobPath     dbus.ObjectPath
 }
 
-func (u *User) runJob(ctx context.Context, method, unit string) error {
-	conn, err := u.connection()
+func (u *User) unitIsActive(ctx context.Context, unit string) (bool, error) {
+	var path dbus.ObjectPath
+	if err := u.managerCall(ctx, CallTimeout, "GetUnit", []any{unit}, &path); err != nil {
+		return false, err
+	}
+	if path == "" {
+		return false, nil
+	}
+	v, err := u.getProp(ctx, path, "org.freedesktop.systemd1.Unit", "ActiveState")
 	if err != nil {
-		return err
+		return false, err
 	}
-
-	sigc := make(chan *dbus.Signal, 16)
-	conn.Signal(sigc)
-	defer conn.RemoveSignal(sigc)
-
-	var job dbus.ObjectPath
-	err = conn.Object(dest, objPath).CallWithContext(ctx, iface+"."+method, 0, unit, mode).Store(&job)
-	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, unit, err)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("%s %s: %w", method, unit, ctx.Err())
-		case sig, ok := <-sigc:
-			if !ok {
-				return fmt.Errorf("%s %s: connection closed", method, unit)
-			}
-			if sig.Name != jobSignal {
-				continue
-			}
-			removed, result, ok := parseJobRemoved(sig.Body, job)
-			if !ok || !removed {
-				continue
-			}
-			if result != "done" {
-				return fmt.Errorf("%s %s: job %s", method, unit, result)
-			}
-			return nil
-		}
-	}
-}
-
-func parseJobRemoved(body []any, want dbus.ObjectPath) (matched bool, result string, ok bool) {
-	if len(body) < 4 {
-		return false, "", false
-	}
-	path, ok := body[1].(dbus.ObjectPath)
-	if !ok {
-		return false, "", false
-	}
-	if path != want {
-		return false, "", true
-	}
-	result, ok = body[3].(string)
-	if !ok {
-		return false, "", false
-	}
-	return true, result, true
-}
-
-func (u *User) connection() (*dbus.Conn, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.conn != nil {
-		return u.conn, nil
-	}
-	path := filepath.Join(u.runtimeDir, "systemd", "private")
-	conn, err := dbus.Dial("unix:path=" + path)
-	if err != nil {
-		return nil, fmt.Errorf("connect to systemd user manager: %w", err)
-	}
-	if err := conn.Auth([]dbus.Auth{dbus.AuthExternal(strconv.Itoa(u.uid))}); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("authenticate to systemd user manager: %w", err)
-	}
-	if err := conn.Object(dest, objPath).Call(iface+".Subscribe", 0).Err; err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("subscribe to systemd jobs: %w", err)
-	}
-	u.conn = conn
-	return conn, nil
+	state, _ := v.Value().(string)
+	return state == "active", nil
 }

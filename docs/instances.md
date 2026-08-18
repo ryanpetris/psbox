@@ -18,7 +18,9 @@ The path must fit in `sockaddr_un.sun_path` (107 bytes plus NUL).
 ## Startup
 
 1. `psbox` starts `psboxd@<escaped>.socket` through the systemd user
-   manager (D-Bus private socket, same peer as `systemctl --user`).
+   manager. It uses the session bus first (`DBUS_SESSION_BUS_ADDRESS`
+   or `$XDG_RUNTIME_DIR/bus`, same as `systemctl --user`). If that
+   bus is missing, it falls back to `$XDG_RUNTIME_DIR/systemd/private`.
 2. It connects with `unixpacket` (SEQPACKET).
 3. It sends one `spawn` JSON frame and passes stdin, stdout, and stderr
    with `SCM_RIGHTS`.
@@ -33,9 +35,19 @@ The CLI starts only that socket unit. systemd socket-activates
 `psboxd@.service`. A failed connect retries the socket start; it does
 not start the service.
 
-The first reply must arrive within 5 seconds. The spawn frame must be
-at most 1 MiB. An oversized environment is rejected with the largest
-variable names in the error.
+Talking to the user manager uses the session bus when it is
+available. On that bus, `psbox` calls `Hello`, `Subscribe`, and
+`AddMatch` for `JobRemoved`. The private socket is AUTH only (no
+`Hello`, no match rules). Each method call has a 2s deadline.
+`StartUnit` / `StopUnit` wait at most 5s for `JobRemoved`. Dial,
+AUTH, `Hello`, and `Subscribe` share a 5s deadline. List and stop
+retry a timed-out or disconnected call up to three times and drop
+the D-Bus connection between tries. Start retries only while the
+unit is not yet active.
+
+The first protocol reply must arrive within 5 seconds. The spawn
+frame must be at most 1 MiB. An oversized environment is rejected
+with the largest variable names in the error.
 
 `--objects` cannot point at a different collection than the process
 default. The daemon already loaded objects from its own environment.
