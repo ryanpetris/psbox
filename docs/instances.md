@@ -29,6 +29,10 @@ The path must fit in `sockaddr_un.sun_path` (107 bytes plus NUL).
    `SIGCONT`) are sent as `signal` frames. `SIGTSTP` also stops the
    CLI itself.
 
+The CLI starts only that socket unit. systemd socket-activates
+`psboxd@.service`. A failed connect retries the socket start; it does
+not start the service.
+
 The first reply must arrive within 5 seconds. The spawn frame must be
 at most 1 MiB. An oversized environment is rejected with the largest
 variable names in the error.

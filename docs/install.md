@@ -24,6 +24,7 @@ systemctl --user daemon-reload
 
 The units are templates. Do not enable `psboxd@.service` globally.
 `psbox` starts `psboxd@<identity>.socket` when it launches an instance.
+It does not start the service unit.
 
 ## From source
 

@@ -21,8 +21,9 @@ Use this when:
 - an app should open `http`/`https` on the host (`options.host-urls`,
   default on; `metadata.type: browser` turns it off)
 
-`psbox` starts `psboxd@<escaped>.socket` if needed, connects with
-`SOCK_SEQPACKET`, and sends one spawn with stdio fds. See
+`psbox` starts `psboxd@<escaped>.socket` if needed. It does not start
+the service unit; socket activation does. It then connects with
+`SOCK_SEQPACKET` and sends one spawn with stdio fds. See
 [instances.md](instances.md).
 
 The implicit instance name is `default`. `--instance work` is
