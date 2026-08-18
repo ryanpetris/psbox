@@ -112,8 +112,10 @@ func (l *Loader) loadFile(path string) ([]any, error) {
 			break
 		}
 		if err != nil {
+			// A syntax error leaves the decoder at the same
+			// position; continuing would warn forever.
 			l.log.Warn("skipping object", "file", path, "error", err)
-			continue
+			break
 		}
 		raws = append(raws, raw)
 	}

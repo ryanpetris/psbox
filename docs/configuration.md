@@ -5,8 +5,9 @@ psbox reads a directory of YAML documents. Default path:
 directory is loaded, including nested files, in sorted path order.
 
 Documents are `version: v1`. Unknown kinds and decode errors are
-skipped with a warning on stderr. A missing objects directory loads as
-an empty collection.
+skipped with a warning on stderr. A YAML syntax error stops reading
+the rest of that file after one warning. A missing objects directory
+loads as an empty collection.
 
 Names (applications, instances, desktop entries) match
 `^[A-Za-z0-9._][A-Za-z0-9._-]*$`. They must not start with `-` and must

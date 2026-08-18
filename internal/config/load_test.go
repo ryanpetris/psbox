@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadPathNameAndSandbox(t *testing.T) {
@@ -77,6 +79,98 @@ metadata:
 	names := col.ListApplications()
 	if !contains(names, "firefox-work") {
 		t.Fatalf("valid referrer should list: %v", names)
+	}
+}
+
+func TestLoadPathMalformedYAMLStops(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeYAML(t, filepath.Join(dir, "broken.yaml"), `
+version: v1
+kind: Application
+metadata:
+  name: broken
+spec:
+  options:
+    dbus: private
+      extra: true
+`)
+	writeYAML(t, filepath.Join(dir, "good.yaml"), `
+version: v1
+kind: Application
+metadata:
+  name: good
+spec:
+  exec: /bin/true
+`)
+	writeYAML(t, filepath.Join(dir, "mixed.yaml"), `
+version: v1
+kind: Application
+metadata:
+  name: kept
+spec:
+  exec: /bin/true
+---
+version: v1
+kind: Application
+metadata:
+  name: after
+spec:
+  options:
+    dbus: private
+      extra: true
+---
+version: v1
+kind: Application
+metadata:
+  name: unreachable
+spec:
+  exec: /bin/false
+`)
+
+	var buf bytes.Buffer
+	loader := NewLoader(slog.New(slog.NewTextHandler(&buf, nil)))
+
+	done := make(chan struct{})
+	var col *Collection
+	var err error
+	go func() {
+		defer close(done)
+		col, err = loader.LoadPath(dir, testPaths(dir))
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("LoadPath hung on malformed YAML")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := col.Applications["good"]; !ok {
+		t.Fatal("sibling file must still load")
+	}
+	if _, ok := col.Applications["kept"]; !ok {
+		t.Fatal("documents before a syntax error must load")
+	}
+	if _, ok := col.Applications["broken"]; ok {
+		t.Fatal("malformed file must not produce an application")
+	}
+	if _, ok := col.Applications["after"]; ok {
+		t.Fatal("document with a syntax error must be skipped")
+	}
+	if _, ok := col.Applications["unreachable"]; ok {
+		t.Fatal("documents after a syntax error must not be read")
+	}
+
+	warns := 0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "skipping object") {
+			warns++
+		}
+	}
+	if warns != 2 {
+		t.Fatalf("want one warning per broken file, got %d\n%s", warns, buf.String())
 	}
 }
 
