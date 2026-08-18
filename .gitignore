@@ -1,0 +1,31 @@
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Go build and test artifacts
+/bin/
+/dist/
+/vendor/
+/completions/
+*.test
+*.out
+coverage.out
+*.coverprofile
+
+# AI coding tool state and config directories
+.claude/
+.codex/
+.copilot/
+.grok/
+.opencode/
+.specify/
+.gemini/
+.aider*
+
+# Environment
+.env
+.env.*

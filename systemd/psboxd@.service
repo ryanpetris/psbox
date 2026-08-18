@@ -1,0 +1,7 @@
+[Unit]
+Description=Petris Sandbox instance %i
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/psboxd %i

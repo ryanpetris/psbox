@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: psbox
+
+before:
+  hooks:
+    - make release/completions
+
+builds:
+  - id: psbox
+    main: ./cmd/psbox
+    binary: psbox
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X petris.dev/psbox/internal/version.Current={{.Version}}
+
+  - id: psboxd
+    main: ./cmd/psboxd
+    binary: psboxd
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X petris.dev/psbox/internal/version.Current={{.Version}}
+
+  - id: psboxa
+    main: ./cmd/psboxa
+    binary: psboxa
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X petris.dev/psbox/internal/version.Current={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - systemd/*
+      - completions/*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+      - Merge remote-tracking branch
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+release:
+  name_template: "{{ .Tag }}"
+  prerelease: auto
+  footer: |
+    Archives contain `psbox`, `psboxd`, `psboxa`, user systemd units, and
+    shell completions.
+
+    Install the binaries to `/usr/bin` and the units to
+    `/usr/lib/systemd/user/`:
+
+    ```sh
+    sudo install -m755 psbox psboxd psboxa /usr/bin/
+    sudo install -m644 systemd/psboxd@.socket systemd/psboxd@.service /usr/lib/systemd/user/
+    ```

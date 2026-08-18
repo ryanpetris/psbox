@@ -1,0 +1,43 @@
+version: v1
+kind: Application
+metadata:
+  name: scratch
+spec:
+  exec: /bin/true
+  options:
+    home: ":tmpfs:"
+    audio: false
+    video: false
+    dbus: false
+    display: false
+    fontconfig: false
+---
+version: v1
+kind: Application
+metadata:
+  name: scratch-private
+spec:
+  exec: /bin/true
+  options:
+    home: ":tmpfs:"
+    audio: false
+    video: false
+    dbus: private
+    display: false
+    fontconfig: false
+  bwrap-args:
+    - [--bind, ~/Downloads]
+---
+version: v1
+kind: FreedesktopEntry
+metadata:
+  name: scratch
+spec:
+  application: scratch
+  value: |
+    [Desktop Entry]
+    Type=Application
+    Name=Scratch
+    Exec=scratch %U
+    TryExec=scratch
+    DBusActivatable=true

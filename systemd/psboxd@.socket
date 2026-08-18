@@ -1,0 +1,4 @@
+[Socket]
+ListenSequentialPacket=%t/psbox/%i.sock
+SocketMode=0600
+TriggerLimitIntervalSec=0
