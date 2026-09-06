@@ -125,3 +125,13 @@ func testPaths(t *testing.T) config.Paths {
 		Root:       filepath.Join(home, "Sandbox"),
 	}
 }
+
+func TestRewritePreservesBareExecutableEnvironment(t *testing.T) {
+	for _, value := range []string{`env FOO=bar app %U`, `env "FOO=two words" app --new-window %u`, `env -u FOO app %F`} {
+		got := rewriteExec(value, "app", testPaths(t))
+		want := "psbox launch app --command -- " + value
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	}
+}

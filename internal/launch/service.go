@@ -93,12 +93,12 @@ func (s *Service) Run(ctx context.Context, req Request, stdout io.Writer) error 
 	prog = filepath.Base(prog)
 
 	if req.Print {
-		fmt.Fprintln(stdout, bwrap.Quote(append([]string{prog, "sandbox"}, sandboxArgs...)))
-		return nil
+		_, err := fmt.Fprintln(stdout, bwrap.Quote(append([]string{prog, "sandbox"}, sandboxArgs...)))
+		return err
 	}
 	if req.PrintBwrap {
-		fmt.Fprintln(stdout, bwrap.Quote(bwrapArgv))
-		return nil
+		_, err := fmt.Fprintln(stdout, bwrap.Quote(bwrapArgv))
+		return err
 	}
 	if eff.Isolation.Instance() {
 		if s.inst == nil {

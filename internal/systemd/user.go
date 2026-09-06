@@ -4,6 +4,7 @@ package systemd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -69,7 +70,7 @@ func (u *User) Start(ctx context.Context, unit string) error {
 		if err == nil {
 			return nil
 		}
-		if active, aerr := u.unitIsActive(ctx, unit); aerr == nil && active {
+		if state, aerr := u.unitState(ctx, unit); aerr == nil && state == "active" {
 			return nil
 		}
 		return err
@@ -83,7 +84,7 @@ func (u *User) Stop(ctx context.Context, unit string) error {
 		if err == nil {
 			return nil
 		}
-		if active, aerr := u.unitIsActive(ctx, unit); aerr != nil || !active {
+		if state, aerr := u.unitState(ctx, unit); aerr == nil && (state == "inactive" || state == "failed" || state == "not-found") {
 			return nil
 		}
 		return err
@@ -201,18 +202,25 @@ type listRow struct {
 	JobPath     dbus.ObjectPath
 }
 
-func (u *User) unitIsActive(ctx context.Context, unit string) (bool, error) {
+func (u *User) unitState(ctx context.Context, unit string) (string, error) {
 	var path dbus.ObjectPath
 	if err := u.managerCall(ctx, CallTimeout, "GetUnit", []any{unit}, &path); err != nil {
-		return false, err
+		var de dbus.Error
+		if errors.As(err, &de) && de.Name == "org.freedesktop.systemd1.NoSuchUnit" {
+			return "not-found", nil
+		}
+		return "", err
 	}
 	if path == "" {
-		return false, nil
+		return "", fmt.Errorf("GetUnit returned an empty path for %s", unit)
 	}
 	v, err := u.getProp(ctx, path, "org.freedesktop.systemd1.Unit", "ActiveState")
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	state, _ := v.Value().(string)
-	return state == "active", nil
+	state, ok := v.Value().(string)
+	if !ok || state == "" {
+		return "", fmt.Errorf("invalid ActiveState for %s", unit)
+	}
+	return state, nil
 }

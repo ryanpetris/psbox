@@ -58,62 +58,91 @@ func (u *User) connection(ctx context.Context) (*dbus.Conn, error) {
 
 func (u *User) dialPrivate(ctx context.Context) (*dbus.Conn, error) {
 	path := filepath.Join(u.runtimeDir, "systemd", "private")
-	timeout := time.Until(ctxDeadline(ctx))
-	if timeout <= 0 {
-		return nil, fmt.Errorf("connect to systemd user manager: %w", ctx.Err())
-	}
-	raw, err := net.DialTimeout("unix", path, timeout)
+	conn, err := u.dialAndAuth(ctx, "unix:path="+dbus.EscapeBusAddressValue(path))
 	if err != nil {
 		return nil, fmt.Errorf("connect to systemd user manager: %w", err)
 	}
-	_ = raw.SetDeadline(ctxDeadline(ctx))
-	// The setup context must not be the Conn lifetime. WithContext
-	// cancels the connection when this function returns.
-	conn, err := dbus.NewConn(raw)
-	if err != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("connect to systemd user manager: %w", err)
-	}
-	if err := u.auth(conn); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	_ = raw.SetDeadline(time.Time{})
 	return conn, nil
 }
 
 func (u *User) dialAndAuth(ctx context.Context, addr string) (*dbus.Conn, error) {
-	if path, ok := unixPathAddr(addr); ok {
-		timeout := time.Until(ctxDeadline(ctx))
-		if timeout <= 0 {
-			return nil, fmt.Errorf("connect to session bus: %w", ctx.Err())
-		}
-		raw, err := net.DialTimeout("unix", path, timeout)
+	ctx, cancel := context.WithTimeout(ctx, ConnectTimeout)
+	defer cancel()
+	var last error
+	for _, candidate := range strings.Split(addr, ";") {
+		endpoint, err := parseBusAddress(candidate)
 		if err != nil {
-			return nil, fmt.Errorf("connect to session bus: %w", err)
+			last = err
+			continue
 		}
-		_ = raw.SetDeadline(ctxDeadline(ctx))
-		conn, err := dbus.NewConn(raw)
-		if err != nil {
+		conn, err := u.connectBus(ctx, endpoint)
+		if err == nil {
+			return conn, nil
+		}
+		last = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("connect to session bus: %w", last)
+}
+
+func (u *User) connectBus(ctx context.Context, endpoint busAddress) (*dbus.Conn, error) {
+	raw, err := (&net.Dialer{}).DialContext(ctx, endpoint.network, endpoint.address)
+	if err != nil {
+		return nil, err
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
 			_ = raw.Close()
-			return nil, fmt.Errorf("connect to session bus: %w", err)
 		}
-		if err := u.auth(conn); err != nil {
-			_ = conn.Close()
+	}()
+	if err := raw.SetDeadline(ctxDeadline(ctx)); err != nil {
+		return nil, err
+	}
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = raw.Close(); close(canceled) })
+	disarmed := false
+	defer func() {
+		if !disarmed && !stop() {
+			<-canceled
+		}
+	}()
+	if endpoint.noncefile != "" {
+		nonce, err := readBusNonce(endpoint.noncefile)
+		if err != nil {
 			return nil, err
 		}
-		_ = raw.SetDeadline(time.Time{})
-		return conn, nil
+		if _, err := raw.Write(nonce); err != nil {
+			return nil, err
+		}
 	}
-
-	conn, err := dbus.Dial(addr)
+	// Authentication uses the setup deadline, while the established connection
+	// owns its lifetime independently of the caller's setup context.
+	conn, err := dbus.NewConn(raw)
 	if err != nil {
-		return nil, fmt.Errorf("connect to session bus: %w", err)
+		return nil, err
 	}
 	if err := u.auth(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
+	disarmed = true
+	if !stop() {
+		<-canceled
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	accepted = true
 	return conn, nil
 }
 
@@ -181,20 +210,6 @@ func sessionBusAddress(runtimeDir string) string {
 		return ""
 	}
 	return "unix:path=" + filepath.Join(runtimeDir, "bus")
-}
-
-func unixPathAddr(addr string) (string, bool) {
-	rest, ok := strings.CutPrefix(addr, "unix:")
-	if !ok {
-		return "", false
-	}
-	for _, part := range strings.Split(rest, ",") {
-		key, val, found := strings.Cut(part, "=")
-		if found && key == "path" && val != "" {
-			return val, true
-		}
-	}
-	return "", false
 }
 
 func ctxDeadline(ctx context.Context) time.Time {

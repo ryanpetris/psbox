@@ -4,6 +4,8 @@ package objects
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -46,7 +48,7 @@ spec:
 
 	paths := testPaths(t)
 	paths.ObjectPath = objects
-	svc := NewService(config.NewLoader(slog.New(slog.DiscardHandler)))
+	svc := NewService(config.NewLoader(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler))
 	var buf bytes.Buffer
 	if err := svc.List(paths, "applications", true, &buf); err != nil {
 		t.Fatal(err)
@@ -69,5 +71,31 @@ spec:
 	}
 	if !strings.Contains(desktop, "ok") {
 		t.Fatalf("desktop list: %s", desktop)
+	}
+}
+
+type failedWriter struct{}
+
+var _ io.Writer = failedWriter{}
+
+func (failedWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestRequiredOutputFailures(t *testing.T) {
+	paths := testPaths(t)
+	paths.ObjectPath = "testdata/install"
+	log := slog.New(slog.DiscardHandler)
+	svc := NewService(config.NewLoader(log), log)
+	for _, kind := range []string{"applications", "desktop", "autostart"} {
+		for _, quiet := range []bool{false, true} {
+			if kind == "autostart" && quiet {
+				continue
+			}
+			if err := svc.List(paths, kind, quiet, failedWriter{}); !errors.Is(err, io.ErrClosedPipe) {
+				t.Errorf("%s quiet=%v: %v", kind, quiet, err)
+			}
+		}
+	}
+	if err := svc.Render(paths, "app", failedWriter{}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("render: %v", err)
 	}
 }

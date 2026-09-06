@@ -5,7 +5,6 @@ package instance
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -34,6 +33,7 @@ func (a *Agent) startPrivateBus(ctx context.Context) error {
 	_ = r.Close()
 	if err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return err
 	}
 
@@ -47,38 +47,24 @@ func (a *Agent) startPrivateBus(ctx context.Context) error {
 	a.infra = append(a.infra, InfraRoot{PID: cmd.Process.Pid, StartTime: start})
 	a.mu.Unlock()
 
-	go func() {
-		err := cmd.Wait()
-		a.log.Error("private dbus-daemon exited", "error", err)
-		os.Exit(1)
-	}()
+	a.busDone = make(chan error, 1)
+	a.workers.Go(func() { a.busDone <- cmd.Wait() })
+
 	return nil
 }
 
-func readBusAddress(r io.Reader, timeout time.Duration) (string, error) {
-	done := make(chan struct{})
-	var addr string
-	var err error
-	go func() {
-		buf := make([]byte, 4096)
-		n, e := r.Read(buf)
-		if e != nil && n == 0 {
-			err = e
-		} else {
-			addr = strings.TrimSpace(string(buf[:n]))
-		}
-		close(done)
-	}()
-	select {
-	case <-done:
-		if err != nil {
-			return "", fmt.Errorf("read dbus address: %w", err)
-		}
-		if addr == "" {
-			return "", fmt.Errorf("empty dbus address")
-		}
-		return addr, nil
-	case <-time.After(timeout):
-		return "", fmt.Errorf("timeout reading dbus address")
+func readBusAddress(r *os.File, timeout time.Duration) (string, error) {
+	if err := r.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return "", err
 	}
+	buf := make([]byte, 4096)
+	n, err := r.Read(buf)
+	if err != nil {
+		return "", fmt.Errorf("read dbus address: %w", err)
+	}
+	addr := strings.TrimSpace(string(buf[:n]))
+	if addr == "" {
+		return "", fmt.Errorf("empty dbus address")
+	}
+	return addr, nil
 }

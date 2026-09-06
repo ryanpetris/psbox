@@ -61,6 +61,11 @@ from the `psbox` process). `psboxa` forces those two keys, plus
 `dbus: private` sets `DBUS_SESSION_BUS_ADDRESS` to the in-sandbox bus
 and drops `DBUS_SESSION_BUS_PID` / `DBUS_SESSION_BUS_WINDOWID`.
 
+The agent searches the workload `PATH` for executable files. Relative paths
+and relative `PATH` entries resolve against the workload working directory.
+A failed search returns an error; the working directory is searched only
+when explicitly present in `PATH` or in the command path.
+
 ## Logging
 
 JSON on stderr from `psboxd` and `psboxa`. `psboxa` logs when a

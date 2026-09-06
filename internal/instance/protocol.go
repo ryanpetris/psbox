@@ -2,7 +2,10 @@ package instance
 
 // SEQPACKET JSON protocol messages.
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 const (
 	ProtocolVersion = 1
@@ -17,11 +20,6 @@ const (
 	TypeLiveness      = "liveness"
 	TypeOpenURI       = "open_uri"
 	TypeOpenURIResult = "open_uri_result"
-
-	ControlFDEnv = "PSBOX_CONTROL_FD"
-	DBusEnv      = "PSBOX_DBUS"
-	HostURLsEnv  = "PSBOX_HOST_URLS"
-	HostURLsOff  = "0"
 
 	FirstReplyTimeout = 5 * time.Second
 	SpawnReadTimeout  = 5 * time.Second
@@ -58,24 +56,5 @@ type StatusError struct {
 }
 
 func (e *StatusError) Error() string {
-	return "exit status " + itoa(e.Code)
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	sign := ""
-	if n < 0 {
-		sign = "-"
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return sign + string(buf[i:])
+	return "exit status " + strconv.Itoa(e.Code)
 }

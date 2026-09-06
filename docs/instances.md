@@ -43,14 +43,19 @@ available. On that bus, `psbox` calls `Hello`, `Subscribe`, and
 AUTH, `Hello`, and `Subscribe` share a 5s deadline. List and stop
 retry a timed-out or disconnected call up to three times and drop
 the D-Bus connection between tries. Start retries only while the
-unit is not yet active.
+unit is not yet active. After a failed stop, success requires a confirmed
+`inactive`, `failed`, or missing unit; a failed state query remains an error.
+Setup deadlines and cancellation cover filesystem and abstract Unix sockets,
+TCP, and nonce TCP addresses, including authentication.
 
 The first protocol reply must arrive within 5 seconds. The spawn
 frame must be at most 1 MiB. An oversized environment is rejected
-with the largest variable names in the error.
+with the largest variable names in the error. Malformed or truncated frames
+and excess descriptors are rejected, with received descriptors closed.
+Protocol writes are bounded to 5 seconds; a stalled write closes its connection.
 
 `--objects` cannot point at a different collection than the process
-default. The daemon already loaded objects from its own environment.
+default. The daemon loads objects using its own process environment.
 
 ## Hashes
 
@@ -65,9 +70,14 @@ the options they fill.
 Running hash is the config hash plus non-default `WAYLAND_DISPLAY`,
 `XAUTHORITY`, `PIPEWIRE_CORE`, `PSBOX_ROOT`, and `PSBOX_OBJECT_PATH`.
 
-If hashes differ and a workload is present, `psboxd` joins and logs an
-error. If hashes differ and the instance is idle, it tears down `bwrap`
-and starts again. A hash mismatch is never a failed launch. The client
+Before each launch, `psboxd` reloads and validates the sandbox application and
+collection options. Invalid or missing sandbox applications fail that launch.
+If hashes differ and a workload is present, `psboxd` joins and logs a
+warning, retaining the running configuration and hashes. If hashes differ
+and the instance is idle, it tears down `bwrap`
+and starts again using the reloaded configuration. Removing a collection
+`sandbox_root` override restores the process default on the next idle rebuild.
+A hash mismatch alone does not fail a launch. The client
 warns when the hashes in `spawned` differ from the hashes it computed.
 
 ## Liveness and idle
@@ -81,7 +91,11 @@ exits.
 
 `psboxd` polls accept with a 1 second deadline. If `bwrap` is gone and
 no clients remain, `psboxd` exits. The socket unit stays and will start
-a new service on the next connect.
+a new service on the next connect. If the agent disconnects, outstanding
+clients receive an error even after `spawned`, and the daemon terminates and
+reaps that sandbox. Each process has one waiter. Agent shutdown kills and
+reaps tracked workloads and stops its private bus; unexpected private-bus
+termination fails the agent through the same cleanup path.
 
 `StartLimitBurst=5` is set on the service. The socket sets
 `TriggerLimitIntervalSec=0`.
@@ -105,7 +119,7 @@ Version `1`. JSON objects on `SOCK_SEQPACKET` with optional fds.
 | --- | --- | --- |
 | `spawn` | client to daemon to agent | argv, env, cwd, stdio fds |
 | `spawned` | agent to client | pid, hashes from the daemon |
-| `spawn_error` | either way | message, optional errno and hashes |
+| `spawn_error` | daemon/agent to client | spawn or sandbox failure, including after `spawned`; optional errno and hashes |
 | `exited` | agent to client | `code` and/or `signal` |
 | `signal` | client to agent | `signum` delivered to the spawn pgid |
 | `query_liveness` | daemon to agent | idle rebuild check |
@@ -120,3 +134,19 @@ The daemon owns `psboxd`. The agent is `psboxa`. The CLI is the client.
 Named instances of one sandbox share `options.home`. They do not share
 a `bwrap` namespace. `firefox/default` and `firefox/work` are two
 daemons and two agents.
+
+## Host integration checks
+
+Use a disposable application and instance on a Linux test host with the current
+binaries, an accessible systemd user manager, and the psbox user units installed.
+
+1. Launch a short command and verify its output and exit status. Repeat with
+   `dbus: private` and a command that connects to the private session bus.
+2. Keep a workload running, change a sandbox option, and verify another launch
+   joins with a hash warning. Once idle, launch again and verify the new setting
+   takes effect. Repeat with a collection `sandbox_root` change and its removal.
+3. Terminate the test instance's agent after a workload is acknowledged. Verify
+   the client fails promptly, the sandbox terminates, and the daemon exits once
+   its clients disconnect.
+4. Stop the test instance through `psbox instance stop` and verify both its
+   service and socket stop. Restore the disposable configuration afterwards.

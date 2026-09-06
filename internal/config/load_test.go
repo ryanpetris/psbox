@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadPathNameAndSandbox(t *testing.T) {
@@ -499,4 +501,40 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestInvalidFilenameStemKeepsIndependentObjects(t *testing.T) {
+	var warnings bytes.Buffer
+	loader := NewLoader(slog.New(slog.NewTextHandler(&warnings, nil)))
+	col, err := loader.LoadPath("testdata/invalid-stem", testPaths(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := col.ListApplications(); len(names) != 1 || names[0] != "valid" {
+		t.Fatalf("applications: %v", names)
+	}
+	if len(col.FreedesktopEntries) != 1 || col.FreedesktopEntries["independent"] == nil {
+		t.Fatalf("desktop entries: %v", col.FreedesktopEntries)
+	}
+	if !strings.Contains(warnings.String(), `invalid application name`) {
+		t.Fatalf("missing invalid-name warning: %s", warnings.String())
+	}
+	for _, name := range []string{".", ".."} {
+		if _, err := col.Resolve(name, Isolation{}, false); err == nil {
+			t.Fatalf("unsafe private home accepted for %q", name)
+		}
+	}
+}
+
+func TestDecodeDBusValues(t *testing.T) {
+	for value, want := range map[string]string{"host": DBusHost, "true": DBusHost, "off": DBusOff, "false": DBusOff, "private": DBusPrivate} {
+		var node yaml.Node
+		if err := yaml.Unmarshal([]byte(value), &node); err != nil {
+			t.Fatal(err)
+		}
+		got, err := decodeDBus(*node.Content[0])
+		if err != nil || got != want {
+			t.Fatalf("%s: got %q, %v; want %q", value, got, err, want)
+		}
+	}
 }

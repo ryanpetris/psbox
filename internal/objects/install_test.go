@@ -3,6 +3,8 @@ package objects
 // Desktop install and orphan tests.
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -41,7 +43,7 @@ spec:
 	paths.DataHome = filepath.Join(root, "data")
 	paths.ConfigHome = filepath.Join(root, "config")
 
-	svc := NewService(config.NewLoader(slog.New(slog.DiscardHandler)))
+	svc := NewService(config.NewLoader(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler))
 	if err := svc.Install(paths); err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +96,54 @@ spec:
 	}
 	paths := testPaths(t)
 	paths.ObjectPath = objects
-	svc := NewService(config.NewLoader(slog.New(slog.DiscardHandler)))
+	svc := NewService(config.NewLoader(slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler))
 	if err := svc.Render(paths, "bad", os.Stdout); err == nil {
 		t.Fatal("expected sandbox collection error")
+	}
+}
+
+func TestInstallRenderFailurePreservesLaunchers(t *testing.T) {
+	paths := testPaths(t)
+	paths.ObjectPath = filepath.Join(t.TempDir(), "objects")
+	if err := os.Mkdir(paths.ObjectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(paths.ObjectPath, "app.yaml")
+	body, err := os.ReadFile("testdata/install/app.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logs, nil))
+	svc := NewService(config.NewLoader(log), log)
+	if err := svc.Install(paths); err != nil {
+		t.Fatal(err)
+	}
+	desktop := filepath.Join(paths.DataHome, "applications", "app.desktop")
+	before, err := os.ReadFile(desktop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := os.ReadFile("testdata/bad-override.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, invalid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Install(paths); err == nil || !strings.Contains(err.Error(), "override pattern") {
+		t.Fatalf("expected actual render failure, got %v", err)
+	}
+	after, err := os.ReadFile(desktop)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("configured launcher changed: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("non-structured progress: %q", line)
+		}
 	}
 }

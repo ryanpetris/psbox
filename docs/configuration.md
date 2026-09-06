@@ -11,7 +11,7 @@ loads as an empty collection.
 
 Names (applications, instances, desktop entries) match
 `^[A-Za-z0-9._][A-Za-z0-9._-]*$`. They must not start with `-` and must
-not contain `/` or `:`.
+not contain `/` or `:`. The complete names `.` and `..` are rejected.
 
 ## Kinds
 
@@ -27,7 +27,9 @@ One file may contain several documents, separated by `---`.
 When a file contains exactly one `Application` and `metadata.name` is
 omitted, the name is the file stem. Desktop entries in that file
 inherit the application name when their own `metadata.name` or
-`spec.application` is omitted.
+`spec.application` is omitted. An invalid file stem skips the unnamed
+application and entries that inherit its invalid name or application reference;
+independently named objects remain eligible to load.
 
 `metadata.type` is a closed application type. Unset keys take that
 type's defaults; explicit `spec.options` always win. Unknown types are
@@ -178,7 +180,9 @@ If `spec.value` is omitted, `psbox objects install` reads
 Rewrite rules:
 
 - `Exec=` becomes `psbox launch <application> -- …` when the binary is a
-  bare name, or `psbox launch <application> --command -- …` when it is a path
+  bare name with no environment prefix. Paths and commands prefixed by `env`
+  use `psbox launch <application> --command -- …`, preserving assignments,
+  quoting, and desktop field codes
 - `TryExec=` is removed
 - `DBusActivatable=` in `[Desktop Entry]` is set to `false`
 - `Icon=` expands `:root:`, `:home:`, and `~`

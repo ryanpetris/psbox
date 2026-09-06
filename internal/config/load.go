@@ -327,9 +327,9 @@ func decodeDBus(node yaml.Node) (string, error) {
 	switch asString {
 	case "private":
 		return DBusPrivate, nil
-	case "true":
+	case "true", "host":
 		return DBusHost, nil
-	case "false":
+	case "false", "off":
 		return DBusOff, nil
 	default:
 		return "", fmt.Errorf("invalid options.dbus %q", asString)
@@ -480,9 +480,6 @@ func fixupSameFile(path string, objs []any) []any {
 	if app.Name == "" {
 		base := filepath.Base(path)
 		app.Name = strings.TrimSuffix(base, filepath.Ext(base))
-		if err := CheckName("application", app.Name); err != nil {
-			return objs
-		}
 	}
 	for _, obj := range objs {
 		entry, ok := obj.(*DesktopEntry)
@@ -506,8 +503,8 @@ func (l *Loader) skipObject(path string, err error) {
 func (l *Loader) add(col *Collection, obj any) {
 	switch v := obj.(type) {
 	case *Application:
-		if v.Name == "" {
-			l.skipObject(v.File, fmt.Errorf("application name is empty"))
+		if err := CheckName("application", v.Name); err != nil {
+			l.skipObject(v.File, err)
 			return
 		}
 		if _, ok := col.Applications[v.Name]; ok {
@@ -515,8 +512,12 @@ func (l *Loader) add(col *Collection, obj any) {
 		}
 		col.Applications[v.Name] = v
 	case *DesktopEntry:
-		if v.Name == "" {
-			l.skipObject(v.File, fmt.Errorf("desktop entry name is empty"))
+		if err := CheckName("application", v.Application); err != nil {
+			l.skipObject(v.File, err)
+			return
+		}
+		if err := CheckName("desktop entry", v.Name); err != nil {
+			l.skipObject(v.File, err)
 			return
 		}
 		switch v.Kind {

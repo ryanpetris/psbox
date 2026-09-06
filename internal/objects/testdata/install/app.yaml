@@ -1,0 +1,10 @@
+version: v1
+kind: Application
+---
+version: v1
+kind: FreedesktopEntry
+spec:
+  value: |
+    [Desktop Entry]
+    Name=App
+    Exec=env FOO=bar app %U

@@ -2,10 +2,7 @@ package bwrap
 
 // POSIX shell quoting for --print output.
 
-import (
-	"strings"
-	"unicode"
-)
+import "strings"
 
 // Quote joins argv as a POSIX shell-escaped command line.
 func Quote(argv []string) string {
@@ -25,7 +22,7 @@ func quoteArg(s string) string {
 
 func needsQuote(s string) bool {
 	for _, r := range s {
-		if unicode.IsSpace(r) || strings.ContainsRune(`\"'$&*()[]{}|;<>?!~#`, r) {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_@%+,-./:", r)) {
 			return true
 		}
 	}

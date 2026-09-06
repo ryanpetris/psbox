@@ -14,7 +14,7 @@ func TestValidName(t *testing.T) {
 		}
 	}
 
-	bad := []string{"", "-lead", "has space", "slash/name", "colon:name", "ü"}
+	bad := []string{".", "..", "", "-lead", "has space", "slash/name", "colon:name", "ü"}
 	for _, name := range bad {
 		if ValidName(name) {
 			t.Errorf("ValidName(%q) = true, want false", name)

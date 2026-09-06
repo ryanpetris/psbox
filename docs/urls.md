@@ -24,7 +24,10 @@ Both end at `psboxa` acting as the helper (`argv[0]` is `xdg-open`, or
 `psboxa xdg-open …`). The helper talks to
 `$XDG_RUNTIME_DIR/psbox-xdg-open.sock` (mode `0600`). The long-lived
 agent sends `open_uri` to `psboxd`. `psboxd` allowlists `http`/`https`
-and runs host `xdg-open`.
+and runs host `xdg-open`. Up to four opens run concurrently, each with a
+5-second deadline. Excess requests receive an error. Slow opens do not hold
+up spawn, exit, or liveness replies. Sandbox shutdown cancels and joins
+outstanding open operations.
 
 Host `xdg-open` uses host desktop files. After `psbox objects install`,
 the default browser's `Exec=` is `psbox launch <browser> …`, so the URL joins

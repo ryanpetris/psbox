@@ -36,7 +36,7 @@ func waitJobRemoved(ctx context.Context, sigc <-chan *dbus.Signal, job dbus.Obje
 			return fmt.Errorf("%s %s: %w", method, unit, ctx.Err())
 		case sig, ok := <-sigc:
 			if !ok {
-				return fmt.Errorf("%s %s: connection closed", method, unit)
+				return fmt.Errorf("%s %s: %w", method, unit, dbus.ErrClosed)
 			}
 			if sig.Name != jobSignal {
 				continue

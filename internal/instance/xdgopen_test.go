@@ -102,7 +102,7 @@ func TestHandleXDGOpenLocal(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(time.Second))
-	go a.handleXDGOpen(nil, server, new(atomic.Uint64))
+	go a.handleXDGOpen(t.Context(), nil, server, new(atomic.Uint64))
 	if _, err := fmt.Fprintln(client, "file:///tmp/x"); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestHandleXDGOpenForwardsHTTP(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(time.Second))
-	go a.handleXDGOpen(agentConn, server, new(atomic.Uint64))
+	go a.handleXDGOpen(t.Context(), agentConn, server, new(atomic.Uint64))
 	if _, err := fmt.Fprintln(client, "https://example.com"); err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestHandleXDGOpenForwardError(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(time.Second))
-	go a.handleXDGOpen(agentConn, server, new(atomic.Uint64))
+	go a.handleXDGOpen(t.Context(), agentConn, server, new(atomic.Uint64))
 	if _, err := fmt.Fprintln(client, "https://example.com"); err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestSpawnEnvInheritsRuntimeDir(t *testing.T) {
 
 func TestSpawnEnvPATHWithoutHostURLs(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-	t.Setenv(HostURLsEnv, HostURLsOff)
+	t.Setenv(config.HostURLsEnv, config.HostURLsOff)
 	env := spawnEnv(map[string]string{"PATH": "/usr/bin"}, "")
 	if env["PATH"] != "/usr/bin" {
 		t.Fatalf("PATH=%q", env["PATH"])

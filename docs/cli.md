@@ -96,7 +96,14 @@ psbox objects [--objects PATH] render <application>
 | `render <application>` | rewritten desktop and autostart text | Does not write files |
 
 `install` skips entries whose template file is missing and lists those
-paths on stderr. Other configured entries are still installed.
+paths on stderr through the CLI logger (`PSBOX_LOG=structured` applies).
+Other configured entries are still installed. Other rendering failures return
+the actual error and stop installation before orphan cleanup, preserving
+existing launchers that could not be rendered. Install and cleanup progress
+also use the CLI logger.
+
+Failures writing required print, list, or render output fail the command,
+including failures flushing a table.
 
 ## `psbox sandbox`
 

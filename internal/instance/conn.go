@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -29,43 +30,72 @@ func WriteMsg(c *net.UnixConn, msg Message, files []*os.File) error {
 		}
 		oob = unix.UnixRights(fds...)
 	}
+	// A timeout invalidates the stream. Its independent timer also bounds time
+	// spent queued behind another writer; concurrent writes cannot extend it.
+	expired := make(chan struct{})
+	timer := time.AfterFunc(FirstReplyTimeout, func() { _ = c.Close(); close(expired) })
 	_, _, err = c.WriteMsgUnix(payload, oob, nil)
+	if !timer.Stop() {
+		<-expired
+		return fmt.Errorf("write protocol message: %w", os.ErrDeadlineExceeded)
+	}
 	return err
 }
 
 // ReadMsg reads one SEQPACKET frame and up to maxFDs file descriptors.
 func ReadMsg(c *net.UnixConn, maxFDs int) (Message, []*os.File, error) {
-	buf := make([]byte, MaxMessageBytes)
-	oob := make([]byte, unix.CmsgSpace(4*maxFDs))
-	n, oobn, _, _, err := c.ReadMsgUnix(buf, oob)
-	if err != nil {
-		return Message{}, nil, err
+	if maxFDs < 0 {
+		return Message{}, nil, fmt.Errorf("negative descriptor limit")
 	}
-	if n == MaxMessageBytes {
-		return Message{}, nil, fmt.Errorf("protocol message exceeds %d bytes", MaxMessageBytes)
+	buf := make([]byte, MaxMessageBytes)
+	// Receive the Linux SCM_RIGHTS maximum so every installed descriptor is owned,
+	// including descriptors exceeding the message-specific limit.
+	oob := make([]byte, unix.CmsgSpace(4*253))
+	n, oobn, flags, _, readErr := c.ReadMsgUnix(buf, oob)
+	var files []*os.File
+	accepted := false
+	defer func() {
+		if !accepted {
+			closeFiles(files)
+		}
+	}()
+	scms, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return Message{}, nil, fmt.Errorf("parse control message: %w", err)
+	}
+	var controlErr error
+	for _, scm := range scms {
+		if scm.Header.Level != unix.SOL_SOCKET || scm.Header.Type != unix.SCM_RIGHTS {
+			controlErr = fmt.Errorf("unexpected ancillary message")
+			continue
+		}
+		fds, err := unix.ParseUnixRights(&scm)
+		if err != nil {
+			controlErr = err
+			continue
+		}
+		for _, fd := range fds {
+			unix.CloseOnExec(fd)
+			files = append(files, os.NewFile(uintptr(fd), "passed"))
+		}
+	}
+	if readErr != nil {
+		return Message{}, nil, readErr
+	}
+	if controlErr != nil {
+		return Message{}, nil, controlErr
+	}
+	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
+		return Message{}, nil, fmt.Errorf("truncated protocol message")
+	}
+	if len(files) > maxFDs {
+		return Message{}, nil, fmt.Errorf("protocol message has %d descriptors; maximum is %d", len(files), maxFDs)
 	}
 	var msg Message
 	if err := json.Unmarshal(buf[:n], &msg); err != nil {
 		return Message{}, nil, fmt.Errorf("decode protocol message: %w", err)
 	}
-	if oobn == 0 || maxFDs == 0 {
-		return msg, nil, nil
-	}
-	scms, err := unix.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return Message{}, nil, err
-	}
-	var files []*os.File
-	for _, scm := range scms {
-		fds, err := unix.ParseUnixRights(&scm)
-		if err != nil {
-			closeFiles(files)
-			return Message{}, nil, err
-		}
-		for _, fd := range fds {
-			files = append(files, os.NewFile(uintptr(fd), "passed"))
-		}
-	}
+	accepted = true
 	return msg, files, nil
 }
 

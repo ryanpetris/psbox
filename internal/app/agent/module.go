@@ -31,6 +31,9 @@ func NewLogger() *slog.Logger {
 
 // Run starts psboxa.
 func Run() int {
+	if instance.InvokedAsXDGOpen(os.Args) {
+		return instance.RunXDGOpen(os.Args)
+	}
 	var svc *instance.Agent
 	app := fx.New(
 		Module,

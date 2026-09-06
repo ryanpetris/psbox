@@ -54,8 +54,8 @@ func LoadPaths() (Paths, error) {
 		}
 	}
 
-	configHome := envPath("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	dataHome := envPath("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	configHome := envOr("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	dataHome := envOr("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	runtimeDir := RuntimeDir()
 
 	p := Paths{
@@ -63,9 +63,9 @@ func LoadPaths() (Paths, error) {
 		ConfigHome:     configHome,
 		DataHome:       dataHome,
 		RuntimeDir:     runtimeDir,
-		ObjectPath:     envPath(EnvObjectPath, filepath.Join(configHome, DefaultObjectDirRelative)),
-		Root:           envPath(EnvRoot, filepath.Join(home, DefaultRootRelative)),
-		Agent:          envPath(EnvAgent, DefaultAgentPath),
+		ObjectPath:     envOr(EnvObjectPath, filepath.Join(configHome, DefaultObjectDirRelative)),
+		Root:           envOr(EnvRoot, filepath.Join(home, DefaultRootRelative)),
+		Agent:          envOr(EnvAgent, DefaultAgentPath),
 		WaylandDisplay: envOr("WAYLAND_DISPLAY", DefaultWaylandDisplay),
 		Xauthority:     os.Getenv("XAUTHORITY"),
 		PipewireCore:   envOr("PIPEWIRE_CORE", DefaultPipewireCore),
@@ -118,7 +118,7 @@ func (p Paths) ImplicitHome(name string) string {
 
 // RuntimeDir is $XDG_RUNTIME_DIR, or /run/user/<uid> when unset.
 func RuntimeDir() string {
-	return envPath("XDG_RUNTIME_DIR", DefaultRuntimeDir())
+	return envOr("XDG_RUNTIME_DIR", DefaultRuntimeDir())
 }
 
 // DefaultRuntimeDir is the Arch/systemd fallback for XDG_RUNTIME_DIR.
@@ -127,13 +127,6 @@ func DefaultRuntimeDir() string {
 }
 
 func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envPath(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}

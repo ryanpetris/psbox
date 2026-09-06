@@ -10,14 +10,7 @@ import (
 	"petris.dev/psbox/internal/config"
 )
 
-const (
-	ControlFDEnv = "PSBOX_CONTROL_FD"
-	DBusEnv      = "PSBOX_DBUS"
-	HostURLsEnv  = "PSBOX_HOST_URLS"
-	HostURLsOff  = "0"
-
-	xdgOpenName = "xdg-open"
-)
+const xdgOpenName = "xdg-open"
 
 // XDGOpenBinDir is $XDG_RUNTIME_DIR/psbox/bin, prepended to PATH in the sandbox.
 func XDGOpenBinDir(runtimeDir string) string {
@@ -43,11 +36,11 @@ func InstanceTrailing(app *config.Application, paths config.Paths, agent string,
 			cmd = append(cmd, "--symlink", agent, filepath.Join(dir, xdgOpenName))
 		}
 	} else {
-		cmd = append(cmd, "--setenv", HostURLsEnv, HostURLsOff)
+		cmd = append(cmd, "--setenv", config.HostURLsEnv, config.HostURLsOff)
 	}
-	cmd = append(cmd, "--setenv", ControlFDEnv, strconv.Itoa(controlFD))
+	cmd = append(cmd, "--setenv", config.ControlFDEnv, strconv.Itoa(controlFD))
 	if app.DBus() == config.DBusPrivate {
-		cmd = append(cmd, "--setenv", DBusEnv, config.DBusPrivate)
+		cmd = append(cmd, "--setenv", config.DBusEnv, config.DBusPrivate)
 	}
 	cmd = append(cmd, agent)
 	return cmd

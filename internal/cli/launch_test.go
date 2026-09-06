@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -211,7 +212,7 @@ func testCommand(t *testing.T, objectPath string) *cobra.Command {
 		PipewireCore:   config.DefaultPipewireCore,
 	}
 	loader := config.NewLoader(log)
-	return NewRoot(launch.NewService(loader, paths, instance.NewClient(log, paths, nilStarter{})), objects.NewService(loader), sandbox.NewService(paths), units.NewService(nilUser{}), paths)
+	return NewRoot(launch.NewService(loader, paths, instance.NewClient(log, paths, nilStarter{})), objects.NewService(loader, log), sandbox.NewService(paths), units.NewService(nilUser{}), paths)
 }
 
 func writeLaunchObjects(t *testing.T) string {
@@ -259,3 +260,26 @@ func (nilUser) Start(context.Context, string) error { return nil }
 func (nilUser) Stop(context.Context, string) error { return nil }
 
 func (nilUser) List(context.Context, []string) ([]systemd.Unit, error) { return nil, nil }
+
+type failedOutput struct{}
+
+var _ io.Writer = failedOutput{}
+
+func (failedOutput) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestPrintReportsOutputFailure(t *testing.T) {
+	objects := writeLaunchObjects(t)
+	for _, args := range [][]string{
+		{"launch", "--print", "brave"},
+		{"launch", "--print-bwrap", "brave"},
+		{"sandbox", "--home-tmpfs", "--print", "--", "true"},
+	} {
+		cmd := testCommand(t, objects)
+		cmd.SetOut(failedOutput{})
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs(args)
+		if err := cmd.ExecuteContext(t.Context()); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+}

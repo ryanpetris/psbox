@@ -133,7 +133,10 @@ func (c *Client) Run(ctx context.Context, req Request) error {
 	defer signal.Stop(sigc)
 
 	errc := make(chan error, 1)
+	readerDone := make(chan struct{})
+	defer func() { _ = conn.Close(); <-readerDone }()
 	go func() {
+		defer close(readerDone)
 		msg, _, err := ReadMsg(conn, 0)
 		if err != nil {
 			errc <- err
@@ -227,6 +230,9 @@ func splitEnv(kv string) (string, string, bool) {
 }
 
 func exitedError(msg Message) error {
+	if msg.Type == TypeSpawnError {
+		return fmt.Errorf("instance failed: %s", msg.Message)
+	}
 	if msg.Type != TypeExited {
 		return fmt.Errorf("unexpected message %q", msg.Type)
 	}

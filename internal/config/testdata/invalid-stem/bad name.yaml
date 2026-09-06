@@ -1,0 +1,17 @@
+version: v1
+kind: Application
+---
+version: v1
+kind: FreedesktopEntry
+---
+version: v1
+kind: FreedesktopEntry
+metadata:
+  name: inherited
+---
+version: v1
+kind: FreedesktopEntry
+metadata:
+  name: independent
+spec:
+  application: valid

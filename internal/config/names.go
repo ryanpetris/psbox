@@ -11,7 +11,7 @@ var namePattern = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._-]*$`)
 
 // ValidName reports whether name matches the object and instance grammar.
 func ValidName(name string) bool {
-	return namePattern.MatchString(name)
+	return name != "." && name != ".." && namePattern.MatchString(name)
 }
 
 // CheckName returns an error if name is empty or illegal.

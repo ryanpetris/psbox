@@ -51,14 +51,18 @@ func (s *Service) List(ctx context.Context, quiet bool, stdout io.Writer) error 
 	}
 	if quiet {
 		for _, item := range items {
-			fmt.Fprintln(stdout, displayIdentity(item.Identity))
+			if _, err := fmt.Fprintln(stdout, displayIdentity(item.Identity)); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "IDENTITY\tSERVICE\tSOCKET\tPID\tSINCE\tRESTARTS\tACCEPTED")
+	if _, err := fmt.Fprintln(tw, "IDENTITY\tSERVICE\tSOCKET\tPID\tSINCE\tRESTARTS\tACCEPTED"); err != nil {
+		return err
+	}
 	for _, item := range items {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			displayIdentity(item.Identity),
 			unitState(item.Service),
 			unitState(item.Socket),
@@ -66,7 +70,9 @@ func (s *Service) List(ctx context.Context, quiet bool, stdout io.Writer) error 
 			formatSince(item.Service),
 			formatCount(item.Service, item.Service.NRestarts),
 			formatCount(item.Socket, item.Socket.NAccepted),
-		)
+		); err != nil {
+			return err
+		}
 	}
 	return tw.Flush()
 }

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Open URL on host
+Exec={{EXECUTABLE}} xdg-open %u
+NoDisplay=true
+MimeType=x-scheme-handler/http;x-scheme-handler/https;

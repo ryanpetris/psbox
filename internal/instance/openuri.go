@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +28,8 @@ func xdgOpenSocketPath() string {
 }
 
 func (a *Agent) serveXDGOpen(ctx context.Context, control *net.UnixConn) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	path := xdgOpenSocketPath()
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
@@ -35,9 +38,13 @@ func (a *Agent) serveXDGOpen(ctx context.Context, control *net.UnixConn) {
 		return
 	}
 	_ = os.Chmod(path, 0o600)
-	go func() {
-		<-ctx.Done()
+	var workers sync.WaitGroup
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer func() {
+		cancel()
+		stop()
 		_ = ln.Close()
+		workers.Wait()
 		_ = os.Remove(path)
 	}()
 
@@ -51,11 +58,15 @@ func (a *Agent) serveXDGOpen(ctx context.Context, control *net.UnixConn) {
 			a.log.Error("xdg-open accept", "error", err)
 			return
 		}
-		go a.handleXDGOpen(control, conn, &seq)
+		workers.Go(func() {
+			stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			defer stop()
+			a.handleXDGOpen(ctx, control, conn, &seq)
+		})
 	}
 }
 
-func (a *Agent) handleXDGOpen(control *net.UnixConn, conn net.Conn, seq *atomic.Uint64) {
+func (a *Agent) handleXDGOpen(ctx context.Context, control *net.UnixConn, conn net.Conn, seq *atomic.Uint64) {
 	defer conn.Close()
 	_ = conn.SetDeadline(a.now().Add(FirstReplyTimeout))
 	line, err := bufio.NewReader(io.LimitReader(conn, maxXDGOpenURIBytes+1)).ReadString('\n')
@@ -67,14 +78,14 @@ func (a *Agent) handleXDGOpen(control *net.UnixConn, conn net.Conn, seq *atomic.
 		_, _ = fmt.Fprintln(conn, "local")
 		return
 	}
-	if err := a.forwardOpenURI(control, uri, seq); err != nil {
+	if err := a.forwardOpenURI(ctx, control, uri, seq); err != nil {
 		_, _ = fmt.Fprintln(conn, "error "+err.Error())
 		return
 	}
 	_, _ = fmt.Fprintln(conn, "ok")
 }
 
-func (a *Agent) forwardOpenURI(control *net.UnixConn, uri string, seq *atomic.Uint64) error {
+func (a *Agent) forwardOpenURI(ctx context.Context, control *net.UnixConn, uri string, seq *atomic.Uint64) error {
 	id := fmt.Sprintf("uri-%d", seq.Add(1))
 	ch := make(chan Message, 1)
 	a.mu.Lock()
@@ -94,6 +105,8 @@ func (a *Agent) forwardOpenURI(control *net.UnixConn, uri string, seq *atomic.Ui
 			return fmt.Errorf("%s", msg.Message)
 		}
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-time.After(FirstReplyTimeout):
 		return fmt.Errorf("open_uri timeout")
 	}

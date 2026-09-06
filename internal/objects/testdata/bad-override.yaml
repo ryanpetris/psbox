@@ -1,0 +1,16 @@
+version: v1
+kind: Application
+metadata:
+  name: app
+---
+version: v1
+kind: FreedesktopEntry
+metadata:
+  name: app
+spec:
+  value: |
+    [Desktop Entry]
+    Exec=app
+  overrides:
+    - field: Exec
+      pattern: '['

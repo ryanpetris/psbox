@@ -33,6 +33,8 @@ type messageHandler struct {
 	mu  sync.Mutex
 }
 
+var _ slog.Handler = (*messageHandler)(nil)
+
 func (h *messageHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.min
 }

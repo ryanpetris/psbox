@@ -5,6 +5,8 @@ package units
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -204,3 +206,18 @@ func TestFormatUnitFields(t *testing.T) {
 type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+type failedOutput struct{}
+
+var _ io.Writer = failedOutput{}
+
+func (failedOutput) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestListReportsOutputFailure(t *testing.T) {
+	svc := NewService(&fakeUser{units: []systemd.Unit{{Name: "psboxd@" + instance.Escape("app/default") + ".socket"}}})
+	for _, quiet := range []bool{false, true} {
+		if err := svc.List(t.Context(), quiet, failedOutput{}); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("quiet=%v: %v", quiet, err)
+		}
+	}
+}

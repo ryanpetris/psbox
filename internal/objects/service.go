@@ -3,8 +3,10 @@ package objects
 // Install, cleanup, list, and render operations.
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,11 +19,12 @@ import (
 // Service implements `psbox objects`.
 type Service struct {
 	loader *config.Loader
+	log    *slog.Logger
 }
 
 // NewService returns an objects service.
-func NewService(loader *config.Loader) *Service {
-	return &Service{loader: loader}
+func NewService(loader *config.Loader, log *slog.Logger) *Service {
+	return &Service{loader: loader, log: log}
 }
 
 // Install writes configured desktop files and removes orphan generator files.
@@ -43,26 +46,26 @@ func (s *Service) Install(paths config.Paths) error {
 		path := filepath.Join(dir, entry.Name+".desktop")
 		body, err := RewriteDesktop(entry, entry.Application, paths)
 		if err != nil {
-			missing = append(missing, squishHome(path, paths.Home))
-			continue
+			if errors.Is(err, errTemplateMissing) {
+				missing = append(missing, squishHome(path, paths.Home))
+				continue
+			}
+			return fmt.Errorf("rewrite desktop entry %s: %w", entry.Name, err)
 		}
 		good[path] = struct{}{}
-		if err := writeIfChanged(path, installBody(body), paths.Home); err != nil {
+		if err := s.writeIfChanged(path, installBody(body), paths.Home); err != nil {
 			return err
 		}
 	}
 
-	if err := removeOrphans(paths, good); err != nil {
+	if err := s.removeOrphans(paths, good); err != nil {
 		return err
 	}
 
-	if len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "\nThe following entries are defined but not installed:\n\n")
-		for _, path := range missing {
-			fmt.Fprintf(os.Stderr, "    %s\n", path)
-		}
-		fmt.Fprintln(os.Stderr)
+	for _, path := range missing {
+		s.log.Warn(fmt.Sprintf("Entry defined but not installed: %s", path), "path", path)
 	}
+
 	return nil
 }
 
@@ -80,7 +83,7 @@ func (s *Service) requireSandbox(col *config.Collection) error {
 
 // Cleanup deletes desktop files marked # @generator psbox.
 func (s *Service) Cleanup(paths config.Paths) error {
-	return removeOrphans(paths, nil)
+	return s.removeOrphans(paths, nil)
 }
 
 // List writes object names to stdout.
@@ -92,19 +95,21 @@ func (s *Service) List(paths config.Paths, kind string, quiet bool, stdout io.Wr
 	switch kind {
 	case "applications":
 		for _, name := range col.ListApplications() {
-			fmt.Fprintln(stdout, name)
+			if _, err := fmt.Fprintln(stdout, name); err != nil {
+				return err
+			}
 		}
 	case "desktop":
-		listEntries(stdout, col, col.FreedesktopEntries, quiet)
+		return listEntries(stdout, col, col.FreedesktopEntries, quiet)
 	case "autostart":
-		listEntries(stdout, col, col.FreedesktopAutostartEntries, quiet)
+		return listEntries(stdout, col, col.FreedesktopAutostartEntries, quiet)
 	default:
 		return fmt.Errorf("unknown list kind %q", kind)
 	}
 	return nil
 }
 
-func listEntries(w io.Writer, col *config.Collection, entries map[string]*config.DesktopEntry, quiet bool) {
+func listEntries(w io.Writer, col *config.Collection, entries map[string]*config.DesktopEntry, quiet bool) error {
 	if quiet {
 		names := make([]string, 0, len(entries))
 		for name := range entries {
@@ -112,12 +117,16 @@ func listEntries(w io.Writer, col *config.Collection, entries map[string]*config
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			fmt.Fprintln(w, name)
+			if _, err := fmt.Fprintln(w, name); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "APPLICATION\tENTRY")
+	if _, err := fmt.Fprintln(tw, "APPLICATION\tENTRY"); err != nil {
+		return err
+	}
 	for _, app := range col.ListApplications() {
 		var names []string
 		for name, entry := range entries {
@@ -127,10 +136,12 @@ func listEntries(w io.Writer, col *config.Collection, entries map[string]*config
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			fmt.Fprintf(tw, "%s\t%s\n", app, name)
+			if _, err := fmt.Fprintf(tw, "%s\t%s\n", app, name); err != nil {
+				return err
+			}
 		}
 	}
-	_ = tw.Flush()
+	return tw.Flush()
 }
 
 // Render writes rewritten desktop files for an application to stdout.
@@ -150,15 +161,23 @@ func (s *Service) Render(paths config.Paths, application string, stdout io.Write
 			body = "# " + err.Error()
 		}
 		if !first {
-			fmt.Fprintln(stdout)
+			if _, err := fmt.Fprintln(stdout); err != nil {
+				return err
+			}
 		}
 		first = false
 		dir := desktopDir(entry.Kind, paths)
 		path := filepath.Join(dir, entry.Name+".desktop")
-		fmt.Fprintf(stdout, "# %s\n", squishHome(path, paths.Home))
-		fmt.Fprint(stdout, body)
+		if _, err := fmt.Fprintf(stdout, "# %s\n", squishHome(path, paths.Home)); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprint(stdout, body); err != nil {
+			return err
+		}
 		if !strings.HasSuffix(body, "\n") {
-			fmt.Fprintln(stdout)
+			if _, err := fmt.Fprintln(stdout); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -190,13 +209,13 @@ func desktopDir(kind string, paths config.Paths) string {
 	}
 }
 
-func writeIfChanged(path, body, home string) error {
+func (s *Service) writeIfChanged(path, body, home string) error {
 	if current, err := os.ReadFile(path); err == nil && string(current) == body {
 		return nil
 	} else if err == nil {
-		fmt.Fprintf(os.Stderr, "Updating %s...\n", squishHome(path, home))
+		s.log.Info(fmt.Sprintf("Updating %s...", squishHome(path, home)), "path", path)
 	} else if os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Creating %s...\n", squishHome(path, home))
+		s.log.Info(fmt.Sprintf("Creating %s...", squishHome(path, home)), "path", path)
 	} else {
 		return err
 	}
@@ -206,7 +225,7 @@ func writeIfChanged(path, body, home string) error {
 	return os.WriteFile(path, []byte(body), 0o644)
 }
 
-func removeOrphans(paths config.Paths, keep map[string]struct{}) error {
+func (s *Service) removeOrphans(paths config.Paths, keep map[string]struct{}) error {
 	dirs := []string{
 		filepath.Join(paths.DataHome, "applications"),
 		filepath.Join(paths.ConfigHome, "autostart"),
@@ -234,7 +253,7 @@ func removeOrphans(paths config.Paths, keep map[string]struct{}) error {
 			if !owned {
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "Removing %s...\n", squishHome(path, paths.Home))
+			s.log.Info(fmt.Sprintf("Removing %s...", squishHome(path, paths.Home)), "path", path)
 			if err := os.Remove(path); err != nil {
 				return err
 			}

@@ -4,15 +4,19 @@ package instance
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"petris.dev/psbox/internal/bwrap"
 	"petris.dev/psbox/internal/config"
@@ -33,6 +37,8 @@ type Agent struct {
 	infraSeen  []InfraRoot
 	busAddr    string
 	busProc    *os.Process
+	busDone    chan error
+	workers    sync.WaitGroup
 	lastBusy   time.Time
 	uriWaiters map[string]chan Message
 }
@@ -61,13 +67,15 @@ func NewAgent(log *slog.Logger) *Agent {
 
 // Run serves the daemon control socket until idle exit or error.
 func (a *Agent) Run(ctx context.Context) error {
-	fdStr := os.Getenv(ControlFDEnv)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	fdStr := os.Getenv(config.ControlFDEnv)
 	if fdStr == "" {
 		return fmt.Errorf("psboxa requires a daemon control socket")
 	}
 	fd, err := strconv.Atoi(fdStr)
 	if err != nil || fd < 0 {
-		return fmt.Errorf("invalid %s", ControlFDEnv)
+		return fmt.Errorf("invalid %s", config.ControlFDEnv)
 	}
 	file := os.NewFile(uintptr(fd), "control")
 	if file == nil {
@@ -83,45 +91,60 @@ func (a *Agent) Run(ctx context.Context) error {
 		_ = conn.Close()
 		return fmt.Errorf("control socket is not a unix socket")
 	}
-	defer uc.Close()
+	defer func() {
+		cancel()
+		_ = uc.Close()
+		a.shutdown()
+		a.workers.Wait()
+	}()
 
 	a.lastBusy = a.now()
-	if os.Getenv(DBusEnv) == config.DBusPrivate {
+	if os.Getenv(config.DBusEnv) == config.DBusPrivate {
 		if err := a.startPrivateBus(ctx); err != nil {
 			return err
 		}
 	}
 	if hostURLsEnabled() {
-		go a.serveXDGOpen(ctx, uc)
+		a.workers.Go(func() { a.serveXDGOpen(ctx, uc) })
 	}
 
 	idle := time.NewTicker(time.Second)
 	defer idle.Stop()
 
-	msgc := make(chan readResult, 1)
-	go func() {
+	msgc := make(chan readResult)
+	a.workers.Go(func() {
 		for {
-			msg, files, err := ReadMsg(uc, 8)
-			msgc <- readResult{msg: msg, files: files, err: err}
+			msg, files, err := ReadMsg(uc, 3)
+			select {
+			case msgc <- readResult{msg: msg, files: files, err: err}:
+			case <-ctx.Done():
+				closeFiles(files)
+				return
+			}
 			if err != nil {
 				return
 			}
 		}
-	}()
+	})
 
 	for {
 		select {
 		case <-ctx.Done():
-			a.shutdown()
 			return ctx.Err()
+		case err := <-a.busDone:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err != nil {
+				return fmt.Errorf("private dbus-daemon exited: %w", err)
+			}
+			return fmt.Errorf("private dbus-daemon exited unexpectedly")
 		case <-idle.C:
 			if a.shouldExit() {
-				a.shutdown()
 				return nil
 			}
 		case res := <-msgc:
 			if res.err != nil {
-				a.shutdown()
 				return res.err
 			}
 			if err := a.handle(ctx, uc, res.msg, res.files); err != nil {
@@ -195,12 +218,16 @@ func (a *Agent) spawn(conn *net.UnixConn, msg Message, files []*os.File) error {
 	}
 
 	cmd := msg.Argv[0]
-	proc, err := os.StartProcess(lookPath(cmd, env), msg.Argv, &os.ProcAttr{
-		Dir:   cwd,
-		Env:   mapEnv(env),
-		Files: []*os.File{stdin, stdout, stderr},
-		Sys:   &syscall.SysProcAttr{Setpgid: true},
-	})
+	path, err := lookPath(cmd, env, cwd)
+	var proc *os.Process
+	if err == nil {
+		proc, err = os.StartProcess(path, msg.Argv, &os.ProcAttr{
+			Dir:   cwd,
+			Env:   mapEnv(env),
+			Files: []*os.File{stdin, stdout, stderr},
+			Sys:   &syscall.SysProcAttr{Setpgid: true},
+		})
+	}
 	if err != nil {
 		return WriteMsg(conn, Message{
 			Type:    TypeSpawnError,
@@ -218,11 +245,12 @@ func (a *Agent) spawn(conn *net.UnixConn, msg Message, files []*os.File) error {
 	a.mu.Unlock()
 	a.log.Info("command started", "command", cmd, "pid", proc.Pid)
 
-	if err := WriteMsg(conn, Message{Type: TypeSpawned, ID: msg.ID, PID: proc.Pid}, nil); err != nil {
-		return err
+	ackErr := WriteMsg(conn, Message{Type: TypeSpawned, ID: msg.ID, PID: proc.Pid}, nil)
+	if ackErr != nil {
+		_ = syscall.Kill(-proc.Pid, syscall.SIGKILL)
+		_ = proc.Kill()
 	}
-
-	go func() {
+	a.workers.Go(func() {
 		state, err := proc.Wait()
 		code, sig := waitStatus(state, err)
 		a.mu.Lock()
@@ -232,8 +260,8 @@ func (a *Agent) spawn(conn *net.UnixConn, msg Message, files []*os.File) error {
 		a.mu.Unlock()
 		a.log.Info("command exited", "command", cmd, "pid", proc.Pid, "code", code, "signal", sig)
 		_ = WriteMsg(conn, Message{Type: TypeExited, ID: msg.ID, Code: intPtr(code), Signal: sigPtr(sig)}, nil)
-	}()
-	return nil
+	})
+	return ackErr
 }
 
 func (a *Agent) signal(msg Message) error {
@@ -298,11 +326,12 @@ func (a *Agent) shutdown() {
 	a.mu.Unlock()
 	for _, s := range spawns {
 		if s.proc != nil {
-			_ = syscall.Kill(-s.pgid, syscall.SIGHUP)
+			_ = syscall.Kill(-s.pgid, syscall.SIGKILL)
+			_ = s.proc.Kill()
 		}
 	}
 	if proc != nil {
-		_ = proc.Signal(syscall.SIGTERM)
+		_ = proc.Kill()
 	}
 }
 
@@ -343,7 +372,7 @@ func spawnEnv(client map[string]string, busAddr string) map[string]string {
 }
 
 func hostURLsEnabled() bool {
-	return os.Getenv(HostURLsEnv) != HostURLsOff
+	return os.Getenv(config.HostURLsEnv) != config.HostURLsOff
 }
 
 func prependPATH(path, dir string) string {
@@ -364,27 +393,40 @@ func mapEnv(env map[string]string) []string {
 	return out
 }
 
-func lookPath(name string, env map[string]string) string {
+func lookPath(name string, env map[string]string, cwd string) (string, error) {
+	check := func(path string) (string, error) {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(cwd, path)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			return "", err
+		}
+		if st.IsDir() {
+			return "", &os.PathError{Op: "exec", Path: path, Err: syscall.EACCES}
+		}
+		if err := unix.Access(path, unix.X_OK); err != nil {
+			return "", &os.PathError{Op: "exec", Path: path, Err: err}
+		}
+		return path, nil
+	}
 	if strings.Contains(name, "/") {
-		return name
+		return check(name)
 	}
-	path := env["PATH"]
-	if path == "" {
-		path = os.Getenv("PATH")
-	}
-	if path == "" {
-		path = config.DefaultPATH
-	}
-	for _, dir := range strings.Split(path, ":") {
-		if dir == "" {
-			continue
+	var denied error
+	for _, dir := range filepath.SplitList(env["PATH"]) {
+		path, err := check(filepath.Join(dir, name))
+		if err == nil {
+			return path, nil
 		}
-		cand := dir + "/" + name
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			return cand
+		if errors.Is(err, syscall.EACCES) {
+			denied = err
 		}
 	}
-	return name
+	if denied != nil {
+		return "", denied
+	}
+	return "", &os.PathError{Op: "look up executable", Path: name, Err: syscall.ENOENT}
 }
 
 func waitStatus(st *os.ProcessState, err error) (code int, sig int) {
@@ -405,7 +447,8 @@ func errnoOf(err error) int {
 	if err == nil {
 		return 0
 	}
-	if errno, ok := err.(syscall.Errno); ok {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
 		return int(errno)
 	}
 	return int(syscall.EIO)

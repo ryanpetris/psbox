@@ -4,6 +4,7 @@ package objects
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,8 @@ const (
 	GeneratorMarker = "# @generator psbox"
 	ClientName      = "psbox"
 )
+
+var errTemplateMissing = errors.New("desktop template missing")
 
 // RewriteDesktop rewrites a desktop-entry body for application.
 func RewriteDesktop(entry *config.DesktopEntry, application string, paths config.Paths) (string, error) {
@@ -130,7 +133,7 @@ func rewriteExec(value, application string, paths config.Paths) string {
 		return launchExec(application) + " --command -- " + replaced
 	}
 	b := tokens[idx]
-	if filepath.Base(b) == b {
+	if idx == 0 && filepath.Base(b) == b {
 		remainder := ""
 		if spans[idx].end < len(value) {
 			remainder = value[spans[idx].end:]
@@ -251,7 +254,7 @@ func readDesktopTemplate(entry *config.DesktopEntry, paths config.Paths) (string
 		}
 		return string(data), nil
 	}
-	return "", fmt.Errorf("could not find desktop entry %q in %s", entry.Name, strings.Join(dirs, ", "))
+	return "", fmt.Errorf("%w: could not find desktop entry %q in %s", errTemplateMissing, entry.Name, strings.Join(dirs, ", "))
 }
 
 func ownedByGenerator(path string) (bool, error) {

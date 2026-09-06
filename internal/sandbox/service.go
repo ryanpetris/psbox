@@ -88,8 +88,8 @@ func (s *Service) Run(req Request, stdout io.Writer) error {
 	env := bwrap.EnvFromPaths(s.paths)
 	argv := bwrap.Argv(flags, env, req.Command)
 	if req.Print {
-		fmt.Fprintln(stdout, bwrap.Quote(argv))
-		return nil
+		_, err := fmt.Fprintln(stdout, bwrap.Quote(argv))
+		return err
 	}
 	return bwrap.Exec(flags, env, req.Command)
 }

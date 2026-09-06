@@ -1,6 +1,6 @@
 package instance
 
-// Host daemon: socket activation, compose/join/rebuild, xdg-open.
+// Host daemon: socket activation and serialized sandbox launch decisions.
 
 import (
 	"context"
@@ -24,22 +24,17 @@ const listenFD = 3
 
 // Daemon is psboxd for one (sandbox, instance).
 type Daemon struct {
-	log     *slog.Logger
-	loader  *config.Loader
-	paths   config.Paths
-	openURI func(uri string) error
-
+	log      *slog.Logger
+	loader   *config.Loader
+	paths    config.Paths
+	openURI  func(context.Context, string) error
+	command  func(context.Context, string, ...string) *exec.Cmd
 	sandbox  string
 	instance string
-
-	mu      sync.Mutex
-	app     *config.Application
-	hashes  bwrap.Hashes
-	bwrap   *exec.Cmd
-	agent   *net.UnixConn
-	seq     uint64
-	waiters map[string]chan Message
-	clients int
+	launchMu sync.Mutex
+	mu       sync.Mutex
+	active   *sandboxProcess
+	clients  int
 }
 
 // NewDaemon returns a host instance daemon.
@@ -47,13 +42,7 @@ func NewDaemon(log *slog.Logger, loader *config.Loader, paths config.Paths) *Dae
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Daemon{
-		log:     log,
-		loader:  loader,
-		paths:   paths,
-		openURI: hostOpenURI,
-		waiters: map[string]chan Message{},
-	}
+	return &Daemon{log: log, loader: loader, paths: paths, openURI: hostOpenURI, command: exec.CommandContext}
 }
 
 // Run is the psboxd process. identity is the escaped systemd %i value.
@@ -69,25 +58,7 @@ func (d *Daemon) Run(ctx context.Context, identity string) error {
 	if err != nil {
 		return err
 	}
-	d.sandbox = sandbox
-	d.instance = inst
-
-	col, err := d.loader.LoadPath(d.paths.ObjectPath, d.paths)
-	if err != nil {
-		return err
-	}
-	d.paths = d.paths.WithCollection(col)
-	app, err := col.LookupApplication(sandbox)
-	if err != nil {
-		return err
-	}
-	if app.SandboxTarget() != "" {
-		return fmt.Errorf("application %q is a sandbox referrer", sandbox)
-	}
-	if _, err := col.RequireApplication(sandbox); err != nil {
-		return err
-	}
-	d.app = app
+	d.sandbox, d.instance = sandbox, inst
 
 	file := os.NewFile(listenFD, "listen")
 	if file == nil {
@@ -100,28 +71,38 @@ func (d *Daemon) Run(ctx context.Context, identity string) error {
 		return fmt.Errorf("listen fd: %w", err)
 	}
 	defer ln.Close()
-
 	uln, ok := ln.(*net.UnixListener)
 	if !ok {
 		return fmt.Errorf("listen fd is not a unix socket")
 	}
 
-	go d.readAgent(ctx)
-
+	ctx, cancel := context.WithCancel(ctx)
+	var clients sync.WaitGroup
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer func() {
+		cancel()
+		stop()
+		_ = ln.Close()
+		clients.Wait()
+		d.mu.Lock()
+		active := d.active
+		d.mu.Unlock()
+		if active != nil {
+			active.stop()
+		}
+	}()
 	for {
 		if ctx.Err() != nil {
-			d.stopSandbox()
 			return ctx.Err()
 		}
-		// Always poll accept so sandbox exit and a finished client can
-		// wake the loop. An infinite deadline would leave psboxd stuck
-		// after the last connection or after bwrap exits.
-		_ = uln.SetDeadline(time.Now().Add(AcceptIdleTimeout))
+		if err := uln.SetDeadline(time.Now().Add(AcceptIdleTimeout)); err != nil {
+			return err
+		}
 		conn, err := uln.AcceptUnix()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				d.mu.Lock()
-				idle := d.bwrap == nil && d.clients == 0
+				idle := d.clients == 0 && (d.active == nil || d.active.finished())
 				d.mu.Unlock()
 				if idle {
 					return nil
@@ -131,327 +112,167 @@ func (d *Daemon) Run(ctx context.Context, identity string) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			d.log.Error("accept", "error", err)
-			continue
+			return fmt.Errorf("accept client: %w", err)
 		}
 		d.mu.Lock()
 		d.clients++
 		d.mu.Unlock()
-		go func() {
-			defer func() {
-				d.mu.Lock()
-				d.clients--
-				d.mu.Unlock()
-			}()
+		clients.Go(func() {
+			defer func() { d.mu.Lock(); d.clients--; d.mu.Unlock() }()
 			d.serveClient(ctx, conn)
-		}()
+		})
 	}
 }
 
 func (d *Daemon) serveClient(ctx context.Context, conn *net.UnixConn) {
 	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(SpawnReadTimeout))
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	if err := conn.SetReadDeadline(time.Now().Add(SpawnReadTimeout)); err != nil {
+		return
+	}
 	msg, files, err := ReadMsg(conn, 3)
 	if err != nil {
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{})
-	if msg.Type != TypeSpawn {
-		closeFiles(files)
-		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: "expected spawn"}, nil)
+	defer func() { closeFiles(files) }()
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
-	if msg.Protocol != 0 && msg.Protocol != ProtocolVersion {
-		closeFiles(files)
-		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: "unsupported protocol"}, nil)
-		return
+	var invalid string
+	switch {
+	case msg.Type != TypeSpawn:
+		invalid = "expected spawn"
+	case msg.Protocol != 0 && msg.Protocol != ProtocolVersion:
+		invalid = "unsupported protocol"
+	case msg.Sandbox != "" && msg.Sandbox != d.sandbox:
+		invalid = "sandbox mismatch"
 	}
-	if msg.Sandbox != "" && msg.Sandbox != d.sandbox {
-		closeFiles(files)
-		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: "sandbox mismatch"}, nil)
+	if invalid != "" {
+		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: invalid}, nil)
 		return
 	}
 
-	id, err := d.ensureSandbox(msg)
+	// A launch decision and its registered spawn form one operation. Another
+	// launch cannot rebuild an idle sandbox between these two steps.
+	d.launchMu.Lock()
+	run, err := d.ensureSandbox(ctx, msg)
+	var id string
+	var replies chan Message
+	if err == nil {
+		id, replies, err = run.request(msg, files)
+	}
+	d.launchMu.Unlock()
 	if err != nil {
-		closeFiles(files)
-		cfg, run := d.hashHex()
-		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: err.Error(), ConfigHash: cfg, RunningHash: run}, nil)
-		return
-	}
-
-	msg.ID = id
-	if err := WriteMsg(d.agentConn(), msg, files); err != nil {
-		closeFiles(files)
 		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: err.Error()}, nil)
 		return
 	}
+	defer run.unwaiter(id)
 	closeFiles(files)
-
-	ch := d.waiter(id)
-	defer d.unwaiter(id)
+	files = nil
+	cfg, running := run.hashes.Hex()
 
 	var spawned Message
 	select {
-	case spawned = <-ch:
+	case reply, ok := <-replies:
+		if !ok {
+			_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: "sandbox agent disconnected"}, nil)
+			return
+		}
+		spawned = reply
 	case <-ctx.Done():
 		return
 	case <-time.After(FirstReplyTimeout):
+		_ = WriteMsg(run.conn, Message{Type: TypeSignal, ID: id, Signum: int(syscall.SIGHUP)}, nil)
 		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: "agent spawn timeout"}, nil)
 		return
 	}
-	if spawned.Type == TypeSpawnError {
-		cfg, run := d.hashHex()
-		spawned.ConfigHash = cfg
-		spawned.RunningHash = run
-		_ = WriteMsg(conn, spawned, nil)
+	spawned.ConfigHash, spawned.RunningHash = cfg, running
+	if spawned.Type != TypeSpawned && spawned.Type != TypeSpawnError {
+		_ = WriteMsg(conn, Message{Type: TypeSpawnError, Message: "unexpected agent spawn reply"}, nil)
 		return
 	}
-	cfg, run := d.hashHex()
-	spawned.ConfigHash = cfg
-	spawned.RunningHash = run
 	if err := WriteMsg(conn, spawned, nil); err != nil {
-		_ = WriteMsg(d.agentConn(), Message{Type: TypeSignal, ID: id, Signum: int(syscall.SIGHUP)}, nil)
+		_ = WriteMsg(run.conn, Message{Type: TypeSignal, ID: id, Signum: int(syscall.SIGHUP)}, nil)
+		return
+	}
+	if spawned.Type == TypeSpawnError {
 		return
 	}
 
-	errc := make(chan error, 1)
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		for {
 			msg, _, err := ReadMsg(conn, 0)
 			if err != nil {
-				errc <- err
 				return
 			}
 			if msg.Type == TypeSignal {
 				msg.ID = id
-				_ = WriteMsg(d.agentConn(), msg, nil)
-			}
-		}
-	}()
-
-	select {
-	case exited := <-ch:
-		_ = WriteMsg(conn, exited, nil)
-	case <-errc:
-		_ = WriteMsg(d.agentConn(), Message{Type: TypeSignal, ID: id, Signum: int(syscall.SIGHUP)}, nil)
-	case <-ctx.Done():
-		_ = WriteMsg(d.agentConn(), Message{Type: TypeSignal, ID: id, Signum: int(syscall.SIGHUP)}, nil)
-	}
-}
-
-func (d *Daemon) ensureSandbox(spawn Message) (string, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	env := composeEnvFromSpawn(spawn.Env, d.paths)
-	hashes, err := bwrap.ComputeHashes(d.app, d.paths, env)
-	if err != nil {
-		return "", err
-	}
-
-	if d.bwrap == nil {
-		if err := d.startSandboxLocked(env); err != nil {
-			return "", err
-		}
-		d.hashes = hashes
-		return d.nextIDLocked(), nil
-	}
-
-	same := hashesEqual(d.hashes, hashes)
-	if !same {
-		if d.queryWorkloadLocked() {
-			d.log.Error("instance hashes differ; joining because workload is present")
-		} else {
-			d.stopSandboxLocked()
-			if err := d.startSandboxLocked(env); err != nil {
-				return "", err
-			}
-			d.hashes = hashes
-			return d.nextIDLocked(), nil
-		}
-	}
-	return d.nextIDLocked(), nil
-}
-
-func (d *Daemon) startSandboxLocked(env bwrap.Env) error {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return err
-	}
-	parent := os.NewFile(uintptr(fds[0]), "agent-parent")
-	child := os.NewFile(uintptr(fds[1]), "agent-child")
-	unix.CloseOnExec(fds[0])
-
-	flags := bwrap.FlagsFromApplication(d.app, d.paths)
-	if flags.Home != "" {
-		if err := os.MkdirAll(flags.Home, 0o700); err != nil && !os.IsExist(err) {
-			_ = parent.Close()
-			_ = child.Close()
-			return err
-		}
-	}
-	argv := bwrap.Argv(flags, env, bwrap.InstanceTrailing(d.app, d.paths, d.paths.Agent, 3))
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Stdin = nil
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	cmd.ExtraFiles = []*os.File{child}
-	if err := cmd.Start(); err != nil {
-		_ = parent.Close()
-		_ = child.Close()
-		return fmt.Errorf("start bwrap: %w", err)
-	}
-	_ = child.Close()
-
-	fc, err := net.FileConn(parent)
-	_ = parent.Close()
-	if err != nil {
-		_ = cmd.Process.Kill()
-		return err
-	}
-	uc, ok := fc.(*net.UnixConn)
-	if !ok {
-		_ = fc.Close()
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("agent socket is not a unix socket")
-	}
-	d.bwrap = cmd
-	d.agent = uc
-
-	go func() {
-		err := cmd.Wait()
-		d.log.Info("sandbox exited", "error", err)
-		d.mu.Lock()
-		if d.bwrap == cmd {
-			d.bwrap = nil
-			if d.agent != nil {
-				_ = d.agent.Close()
-				d.agent = nil
-			}
-		}
-		d.mu.Unlock()
-	}()
-	return nil
-}
-
-func (d *Daemon) stopSandbox() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.stopSandboxLocked()
-}
-
-func (d *Daemon) stopSandboxLocked() {
-	if d.agent != nil {
-		_ = d.agent.Close()
-		d.agent = nil
-	}
-	if d.bwrap != nil && d.bwrap.Process != nil {
-		_ = d.bwrap.Process.Kill()
-		_, _ = d.bwrap.Process.Wait()
-		d.bwrap = nil
-	}
-}
-
-func (d *Daemon) queryWorkloadLocked() bool {
-	if d.agent == nil {
-		return false
-	}
-	id := d.nextIDLocked()
-	ch := make(chan Message, 1)
-	d.waiters[id] = ch
-	if err := WriteMsg(d.agent, Message{Type: TypeQueryLiveness, ID: id}, nil); err != nil {
-		delete(d.waiters, id)
-		return true
-	}
-	d.mu.Unlock()
-	var msg Message
-	select {
-	case msg = <-ch:
-	case <-time.After(FirstReplyTimeout):
-		msg.Workload = true
-	}
-	d.mu.Lock()
-	delete(d.waiters, id)
-	return msg.Workload
-}
-
-func (d *Daemon) readAgent(ctx context.Context) {
-	for ctx.Err() == nil {
-		conn := d.agentConn()
-		if conn == nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
-				continue
-			}
-		}
-		msg, _, err := ReadMsg(conn, 0)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
-				continue
-			}
-		}
-		switch msg.Type {
-		case TypeOpenURI:
-			d.handleOpenURI(conn, msg)
-		default:
-			d.mu.Lock()
-			ch := d.waiters[msg.ID]
-			d.mu.Unlock()
-			if ch != nil {
-				select {
-				case ch <- msg:
-				default:
+				if err := WriteMsg(run.conn, msg, nil); err != nil {
+					return
 				}
 			}
 		}
+	}()
+	defer func() { _ = conn.Close(); <-readerDone }()
+	select {
+	case exited, ok := <-replies:
+		if !ok {
+			exited = Message{Type: TypeSpawnError, ID: id, Message: "sandbox agent disconnected"}
+		}
+		_ = WriteMsg(conn, exited, nil)
+	case <-readerDone:
+		_ = WriteMsg(run.conn, Message{Type: TypeSignal, ID: id, Signum: int(syscall.SIGHUP)}, nil)
+	case <-ctx.Done():
+		_ = WriteMsg(run.conn, Message{Type: TypeSignal, ID: id, Signum: int(syscall.SIGHUP)}, nil)
 	}
 }
 
-func (d *Daemon) handleOpenURI(conn *net.UnixConn, msg Message) {
-	err := d.openURI(msg.URI)
-	out := Message{Type: TypeOpenURIResult, ID: msg.ID, OK: err == nil}
+// ensureSandbox runs with launchMu held. The original process paths remain the
+// reload baseline so removing a collection option restores its process default.
+func (d *Daemon) ensureSandbox(ctx context.Context, spawn Message) (*sandboxProcess, error) {
+	col, err := d.loader.LoadPath(d.paths.ObjectPath, d.paths)
 	if err != nil {
-		out.Message = err.Error()
-		out.OK = false
+		return nil, err
 	}
-	_ = WriteMsg(conn, out, nil)
-}
-
-func (d *Daemon) agentConn() *net.UnixConn {
+	app, err := col.RequireApplication(d.sandbox)
+	if err != nil {
+		return nil, err
+	}
+	if app.SandboxTarget() != "" {
+		return nil, fmt.Errorf("application %q is a sandbox referrer", d.sandbox)
+	}
+	paths := d.paths.WithCollection(col)
+	env := composeEnvFromSpawn(spawn.Env, paths)
+	hashes, err := bwrap.ComputeHashes(app, paths, env)
+	if err != nil {
+		return nil, err
+	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.agent
-}
-
-func (d *Daemon) waiter(id string) chan Message {
-	ch := make(chan Message, 2)
-	d.mu.Lock()
-	d.waiters[id] = ch
+	active := d.active
 	d.mu.Unlock()
-	return ch
-}
-
-func (d *Daemon) unwaiter(id string) {
+	if active != nil && !active.finished() {
+		if hashesEqual(active.hashes, hashes) {
+			return active, nil
+		}
+		if active.workload(ctx) {
+			d.log.Warn("instance hashes differ; joining because workload is present")
+			return active, nil
+		}
+	}
+	if active != nil {
+		active.stop()
+	}
+	run, err := d.startSandbox(ctx, app, paths, env, hashes)
+	if err != nil {
+		return nil, err
+	}
 	d.mu.Lock()
-	delete(d.waiters, id)
+	d.active = run
 	d.mu.Unlock()
-}
-
-func (d *Daemon) nextIDLocked() string {
-	d.seq++
-	return strconv.FormatUint(d.seq, 10)
-}
-
-func (d *Daemon) hashHex() (string, string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.hashes.Hex()
+	return run, nil
 }
 
 func hashesEqual(a, b bwrap.Hashes) bool {
@@ -470,14 +291,4 @@ func validateListenFDs() error {
 		return fmt.Errorf("LISTEN_PID does not match this process")
 	}
 	return nil
-}
-
-func hostOpenURI(uri string) error {
-	if err := CheckHostOpenURI(uri); err != nil {
-		return err
-	}
-	cmd := exec.Command("xdg-open", uri)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }

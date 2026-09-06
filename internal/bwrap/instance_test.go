@@ -31,7 +31,7 @@ func TestInstanceTrailingSymlinksXDGOpen(t *testing.T) {
 	if !containsSeq(got, "--symlink", "/usr/bin/psboxa", shim) {
 		t.Fatalf("missing xdg-open symlink: %v", got)
 	}
-	if !containsSeq(got, "--setenv", ControlFDEnv, "3") {
+	if !containsSeq(got, "--setenv", config.ControlFDEnv, "3") {
 		t.Fatalf("missing control fd: %v", got)
 	}
 	if got[len(got)-1] != "/usr/bin/psboxa" {
@@ -77,10 +77,10 @@ func TestInstanceTrailingHostURLsOff(t *testing.T) {
 	if containsSeq(got, "--dir", XDGOpenBinDir(paths.RuntimeDir)) {
 		t.Fatalf("host-urls: false must not create shim dir: %v", got)
 	}
-	if !containsSeq(got, "--setenv", HostURLsEnv, HostURLsOff) {
-		t.Fatalf("host-urls: false should set %s: %v", HostURLsEnv, got)
+	if !containsSeq(got, "--setenv", config.HostURLsEnv, config.HostURLsOff) {
+		t.Fatalf("host-urls: false should set %s: %v", config.HostURLsEnv, got)
 	}
-	if !containsSeq(got, "--setenv", ControlFDEnv, "3") {
+	if !containsSeq(got, "--setenv", config.ControlFDEnv, "3") {
 		t.Fatalf("missing control fd: %v", got)
 	}
 }
@@ -94,8 +94,8 @@ func TestInstanceTrailingPrivateDBusEnv(t *testing.T) {
 		Options: config.ApplicationOptions{DBus: &priv},
 	}}
 	got := InstanceTrailing(app, paths, "/usr/bin/psboxa", 3)
-	if !containsSeq(got, "--setenv", DBusEnv, config.DBusPrivate) {
-		t.Fatalf("private dbus should set %s: %v", DBusEnv, got)
+	if !containsSeq(got, "--setenv", config.DBusEnv, config.DBusPrivate) {
+		t.Fatalf("private dbus should set %s: %v", config.DBusEnv, got)
 	}
 }
 

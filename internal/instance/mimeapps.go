@@ -3,6 +3,7 @@ package instance
 // Sandbox mimeapps defaults so GIO http(s) opens go through psboxa.
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,17 +38,15 @@ func ensureHostURLHandler(env map[string]string) error {
 	return updateMimeappsList(filepath.Join(configHome, "mimeapps.list"))
 }
 
+//go:embed assets/open-url.desktop
+var hostURLDesktopTemplate string
+
 func writeHostURLDesktop(path string) error {
 	exe := "psboxa"
 	if p, err := os.Executable(); err == nil && p != "" {
 		exe = p
 	}
-	body := "[Desktop Entry]\n" +
-		"Type=Application\n" +
-		"Name=Open URL on host\n" +
-		"Exec=" + quoteDesktopExec(exe) + " xdg-open %u\n" +
-		"NoDisplay=true\n" +
-		"MimeType=x-scheme-handler/http;x-scheme-handler/https;\n"
+	body := strings.ReplaceAll(hostURLDesktopTemplate, "{{EXECUTABLE}}", quoteDesktopExec(exe))
 	return os.WriteFile(path, []byte(body), 0o644)
 }
 
