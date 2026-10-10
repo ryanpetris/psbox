@@ -55,6 +55,9 @@ func (c *Collection) checkSandbox(name string, app *Application) error {
 	if opts.Downloads != nil {
 		offending = append(offending, "options.downloads")
 	}
+	if opts.Dev != nil {
+		offending = append(offending, "options.dev")
+	}
 	if app.Type != "" {
 		offending = append(offending, "metadata.type")
 	}

@@ -25,6 +25,10 @@ const (
 	DBusPrivate = "private"
 	DBusOff     = "off"
 
+	DevPrivate    = "private"
+	DevHost       = "host"
+	DevPrivateSHM = "private-shm"
+
 	CacheTmpfs = "tmpfs"
 	CacheHome  = "home"
 )
@@ -64,6 +68,7 @@ type ApplicationOptions struct {
 	HostURLs   *bool
 	Cache      *string
 	Downloads  *bool
+	Dev        *string
 }
 
 // ApplicationSpec is the spec: of an Application object.

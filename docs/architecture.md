@@ -31,9 +31,16 @@ the workload. Those are not self-calls.
 ## Compose
 
 Every sandbox gets `--die-with-parent`, `--unshare-pid`, and
-`--new-session`, a fresh `/proc`, `/dev`, and `/tmp`, and read-only
+`--new-session`, a fresh `/proc` and `/tmp`, and read-only
 tries of `/usr`, `/etc`, `/opt`, `/sys`, plus usrmerge symlinks for
 `/bin`, `/sbin`, `/lib`, and `/lib64`.
+
+`options.dev` defaults to `private`: a fresh `/dev` with private shared
+memory and pseudo-terminals plus selective device binds. `true`/`host`
+binds host `/dev` instead. `private-shm` binds host `/dev`, then mounts a
+private tmpfs with mode `1777` over `/dev/shm`. Both host modes share host
+pseudo-terminals and skip selective device binds while retaining audio and
+display socket integration. Device exclusions are rejected for host modes.
 
 `$XDG_RUNTIME_DIR` is a tmpfs. Selected sockets are bound back in:
 Wayland, Pulse, PipeWire, and D-Bus sockets when enabled. `dbus:
@@ -78,3 +85,25 @@ for slog text (time, level, message, and attributes).
 Distro recipes consume the in-tree `systemd/` units and the three
 binaries. Object collections for real applications live with the
 packager.
+
+## Device manual validation
+
+See [AGENTS.md](../AGENTS.md#build-test-and-release) for the development
+checks and analysis gates.
+
+Device mount checks run manually on a Linux host. They require a working
+Bubblewrap environment; the automated tests validate parsing, composition,
+and configuration hashes without requiring nested sandboxes.
+
+Host manual checks for device modes:
+
+1. Create a temporary marker in host `/dev/shm`. Confirm it is visible with
+   `psbox sandbox --no-home --dev host -- ls /dev/shm`, and hidden with
+   `--dev private` and `--dev private-shm`. Remove the marker afterward.
+2. Check `stat -c %a /dev/shm` inside `--dev private-shm`; it must print
+   `1777`.
+3. Compare host `/dev/pts` with each sandbox mode. `host` and `private-shm`
+   expose host terminal nodes; `private` has its own terminal filesystem.
+4. Keep a sandbox running with `host` or `private-shm`, then connect a
+   hidraw device. Confirm the new `/dev/hidraw*` path appears and follows
+   host access permissions.

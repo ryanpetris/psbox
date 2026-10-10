@@ -1,0 +1,26 @@
+version: v1
+kind: Application
+metadata:
+  name: "true"
+spec:
+  exec: true
+  options:
+    dev: true
+---
+version: v1
+kind: Application
+metadata:
+  name: host
+spec:
+  exec: true
+  options:
+    dev: host
+---
+version: v1
+kind: Application
+metadata:
+  name: private-shm
+spec:
+  exec: true
+  options:
+    dev: private-shm

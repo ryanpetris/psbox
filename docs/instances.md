@@ -63,7 +63,7 @@ Each sandbox has a **config hash** and a **running hash** (blake2b-512).
 
 Config hash includes home, non-default audio/video/display/fontconfig,
 non-host dbus, `host-urls: false`, `cache: home`, `downloads: true`,
-and `bwrap-args`. It does not include isolation, `exec`,
+non-private `dev`, and `bwrap-args`. It does not include isolation, `exec`,
 `default-args`, `env`, or `metadata.type`. Type defaults are hashed as
 the options they fill.
 

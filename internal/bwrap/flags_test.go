@@ -9,6 +9,27 @@ import (
 	"petris.dev/psbox/internal/config"
 )
 
+func TestApplicationDevFlags(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []string{config.DevPrivate, config.DevHost, config.DevPrivateSHM} {
+		t.Run(mode, func(t *testing.T) {
+			app := &config.Application{Spec: config.ApplicationSpec{Options: config.ApplicationOptions{Dev: &mode}}}
+			flags := FlagsFromApplication(app, testPaths(t))
+			if flags.Dev != mode {
+				t.Fatalf("Dev = %q, want %q", flags.Dev, mode)
+			}
+			args := flags.Args()
+			if mode != config.DevPrivate && !containsSeq(args, "--dev", mode) {
+				t.Fatalf("missing device mode in sandbox arguments: %v", args)
+			}
+			if mode == config.DevPrivate && slices.Contains(args, "--dev") {
+				t.Fatalf("default mode should be omitted: %v", args)
+			}
+		})
+	}
+}
+
 func TestLaunchSandboxArgvPrintShape(t *testing.T) {
 	t.Parallel()
 

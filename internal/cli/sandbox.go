@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"petris.dev/psbox/internal/complete"
+	"petris.dev/psbox/internal/config"
 	"petris.dev/psbox/internal/sandbox"
 )
 
@@ -34,9 +35,11 @@ func newSandboxCommand(svc *sandbox.Service) *cobra.Command {
 	cmd.Flags().BoolVar(&req.NoDisplay, "no-display", false, "disable display support")
 	cmd.Flags().StringVar(&req.Cache, "cache", "", "cache location (`tmpfs` or `home`); default tmpfs")
 	cmd.Flags().BoolVar(&req.Downloads, "downloads", false, "bind the host Downloads directory")
+	cmd.Flags().StringVar(&req.Dev, "dev", config.DevPrivate, "device filesystem: private, true/host, or private-shm")
 	cmd.Flags().BoolVar(&req.Print, "print", false, "print the bwrap command instead of running it")
 	cmd.MarkFlagsMutuallyExclusive("home", "home-tmpfs", "no-home")
 	cmd.MarkFlagsMutuallyExclusive("no-dbus", "no-session-dbus")
+	_ = cmd.RegisterFlagCompletionFunc("dev", cobra.FixedCompletions([]string{"true", config.DevHost, config.DevPrivate, config.DevPrivateSHM}, cobra.ShellCompDirectiveNoFileComp))
 	_ = cmd.MarkFlagDirname("home")
 	return cmd
 }

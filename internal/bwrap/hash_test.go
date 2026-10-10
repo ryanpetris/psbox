@@ -11,6 +11,40 @@ import (
 	"petris.dev/psbox/internal/config"
 )
 
+func TestDevConfigHashes(t *testing.T) {
+	t.Parallel()
+
+	paths := testPaths(t)
+	env := EnvFromPaths(paths)
+	hashes := make(map[string][]byte)
+	for _, value := range []string{"", config.DevPrivate, "true", config.DevHost, config.DevPrivateSHM} {
+		app := &config.Application{Name: "app"}
+		if value != "" {
+			mode, err := config.ParseDev(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			app.Spec.Options.Dev = &mode
+		}
+		hash, err := ComputeHashes(app, paths, env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashes[value] = hash.Config
+	}
+	if !bytes.Equal(hashes[""], hashes[config.DevPrivate]) {
+		t.Fatal("explicit private must hash like the omitted default")
+	}
+	if !bytes.Equal(hashes["true"], hashes[config.DevHost]) {
+		t.Fatal("true and host must hash identically")
+	}
+	for _, pair := range [][2]string{{config.DevPrivate, config.DevHost}, {config.DevPrivate, config.DevPrivateSHM}, {config.DevHost, config.DevPrivateSHM}} {
+		if bytes.Equal(hashes[pair[0]], hashes[pair[1]]) {
+			t.Fatalf("%s and %s must have different hashes", pair[0], pair[1])
+		}
+	}
+}
+
 func TestHashOmitsDefaultsAndSortsKeys(t *testing.T) {
 	t.Parallel()
 

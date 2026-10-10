@@ -527,7 +527,13 @@ func TestInvalidFilenameStemKeepsIndependentObjects(t *testing.T) {
 }
 
 func TestDecodeDBusValues(t *testing.T) {
-	for value, want := range map[string]string{"host": DBusHost, "true": DBusHost, "off": DBusOff, "false": DBusOff, "private": DBusPrivate} {
+	t.Parallel()
+
+	for value, want := range map[string]string{
+		"host": DBusHost, "true": DBusHost, "True": DBusHost, "TRUE": DBusHost,
+		`"true"`: DBusHost, "off": DBusOff, "false": DBusOff, "False": DBusOff,
+		"FALSE": DBusOff, `"false"`: DBusOff, "private": DBusPrivate,
+	} {
 		var node yaml.Node
 		if err := yaml.Unmarshal([]byte(value), &node); err != nil {
 			t.Fatal(err)
@@ -535,6 +541,50 @@ func TestDecodeDBusValues(t *testing.T) {
 		got, err := decodeDBus(*node.Content[0])
 		if err != nil || got != want {
 			t.Fatalf("%s: got %q, %v; want %q", value, got, err, want)
+		}
+	}
+}
+
+func TestDecodeBoolText(t *testing.T) {
+	t.Parallel()
+
+	for value, want := range map[string]string{
+		"true": "true", "True": "true", "TRUE": "true",
+		"false": "false", "False": "false", "FALSE": "false",
+		`"True"`: "True", `"FALSE"`: "FALSE", `""`: "",
+		"yes": "yes", "on": "on", "y": "y", `"on"`: "on",
+		"arbitrary-option": "arbitrary-option",
+	} {
+		var node yaml.Node
+		if err := yaml.Unmarshal([]byte(value), &node); err != nil {
+			t.Fatal(err)
+		}
+		got, err := decodeBoolText(*node.Content[0])
+		if err != nil || got != want {
+			t.Fatalf("%s: got %q, %v; want %q", value, got, err, want)
+		}
+	}
+	for _, value := range []string{"null", "123", "[]", "{}"} {
+		var node yaml.Node
+		if err := yaml.Unmarshal([]byte(value), &node); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeBoolText(*node.Content[0]); err == nil {
+			t.Fatalf("expected boolean/string type error for %s", value)
+		}
+	}
+}
+
+func TestDecodeDBusValidation(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"y", "Y", "yes", "Yes", "YES", "on", "On", "ON", "n", "N", "no", "No", "NO", `"on"`, `"yes"`, `"y"`, `"True"`, `"TRUE"`, "unknown", "null", "123", "[]", "{}"} {
+		var node yaml.Node
+		if err := yaml.Unmarshal([]byte(value), &node); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeDBus(*node.Content[0]); err == nil || !strings.Contains(err.Error(), "options.dbus") {
+			t.Fatalf("expected dbus validation error for %s, got %v", value, err)
 		}
 	}
 }

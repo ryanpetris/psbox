@@ -26,6 +26,7 @@ type Request struct {
 	NoDisplay     bool
 	Cache         string
 	Downloads     bool
+	Dev           string
 	Print         bool
 	Command       []string
 }
@@ -42,6 +43,25 @@ func NewService(paths config.Paths) *Service {
 
 // Run prints or executes the composed bwrap command.
 func (s *Service) Run(req Request, stdout io.Writer) error {
+	dev, err := config.ParseDev(req.Dev)
+	if err != nil {
+		return fmt.Errorf("--dev: %w", err)
+	}
+	if dev != config.DevPrivate {
+		for _, exclusion := range []struct {
+			flag    string
+			enabled bool
+		}{
+			{"--no-audio", req.NoAudio},
+			{"--no-video", req.NoVideo},
+			{"--no-evdev", req.NoEvdev},
+			{"--no-display", req.NoDisplay},
+		} {
+			if exclusion.enabled {
+				return fmt.Errorf("--dev %s conflicts with %s", dev, exclusion.flag)
+			}
+		}
+	}
 	if req.Home != "" && (req.HomeTmpfs || req.NoHome) {
 		return fmt.Errorf("--home, --home-tmpfs, and --no-home are mutually exclusive")
 	}
@@ -84,6 +104,7 @@ func (s *Service) Run(req Request, stdout io.Writer) error {
 		NoDisplay:     req.NoDisplay,
 		CacheHome:     req.Cache == config.CacheHome,
 		Downloads:     req.Downloads,
+		Dev:           dev,
 	}
 	env := bwrap.EnvFromPaths(s.paths)
 	argv := bwrap.Argv(flags, env, req.Command)

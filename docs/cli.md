@@ -118,6 +118,7 @@ psbox sandbox [flags] -- <command>
 | `--home DIR` | Bind this directory as `$HOME` |
 | `--home-tmpfs` | Empty tmpfs home |
 | `--no-home` | No home bind |
+| `--dev MODE` | `private` (default), `true`/`host`, or `private-shm` |
 | `--no-audio` | No audio devices or sockets |
 | `--no-video` | No video devices |
 | `--no-dbus` | No system or session bus |
@@ -132,6 +133,14 @@ psbox sandbox [flags] -- <command>
 
 `--home`, `--home-tmpfs`, and `--no-home` are mutually exclusive.
 `--no-dbus` and `--no-session-dbus` are mutually exclusive.
+
+`--dev true` and `--dev host` bind the entire host `/dev`, including shared
+memory and pseudo-terminals. `--dev private-shm` also binds host `/dev`, but
+covers `/dev/shm` with a private tmpfs; host pseudo-terminals remain shared.
+Both host modes expose newly connected devices, subject to host permissions.
+They conflict with `--no-audio`, `--no-video`, `--no-evdev`, and
+`--no-display`. `--dev false` is invalid. Application launches select the
+same behavior through `spec.options.dev`.
 
 `psbox launch` must not exec `psbox sandbox`. Both call the same
 in-process compose.

@@ -78,6 +78,9 @@ func canonicalConfig(app *config.Application, paths config.Paths) ([]byte, error
 	if opts.Downloads != nil && *opts.Downloads {
 		body["downloads"] = true
 	}
+	if dev := app.Dev(); dev != config.DevPrivate {
+		body["dev"] = dev
+	}
 	if args := hashBwrapArgs(app.Spec.BwrapArgs, paths); len(args) > 0 {
 		body["bwrap-args"] = args
 	}

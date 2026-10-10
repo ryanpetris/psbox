@@ -5,7 +5,39 @@ package bwrap
 import (
 	"slices"
 	"testing"
+
+	"petris.dev/psbox/internal/config"
 )
+
+func TestComposeDev(t *testing.T) {
+	t.Parallel()
+
+	env := Env{Home: "/home/u", RuntimeDir: "/run/user/1000"}
+	for _, mode := range []string{"", config.DevPrivate, config.DevHost, config.DevPrivateSHM} {
+		t.Run(mode, func(t *testing.T) {
+			got := Compose(Flags{Dev: mode}, env)
+			host := mode == config.DevHost || mode == config.DevPrivateSHM
+			if containsSeq(got, "--dev-bind", "/dev", "/dev") != host || containsSeq(got, "--dev", "/dev") == host {
+				t.Fatalf("device root for %q: %v", mode, got)
+			}
+			if mode == config.DevPrivateSHM {
+				if !containsSeq(got, "--dev-bind", "/dev", "/dev", "--perms", "1777", "--tmpfs", "/dev/shm") {
+					t.Fatalf("private shared memory must cover host /dev/shm with mode 1777: %v", got)
+				}
+			} else if containsSeq(got, "--tmpfs", "/dev/shm") {
+				t.Fatalf("unexpected shared memory override: %v", got)
+			}
+			for _, path := range []string{"/dev/snd", "/dev/v4l", "/dev/input", "/dev/dri"} {
+				if containsSeq(got, "--dev-bind-try", path, path) == host {
+					t.Fatalf("selective device bind %q for %q: %v", path, mode, got)
+				}
+			}
+			if !containsSeq(got, "--ro-bind-try", "/run/user/1000/pulse", "/run/user/1000/pulse") || !containsSeq(got, "--ro-bind-try", "/run/user/1000/wayland-0", "/run/user/1000/wayland-0") {
+				t.Fatalf("device mode must preserve audio and display integration: %v", got)
+			}
+		})
+	}
+}
 
 func TestComposeCacheTmpfs(t *testing.T) {
 	t.Parallel()

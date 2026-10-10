@@ -90,6 +90,7 @@ expand to the host home (not the private home).
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `home` | `$PSBOX_ROOT/<sandbox>` | Private home path, `:tmpfs:`, or `:none:` |
+| `dev` | `private` | `true`/`host`, `private`, or `private-shm`; see device access below |
 | `audio` | `true` | Pulse/PipeWire and `/dev/snd` |
 | `video` | `true` | `/dev/video*` and `/dev/v4l` |
 | `dbus` | host | `true`/`host`, `private`, or `false`/`off` |
@@ -101,9 +102,57 @@ expand to the host home (not the private home).
 | `downloads` | `false` | Bind the host `Downloads` directory into `$HOME/Downloads` |
 | `sandbox` | unset | Name of the application that owns the sandbox |
 
-Boolean options that are omitted or `true` do not change the config
-hash. Setting `false` does. `cache: tmpfs` (the default) is omitted
-from the hash; `cache: home` is included.
+Boolean integration options (`audio`, `video`, `display`, `fontconfig`,
+and `host-urls`) that are omitted or `true` do not change the config hash.
+Setting `false` does. `cache: tmpfs` (the default) is omitted from the
+hash; `cache: home` is included.
+
+`dev` and `dbus` accept YAML booleans or strings. Unquoted `True`/`TRUE`
+and `False`/`FALSE` normalize to `true` and `false`; each option then
+validates its supported values. Strings are case-sensitive and are not
+interpreted as booleans. YAML 1.1 words such as `yes`, `on`, and `y` are
+not supported values, whether quoted or unquoted.
+
+### Device access
+
+`dev` accepts a single scalar value:
+
+- `private` (default): a private `/dev`, including private shared memory and
+  pseudo-terminals, with the selected audio, video, input/hidraw, and graphics
+  devices bound in. Root-level devices such as `/dev/hidraw*` and `/dev/video*`
+  are enumerated at sandbox creation.
+- `true` or `host`: bind the entire host `/dev`, including `/dev/shm` and
+  `/dev/pts`. Newly created host device nodes appear in the running sandbox.
+- `private-shm`: bind host `/dev`, then cover `/dev/shm` with a private tmpfs
+  with mode `1777`. Host `/dev/pts` remains shared, and device hotplug remains
+  visible.
+
+For example:
+
+```yaml
+spec:
+  options:
+    dev: private-shm
+```
+
+Host device modes cannot be combined with `audio: false`, `video: false`, or
+`display: false`, because those settings include device exclusions.
+`false` is not a valid device mode.
+
+Host device modes expose every device that host permissions allow the user
+to access. They also expose other host terminal paths belonging to that user.
+`--new-session` detaches the sandbox from its inherited controlling terminal;
+it does not hide host terminal paths or prevent permitted reads, writes, or
+terminal-setting changes. Enabling `dev.tty.legacy_tiocsti` alone does not
+permit `TIOCSTI` input injection into arbitrary host terminals: Linux also
+requires the target to be the caller's controlling terminal or the caller
+to have `CAP_SYS_ADMIN` in the initial user namespace.
+
+`dev: true` and `dev: host` normalize to the same mode and config hash.
+Omitted `dev` and explicit `dev: private` hash identically. `host` and
+`private-shm` have distinct hashes.
+
+### D-Bus access
 
 `dbus: private` binds neither the host session bus nor the system bus
 (`/run/dbus`). Instance isolation starts `dbus-daemon --session --nofork`
@@ -145,7 +194,7 @@ Launch identity is the **target** (`firefox`), so
 `psbox launch firefox-work` joins `firefox/default`. The referrer may set
 `exec`, `default-args`, and `env` only. Setting home, audio, video,
 dbus, display, fontconfig, isolation, `host-urls`, `cache`,
-`downloads`, `metadata.type`, or `bwrap-args` on a referrer is a
+`downloads`, `dev`, `metadata.type`, or `bwrap-args` on a referrer is a
 collection error: the referrer is omitted from lists and rejected at
 launch, install, and render.
 

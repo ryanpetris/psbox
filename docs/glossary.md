@@ -22,7 +22,7 @@ flags. For a referrer (`options.sandbox: other`), the sandbox is
 An application that sets `options.sandbox` to another application. It
 supplies `exec`, `default-args`, and `env`. It must not set home, audio,
 video, dbus, display, fontconfig, isolation, `host-urls`, `cache`,
-`downloads`, `metadata.type`, or `bwrap-args`.
+`downloads`, `dev`, `metadata.type`, or `bwrap-args`.
 
 ## Isolation
 
@@ -74,6 +74,14 @@ infrastructure, as are processes it activated (including after they
 reparent to PID 1). Those do not keep an idle instance alive by
 themselves.
 
+## Device mode
+
+The `dev` option selects the device filesystem. `private` is the default:
+a private `/dev` with selective device binds, private shared memory, and
+private pseudo-terminals. `true`/`host` exposes host `/dev` in full.
+`private-shm` exposes host `/dev` with private shared memory at `/dev/shm`;
+host pseudo-terminals remain shared.
+
 ## `psbox`
 
 The host CLI. Applications start with `psbox launch <application>`.
@@ -101,7 +109,8 @@ false` disables it.
 
 A blake2b-512 digest of the sandbox options that affect the instance
 root: home, non-default audio/video/display/fontconfig, non-host dbus,
-`host-urls: false`, `cache: home`, `downloads: true`, and `bwrap-args`.
+`host-urls: false`, `cache: home`, `downloads: true`, non-private `dev`,
+and `bwrap-args`.
 Isolation, `exec`, `default-args`, `env`, and `metadata.type` are not
 included; type defaults are hashed as the options they fill.
 

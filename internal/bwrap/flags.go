@@ -26,6 +26,7 @@ type Flags struct {
 	NoDisplay     bool
 	CacheHome     bool
 	Downloads     bool
+	Dev           string
 }
 
 // Env is the host environment used to compose bwrap binds and --setenv.
@@ -57,6 +58,7 @@ func FlagsFromApplication(app *config.Application, paths config.Paths) Flags {
 	opts := app.Spec.Options
 	home := opts.HomeValue()
 	var f Flags
+	f.Dev = app.Dev()
 	switch home {
 	case config.HomeNone:
 		f.NoHome = true
@@ -130,6 +132,9 @@ func (f Flags) Args() []string {
 	}
 	if f.Downloads {
 		args = append(args, "--downloads")
+	}
+	if f.Dev != "" && f.Dev != config.DevPrivate {
+		args = append(args, "--dev", f.Dev)
 	}
 	return args
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -305,26 +306,25 @@ func decodeApplicationOptions(raw map[string]yaml.Node) (ApplicationOptions, err
 				return opts, err
 			}
 			opts.Downloads = &v
+		case "dev":
+			v, err := decodeDev(node)
+			if err != nil {
+				return opts, err
+			}
+			opts.Dev = &v
 		default:
 			return opts, fmt.Errorf("unknown options key %q", key)
 		}
 	}
-	return opts, nil
+	return opts, validateDevOptions(opts)
 }
 
 func decodeDBus(node yaml.Node) (string, error) {
-	var asBool bool
-	if err := node.Decode(&asBool); err == nil {
-		if asBool {
-			return DBusHost, nil
-		}
-		return DBusOff, nil
-	}
-	var asString string
-	if err := node.Decode(&asString); err != nil {
+	value, err := decodeBoolText(node)
+	if err != nil {
 		return "", fmt.Errorf("options.dbus: %w", err)
 	}
-	switch asString {
+	switch value {
 	case "private":
 		return DBusPrivate, nil
 	case "true", "host":
@@ -332,7 +332,37 @@ func decodeDBus(node yaml.Node) (string, error) {
 	case "false", "off":
 		return DBusOff, nil
 	default:
-		return "", fmt.Errorf("invalid options.dbus %q", asString)
+		return "", fmt.Errorf("invalid options.dbus %q", value)
+	}
+}
+
+func decodeDev(node yaml.Node) (string, error) {
+	value, err := decodeBoolText(node)
+	if err != nil {
+		return "", fmt.Errorf("options.dev: %w", err)
+	}
+	mode, err := ParseDev(value)
+	if err != nil {
+		return "", fmt.Errorf("options.dev: %w", err)
+	}
+	return mode, nil
+}
+
+func decodeBoolText(node yaml.Node) (string, error) {
+	if node.Kind != yaml.ScalarNode {
+		return "", fmt.Errorf("expected a boolean or string")
+	}
+	switch node.Tag {
+	case "!!bool":
+		var value bool
+		if err := node.Decode(&value); err != nil {
+			return "", err
+		}
+		return strconv.FormatBool(value), nil
+	case "!!str":
+		return node.Value, nil
+	default:
+		return "", fmt.Errorf("expected a boolean or string")
 	}
 }
 

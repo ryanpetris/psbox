@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"petris.dev/psbox/internal/config"
 )
 
 const BwrapPath = "/usr/bin/bwrap"
@@ -15,7 +17,15 @@ func Compose(f Flags, env Env) []string {
 	var args []string
 	args = append(args, "--die-with-parent", "--unshare-pid", "--new-session")
 	args = append(args, "--proc", "/proc")
-	args = append(args, "--dev", "/dev")
+	hostDev := f.Dev == config.DevHost || f.Dev == config.DevPrivateSHM
+	if hostDev {
+		args = append(args, "--dev-bind", "/dev", "/dev")
+		if f.Dev == config.DevPrivateSHM {
+			args = append(args, "--perms", "1777", "--tmpfs", "/dev/shm")
+		}
+	} else {
+		args = append(args, "--dev", "/dev")
+	}
 	args = append(args, "--tmpfs", "/tmp")
 	args = append(args, bindTryRO("/etc")...)
 	args = append(args, bindTryRO("/opt")...)
@@ -51,7 +61,9 @@ func Compose(f Flags, env Env) []string {
 	}
 
 	if !f.NoAudio {
-		args = append(args, bindTryDev("/dev/snd")...)
+		if !hostDev {
+			args = append(args, bindTryDev("/dev/snd")...)
+		}
 		if env.RuntimeDir != "" {
 			args = append(args, bindTryRO(filepath.Join(env.RuntimeDir, "pulse"))...)
 			core := env.PipewireCore
@@ -61,7 +73,7 @@ func Compose(f Flags, env Env) []string {
 			args = append(args, bindTryRO(filepath.Join(env.RuntimeDir, core))...)
 		}
 	}
-	if !f.NoVideo {
+	if !f.NoVideo && !hostDev {
 		args = append(args, bindTryDev("/dev/v4l")...)
 		for _, dev := range globCharDevices("/dev/video*") {
 			args = append(args, bindTryDev(dev)...)
@@ -80,14 +92,16 @@ func Compose(f Flags, env Env) []string {
 	if !f.NoUdev {
 		args = append(args, bindTryRO("/run/udev")...)
 	}
-	if !f.NoEvdev {
+	if !f.NoEvdev && !hostDev {
 		args = append(args, bindTryDev("/dev/input")...)
 		for _, dev := range globCharDevices("/dev/hidraw*") {
 			args = append(args, bindTryDev(dev)...)
 		}
 	}
 	if !f.NoDisplay {
-		args = append(args, bindTryDev("/dev/dri")...)
+		if !hostDev {
+			args = append(args, bindTryDev("/dev/dri")...)
+		}
 		wayland := env.WaylandDisplay
 		if wayland == "" {
 			wayland = "wayland-0"
