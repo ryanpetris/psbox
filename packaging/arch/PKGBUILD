@@ -1,0 +1,55 @@
+# Built by `make package-arch`, which supplies the source archive and its
+# checksum and sets PSBOX_VERSION and PKGREL.
+pkgname=psbox
+pkgver=${PSBOX_VERSION:-0.0.0}
+pkgrel=${PKGREL:-1}
+pkgdesc='Run Linux applications inside private-home sandboxes'
+url=https://petris.dev/psbox
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=(
+    'dbus'
+    'gcc-libs'
+    'glibc'
+    'systemd'
+)
+makedepends=('cargo')
+optdepends=(
+    'passt: isolated sandbox networking'
+    'xwayland-satellite: X11 applications inside sandboxes'
+)
+source=("${pkgname}-${pkgver}.tar.gz")
+b2sums=("${PSBOX_SOURCE_B2SUM:?run make package-arch}")
+
+prepare() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    PSBOX_VERSION="${pkgver}" CARGO_PROFILE_RELEASE_STRIP=false cargo build --release --frozen
+}
+
+check() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    PSBOX_VERSION="${pkgver}" cargo test --frozen
+}
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    install -Dm755 target/release/psbox "${pkgdir}/usr/bin/psbox"
+
+    install -Dm644 units/psbox@.socket "${pkgdir}/usr/lib/systemd/user/psbox@.socket"
+    install -Dm644 units/psbox@.service "${pkgdir}/usr/lib/systemd/user/psbox@.service"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    PATH="${srcdir}/${pkgname}-${pkgver}/target/release:${PATH}" psbox completions bash |
+        install -Dm644 /dev/stdin "${pkgdir}/usr/share/bash-completion/completions/psbox"
+    PATH="${srcdir}/${pkgname}-${pkgver}/target/release:${PATH}" psbox completions zsh |
+        install -Dm644 /dev/stdin "${pkgdir}/usr/share/zsh/site-functions/_psbox"
+}

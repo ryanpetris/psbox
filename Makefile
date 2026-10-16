@@ -11,9 +11,14 @@ FUZZ_TARGETS := config protocol dbus_message desktop_entry
 # The version psbox reports, MAJOR.MINOR.PATCH without a `v`: 0.0.0 for
 # development builds, set from the tag for releases.
 export PSBOX_VERSION ?= 0.0.0
+# The release of the distribution packages for one PSBOX_VERSION.
+export PKGREL ?= 1
+# The Debian changelog's distribution for package-deb.
+DEB_DISTRIBUTION ?= unstable
+PACKAGE_DIR := target/package
 
-.PHONY: all build test fmt check check/fmt check/clippy check/deny fuzz \
-	release dist install dev/install clean
+.PHONY: all build test fmt check check/fmt check/clippy check/deny check/version \
+	fuzz release dist checksums source package-arch package-deb install dev/install clean
 
 all: build
 
@@ -46,15 +51,17 @@ fuzz:
 		$(CARGO) +nightly fuzz run $$t -- -max_total_time=$(FUZZ_TIME) || exit 1; \
 	done
 
-# Static release binaries for amd64 and arm64.
-release:
+check/version:
 	@echo "$(PSBOX_VERSION)" | grep -Eqx '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' || \
 		{ echo "PSBOX_VERSION must be MAJOR.MINOR.PATCH without a v prefix" >&2; exit 1; }
+
+# Static release binaries for amd64 and arm64.
+release: check/version
 	for t in $(TARGETS); do $(CARGO) build --release --target $$t || exit 1; done
 
 # Release archives: the binary, the units, the license, and the README.
 dist: release
-	rm -rf dist && mkdir -p dist
+	mkdir -p dist && rm -f dist/psbox_*_linux_*.tar.gz
 	for pair in x86_64-unknown-linux-musl:amd64 aarch64-unknown-linux-musl:arm64; do \
 		target=$${pair%%:*}; arch=$${pair##*:}; \
 		name=psbox_$(PSBOX_VERSION)_linux_$$arch; \
@@ -64,7 +71,44 @@ dist: release
 		tar -C dist -czf dist/$$name.tar.gz $$name || exit 1; \
 		rm -rf dist/$$name; \
 	done
-	cd dist && sha256sum *.tar.gz > checksums.txt
+	$(MAKE) checksums
+
+# SHA-256 of everything in dist/.
+checksums:
+	cd dist && find . -maxdepth 1 -type f ! -name checksums.txt -printf '%P\n' | sort | \
+		xargs sha256sum > checksums.txt
+
+# The source archive of the committed HEAD, which the distribution packages
+# build from: dist/psbox-<version>.tar.gz with one psbox-<version>/ directory.
+source: check/version
+	mkdir -p dist
+	git archive --format=tar.gz --prefix=psbox-$(PSBOX_VERSION)/ \
+		-o dist/psbox-$(PSBOX_VERSION).tar.gz HEAD
+
+# An Arch package for this machine's architecture (needs makepkg and cargo).
+package-arch: source
+	rm -rf $(PACKAGE_DIR)/arch && mkdir -p $(PACKAGE_DIR)/arch
+	cp packaging/arch/PKGBUILD dist/psbox-$(PSBOX_VERSION).tar.gz $(PACKAGE_DIR)/arch/
+	cd $(PACKAGE_DIR)/arch && \
+		PSBOX_SOURCE_B2SUM=$$(b2sum psbox-$(PSBOX_VERSION).tar.gz | cut -d' ' -f1) \
+		makepkg --cleanbuild --nosign --noconfirm
+	cp $(PACKAGE_DIR)/arch/psbox-$(PSBOX_VERSION)-$(PKGREL)-*.pkg.tar.zst dist/
+	$(MAKE) checksums
+
+# A Debian package for this machine's architecture (needs dpkg-buildpackage
+# and the build dependencies in packaging/debian/control).
+package-deb: source
+	rm -rf $(PACKAGE_DIR)/deb && mkdir -p $(PACKAGE_DIR)/deb
+	tar -C $(PACKAGE_DIR)/deb -xzf dist/psbox-$(PSBOX_VERSION).tar.gz
+	cp -R packaging/debian $(PACKAGE_DIR)/deb/psbox-$(PSBOX_VERSION)/debian
+	printf '%s\n' \
+		"psbox ($(PSBOX_VERSION)-$(PKGREL)) $(DEB_DISTRIBUTION); urgency=medium" '' \
+		'  * psbox $(PSBOX_VERSION).' '' \
+		" -- Ryan Petris <ryan@petris.net>  $$(date -R -d @$$(git log -1 --format=%ct))" \
+		> $(PACKAGE_DIR)/deb/psbox-$(PSBOX_VERSION)/debian/changelog
+	cd $(PACKAGE_DIR)/deb/psbox-$(PSBOX_VERSION) && dpkg-buildpackage --build=binary --no-sign
+	cp $(PACKAGE_DIR)/deb/psbox_$(PSBOX_VERSION)-$(PKGREL)_*.deb dist/
+	$(MAKE) checksums
 
 # Installs the release binary (from `cargo build --release`) and the user
 # units, for example `sudo make install` or `make install DESTDIR=pkg`.

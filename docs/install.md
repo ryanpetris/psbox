@@ -15,6 +15,21 @@
 
 `psbox check` reports each of these.
 
+## From a package
+
+Each release has an Arch package (`psbox-<version>-<rel>-x86_64.pkg.tar.zst`)
+and Debian packages for amd64 and arm64 (`psbox_<version>-<rel>_<arch>.deb`,
+built on Debian 13). They install the binary, the user units, and the bash
+and zsh completions, and depend on `dbus` and `systemd`; `passt` and
+`xwayland-satellite` are optional:
+
+```sh
+sudo pacman -U psbox-<version>-1-x86_64.pkg.tar.zst      # Arch
+sudo apt install ./psbox_<version>-1_amd64.deb            # Debian, Ubuntu
+systemctl --user daemon-reload
+psbox check
+```
+
 ## From a release archive
 
 Each archive (`psbox_<version>_linux_<arch>.tar.gz`, see

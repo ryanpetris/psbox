@@ -2,6 +2,7 @@
 name = "psbox"
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.97"
 description = "Private-home application sandboxes for Linux"
 license = "MIT"
 publish = false

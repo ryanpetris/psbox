@@ -117,7 +117,7 @@ is reported.
 
 Other top-level directories: `units/` (the `psbox@` user units),
 `examples/` (sandbox configs), `scripts/` (headless GNOME test helpers),
-`docs/`.
+`packaging/` (Arch and Debian recipes), `docs/`.
 
 A new module belongs where its concern already lives; add one only for a
 new concern, and do not create catch-all modules such as `utils`.

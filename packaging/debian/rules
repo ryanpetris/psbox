@@ -1,0 +1,41 @@
+#!/usr/bin/make -f
+
+# Built by `make package-deb`, which writes debian/changelog with the version.
+
+include /usr/share/dpkg/pkg-info.mk
+
+# The distribution's Rust is older than psbox needs, so the build installs
+# the current stable toolchain with rustup, inside the build tree.
+export PSBOX_VERSION := $(DEB_VERSION_UPSTREAM)
+export RUSTUP_HOME := $(CURDIR)/debian/rustup
+export CARGO_HOME := $(CURDIR)/debian/cargo-home
+export RUSTUP_TOOLCHAIN := stable
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_build:
+	rustup toolchain install stable --profile minimal
+	cargo fetch --locked --target "$$(rustc --print host-tuple)"
+	CARGO_PROFILE_RELEASE_STRIP=false cargo build --release --frozen
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --frozen
+endif
+
+override_dh_auto_install:
+	install -Dm755 target/release/psbox debian/psbox/usr/bin/psbox
+	install -Dm644 units/psbox@.socket debian/psbox/usr/lib/systemd/user/psbox@.socket
+	install -Dm644 units/psbox@.service debian/psbox/usr/lib/systemd/user/psbox@.service
+	# The scripts call back into the binary by the name it was run as.
+	PATH="$(CURDIR)/target/release:$$PATH" psbox completions bash | \
+		install -Dm644 /dev/stdin debian/psbox/usr/share/bash-completion/completions/psbox
+	PATH="$(CURDIR)/target/release:$$PATH" psbox completions zsh | \
+		install -Dm644 /dev/stdin debian/psbox/usr/share/zsh/vendor-completions/_psbox
+
+# The user units are enabled per sandbox by psbox itself, not at install.
+override_dh_installsystemduser:
+
+override_dh_auto_clean:
+	rm -rf target debian/rustup debian/cargo-home

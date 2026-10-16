@@ -1,0 +1,20 @@
+Source: psbox
+Section: utils
+Priority: optional
+Maintainer: Ryan Petris <ryan@petris.net>
+Build-Depends: debhelper-compat (= 13), rustup, ca-certificates
+Rules-Requires-Root: no
+Standards-Version: 4.7.2
+Homepage: https://petris.dev/psbox
+
+Package: psbox
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, dbus, systemd
+Suggests: passt, xwayland-satellite
+Description: Run Linux applications inside private-home sandboxes
+ psbox runs applications in sandboxes with a private home, built on Linux
+ namespaces, the new mount API, Landlock, seccomp, and cgroups. Each
+ sandbox is supervised by a socket-activated systemd user service.
+ .
+ passt provides isolated sandbox networking, and xwayland-satellite runs
+ X11 applications inside sandboxes.
