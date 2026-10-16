@@ -394,12 +394,17 @@ pub struct Plan {
     pub mounts: Vec<Mount>,
     /// Classes published into `/dev`.
     pub node_classes: Vec<DeviceClass>,
+    /// The `audio` class: the host's audio sockets, and the Realtime portal.
+    pub audio: bool,
     pub env: BTreeMap<String, String>,
     pub commands: BTreeMap<String, Command>,
     pub idle_timeout: Duration,
     pub dbus: Dbus,
     /// The private session bus, when the sandbox has one.
     pub bus: Option<BusPaths>,
+    /// Host bus names the gateway forwards calls to (`dbus-talk`); empty
+    /// without a private bus.
+    pub dbus_talk: Vec<String>,
     /// Serve X11 clients with an on-demand Xwayland.
     pub xwayland: bool,
     pub network: Network,
@@ -710,6 +715,9 @@ pub fn diff(old: &Plan, new: &Plan) -> Change {
     }
     if old.dbus != new.dbus {
         c.restart.push("dbus".into());
+    }
+    if old.dbus_talk != new.dbus_talk {
+        c.restart.push("dbus-talk".into());
     }
     if old.xwayland != new.xwayland {
         c.restart.push("xwayland".into());
@@ -1116,11 +1124,22 @@ impl Plan {
             host_home_dir,
             home,
             mounts,
+            audio: classes.contains(&DeviceClass::Audio),
             node_classes: classes.into_iter().filter(|c| c.is_node()).collect(),
             env,
             commands,
             idle_timeout: Duration::from_secs(spec.idle_timeout),
             dbus: spec.dbus,
+            // Each name is owned once on the private bus, so duplicates go.
+            dbus_talk: match &bus {
+                Some(_) => spec.dbus_talk.iter().fold(Vec::new(), |mut names, n| {
+                    if !names.contains(n) {
+                        names.push(n.clone());
+                    }
+                    names
+                }),
+                None => Vec::new(),
+            },
             bus,
             xwayland,
             network,
@@ -1356,6 +1375,31 @@ mod tests {
             root: "/home/u/Sandbox".into(),
             pasta: true,
         }
+    }
+
+    #[test]
+    fn dbus_talk_reaches_the_plan_only_with_a_private_bus() {
+        let talk = |text: &str| {
+            Plan::build(&main("app"), &Spec::parse(text).unwrap(), &host())
+                .unwrap()
+                .dbus_talk
+        };
+        assert!(talk("").is_empty());
+        assert_eq!(talk("dbus-talk = [\"org.a.b\"]"), ["org.a.b"]);
+        assert_eq!(
+            talk("dbus-talk = [\"org.a.b\", \"org.c.d\", \"org.a.b\"]"),
+            ["org.a.b", "org.c.d"]
+        );
+        // Tasks have no bus unless they set one.
+        let spec = Spec::parse("dbus-talk = [\"org.a.b\"]\n[task.t]\nexec = [\"x\"]\n").unwrap();
+        let task = Identity::Task {
+            sandbox: "app".into(),
+            task: "t".into(),
+        };
+        assert!(Plan::build(&task, &spec, &host()).unwrap().dbus_talk.is_empty());
+        let old = Plan::build(&main("app"), &Spec::parse("").unwrap(), &host()).unwrap();
+        let new = Plan::build(&main("app"), &spec, &host()).unwrap();
+        assert!(diff(&old, &new).restart.contains(&"dbus-talk".to_string()));
     }
 
     #[test]

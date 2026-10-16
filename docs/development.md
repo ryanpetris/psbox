@@ -106,6 +106,14 @@ Verified on Linux 7.2 with GNOME, beyond the unit tests:
 | Desktop entries copied and inline, launched with `gio launch` | Grouped under their entries in GNOME |
 | Xwayland on demand: `glxgears`, `xdpyinfo`, GTK apps with `GDK_BACKEND=x11`, with the host network while the host's Xwayland holds `:0` and `:1` | Work on display `:28787`; no abstract sockets |
 | Static builds for amd64 and arm64 (arm64 run under qemu) | Work |
+| Overlay refresh after an update task: a running instance sees the new version on a fresh overlay, while a process whose working directory is in the old overlay keeps the old files | Works |
+| `profiles/` created, removed, and created again while a sandbox runs | Reloads each time |
+| Gateway against two private `dbus-daemon`s: a `dbus-talk` name called by name and by its unique name, an unlisted name unreachable, a big-endian call served and the gateway still serving afterwards | Works |
+| `dbus-talk` on the session bus: a host name called by name and by its unique name, alongside the portal; an unlisted name never reaches the host | Works |
+| Realtime with `audio`: `MakeThreadRealtimeWithPID` and `MakeThreadHighPriorityWithPID` on sandbox processes; an id not in the sandbox refused by the host portal | Works (`SCHED_RR` and nice -10 on the host) |
+| The connector from inside the sandbox: ptrace, `pidfd_getfd`, and its `fd`, `maps`, `root`, and `environ` entries | Refused |
+| The connector's `mountinfo` and `net/tcp` from inside the sandbox | The sandbox's own |
+| The connector killed with `SIGQUIT`, or stopped with `SIGSTOP`, from inside the sandbox | No core dump; reaped, and replaced on the next call (after five seconds when stopped) |
 
 ## Host checklist
 

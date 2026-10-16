@@ -38,6 +38,10 @@ pub struct Options {
     /// buses; `off`: no bus.
     #[arg(long, value_name = "MODE", value_parser = ["portal", "host", "off"])]
     dbus: Option<String>,
+    /// A host bus name the sandbox may call through the gateway (with the
+    /// `portal` bus); repeat for more.
+    #[arg(long, value_name = "NAME")]
+    dbus_talk: Vec<String>,
     /// `isolated` (outbound only, through pasta; the default when pasta is
     /// installed, otherwise `host`), `host`, or `none`.
     #[arg(long, value_name = "MODE", value_parser = ["host", "isolated", "none"])]
@@ -94,6 +98,10 @@ impl Options {
             if let Some(v) = value {
                 t.insert(key.into(), v.clone().into());
             }
+        }
+        if !self.dbus_talk.is_empty() {
+            let names: Vec<toml::Value> = self.dbus_talk.iter().map(|n| n.clone().into()).collect();
+            t.insert("dbus-talk".into(), names.into());
         }
         if let Some(list) = &self.devices {
             let classes: Vec<toml::Value> = match list.trim() {
@@ -188,6 +196,7 @@ mod tests {
             },
             devices: Some("gpu, camera".into()),
             dbus: Some("host".into()),
+            dbus_talk: vec![],
             no_display: true,
             bind: vec!["~/Downloads".into(), "data:/srv/data".into()],
             ro_bind: vec!["/etc/hosts:~/hosts".into()],
@@ -214,6 +223,16 @@ mod tests {
         })
         .unwrap();
         assert_eq!(xs.mount["bind-000"].host.as_deref(), Some("/home/u/games/"));
+        let talk = spec(&Options {
+            home: HomeArgs {
+                home_tmpfs: true,
+                ..Default::default()
+            },
+            dbus_talk: vec!["org.a.b".into(), "org.c.d".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(talk.dbus_talk, ["org.a.b", "org.c.d"]);
         assert!(xs.display && xs.xwayland && xs.network == Some(Network::Host));
         assert_eq!(s.env["A"], "b=c");
         assert_eq!(s.idle_timeout, 0);

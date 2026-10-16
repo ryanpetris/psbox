@@ -11,7 +11,7 @@ psbox run <name>  --seqpacket + SCM_RIGHTS-->  psbox@<key>.service (socket-activ
                                                supervisor: owns user + mount namespaces and the cgroup subtree
                                                  |- forker thread  (joined to the sandbox PID namespace)
                                                  |- infra/     init (PID 1), the private dbus-daemon and the services it activates,
-                                                 |            xwayland-satellite and Xwayland (started on the first X client)
+                                                 |            the connector, xwayland-satellite and Xwayland (started on the first X client)
                                                  '- workload/  apps, cloned straight into this cgroup
 ```
 
@@ -94,6 +94,13 @@ Forwarded host sockets (Wayland, `pipewire-0`, `pulse/native`) are attached
 when they first appear, and re-attached when their server creates them
 again, with `MOVE_MOUNT_BENEATH` so the swap is atomic.
 
+An overlay's upper and work directories live on a detached tmpfs that only
+the overlay holds. After a task, `psbox task` sends each running instance of
+the sandbox a refresh request naming the task's writable host directories;
+the supervisor builds a new overlay over each matching lower directory,
+attaches the mounts that belong beneath it inside that detached tree, and
+swaps the whole tree in the same way; if any part fails, nothing changes.
+
 ## Devices
 
 One inotify watch on `/run/udev/data`: a new or renamed entry means udev has
@@ -108,8 +115,8 @@ devices are unpublished the same way.
 
 Each sandbox with `dbus = "portal"` runs a private `dbus-daemon` in the
 `infra` cgroup with a psbox-written configuration. Its activatable services
-are links to the host's `/usr/share/dbus-1/services` files minus portals,
-plus the sandbox's own `~/.local/share/dbus-1/services`. A plain private bus
+are links to the host's `/usr/share/dbus-1/services` files minus portals and
+`dbus-talk` names, plus the sandbox's own `~/.local/share/dbus-1/services`. A plain private bus
 would activate `xdg-desktop-portal` inside the sandbox from the host's
 service files; leaving portal services out makes portal names always reach
 the gateway.
@@ -120,8 +127,37 @@ them gets its own host connection, which registers the client's app id
 (from the command that started it) with
 `org.freedesktop.host.portal.Registry`, so host services see per-client
 lifetimes and portal request and session paths map one-to-one onto the
-paths the client predicted from its own name. The policy is in
-[isolation.md](isolation.md#d-bus).
+paths the client predicted from its own name. The gateway reads the policy
+from the current plan for each call, so device-class changes (Camera,
+Realtime) apply live. The policy is in [isolation.md](isolation.md#d-bus).
+
+The host portal identifies a client by the process that opened its host
+connection and reads the process ids a client passes (Realtime) in that
+process's PID namespace, as it does for Flatpak apps. So the connector opens
+the host connections: a process forked on the forker thread into the
+sandbox's PID namespace and the `infra` cgroup, started on first use, that
+connects a socket to the host bus for each request and passes it back. It
+joins the sandbox's mount namespace (and network namespace, when the sandbox
+has one) and reaches the host bus through a descriptor for its socket
+opened before the fork, so its `/proc` entries show only the sandbox's view.
+It keeps the supervisor's capabilities, so sandbox processes, which have
+none, cannot ptrace it or open its descriptors; the host portal, which runs
+as the owner of the supervisor's user namespace, can read its `/proc` entry.
+Its core dump limit is one byte, so signals from the sandbox cannot make it
+dump the supervisor's memory on the host. If it exits, does not answer
+within five seconds, or finds its socket refusing connections (the host bus
+made a new one), a new one is started for that client.
+
+Each `dbus-talk` name gets its own gateway connection to the private bus,
+which owns that name: GDBus proxies call the owner's unique name, which is
+then unambiguous, and the bus accepts a reply only from the connection that
+was called. Calls to it go out through the caller's host connection
+unchanged.
+
+Messages are written little-endian. A big-endian message from a client is
+converted to little-endian when it is read; one whose body cannot be
+decoded is skipped (with an error reply to a method call) without ending
+the connection.
 
 The host bus, for the gateway and for `dbus = "host"`, is `PSBOX_HOST_BUS`
 when set (used for headless tests), else `DBUS_SESSION_BUS_ADDRESS`, else
@@ -170,6 +206,6 @@ see the host's `/run/systemd/resolve` for name lookups.
 | `supervisor.rs` | The supervisor: start, spawn, live changes, devices, idle |
 | `root.rs`, `spawn.rs`, `forker.rs`, `inject.rs` | The sandbox root, spawning, and joining the sandbox's namespaces |
 | `sys/` | Namespaces, the mount API, Landlock, seccomp, cgroups, inotify, file descriptors |
-| `bus.rs`, `gateway.rs`, `portal.rs`, `dbus/` | The private bus, the gateway, the portal policy, and the D-Bus wire format |
+| `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `dbus/` | The private bus, the gateway and its connector, the portal policy, and the D-Bus wire format |
 | `devices.rs`, `x11.rs`, `desktop.rs`, `install.rs`, `systemd.rs`, `protocol.rs` | Device classes, Xwayland, desktop entries, the user manager, and the client protocol |
 | `fuzz.rs` | Entry points for the fuzz targets (built only for them) |

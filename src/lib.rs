@@ -8,6 +8,7 @@
 mod bus;
 mod cli;
 mod client;
+mod connector;
 mod dbus;
 mod desktop;
 mod devices;
@@ -344,13 +345,7 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
             task,
             create_dirs,
             args,
-        } => {
-            let id = plan::Identity::Task {
-                sandbox,
-                task: task.clone(),
-            };
-            client::run(&id, Some(task), args, false, create_dirs)
-        }
+        } => cli::task(&sandbox, &task, args, create_dirs),
         Cmd::Sandbox {
             options,
             create_dirs,

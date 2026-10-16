@@ -55,8 +55,10 @@ pub fn activation_allowed(name: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// Allow the Camera portal.
+    /// Allow the Camera portal (the `camera` device class).
     pub camera: bool,
+    /// Allow the Realtime portal (the `audio` device class).
+    pub realtime: bool,
     /// URI schemes `OpenURI.OpenURI` may open on the host.
     pub uri_schemes: Vec<String>,
 }
@@ -65,6 +67,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             camera: false,
+            realtime: false,
             uri_schemes: vec!["http".into(), "https".into(), "mailto".into()],
         }
     }
@@ -86,6 +89,21 @@ pub fn service_for(dest: &str, gateway_unique: &str, path: &str) -> Option<&'sta
         Some(NOTIFICATIONS_NAME)
     } else {
         None
+    }
+}
+
+/// Whether a signal arriving on a client's host connection is passed to the
+/// client: only portal and notification signals, on their own objects. A
+/// host process can send a signal straight to any connection, so this is
+/// what keeps other services (including `dbus-talk` ones, whose signals
+/// are not forwarded) out.
+pub fn signal_forwarded(path: &str, iface: &str) -> bool {
+    let portal_object = path == PORTAL_PATH || path.starts_with(&format!("{PORTAL_PATH}/"));
+    let notifications_object = path == NOTIFICATIONS_PATH;
+    match iface {
+        "org.freedesktop.DBus.Properties" => portal_object || notifications_object,
+        NOTIFICATIONS_NAME => notifications_object,
+        i => portal_object && i.starts_with("org.freedesktop.portal."),
     }
 }
 
@@ -153,6 +171,7 @@ fn allowed_portal_iface(policy: &Policy, iface: &str) -> bool {
         || iface == "org.freedesktop.portal.Screenshot"
         || iface == "org.freedesktop.portal.ScreenCast"
         || (policy.camera && iface == "org.freedesktop.portal.Camera")
+        || (policy.realtime && iface == "org.freedesktop.portal.Realtime")
 }
 
 fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Verdict {
@@ -230,6 +249,14 @@ fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Ve
                 file: None,
             }
         }
+        // MakeThreadRealtimeWithPID(process, thread, priority) and
+        // MakeThreadHighPriorityWithPID(process, thread, nice): the ids are
+        // the sandbox's, and the host portal finds them in the PID namespace
+        // of the process that opened the host connection, which is the
+        // sandbox's.
+        ("org.freedesktop.portal.Realtime", "MakeThreadRealtimeWithPID") if msg.signature == "ttu" => forward(),
+        ("org.freedesktop.portal.Realtime", "MakeThreadHighPriorityWithPID") if msg.signature == "tti" => forward(),
+        ("org.freedesktop.portal.Realtime", _) => deny("only the WithPID calls of the Realtime portal"),
         ("org.freedesktop.portal.FileChooser", "OpenFile" | "SaveFile" | "SaveFiles") => {
             // Sandbox paths mean nothing to the host dialog.
             if let Some(opts) = args.get_mut(2) {
@@ -402,6 +429,54 @@ mod tests {
             &[opts()],
         );
         assert_eq!(check(&with_camera, &m), forward());
+    }
+
+    #[test]
+    fn realtime_needs_the_policy_and_translates_ids() {
+        let with_realtime = Policy {
+            realtime: true,
+            ..Policy::default()
+        };
+        let rt = |member: &str, args: &[Value]| {
+            check(
+                &with_realtime,
+                &call(
+                    PORTAL_NAME,
+                    PORTAL_PATH,
+                    "org.freedesktop.portal.Realtime",
+                    member,
+                    args,
+                ),
+            )
+        };
+        let args = [Value::U64(12), Value::U64(13), Value::U32(5)];
+        assert_eq!(rt("MakeThreadRealtimeWithPID", &args), forward());
+        let nice = [Value::U64(12), Value::U64(13), Value::I32(-5)];
+        assert_eq!(rt("MakeThreadHighPriorityWithPID", &nice), forward());
+        // Wrong argument types, other members, and no policy are refused.
+        assert!(matches!(rt("MakeThreadRealtimeWithPID", &nice), Verdict::Deny(_)));
+        assert!(matches!(rt("MakeThreadRealtime", &[Value::U64(13)]), Verdict::Deny(_)));
+        let without = call(
+            PORTAL_NAME,
+            PORTAL_PATH,
+            "org.freedesktop.portal.Realtime",
+            "MakeThreadRealtimeWithPID",
+            &args,
+        );
+        assert!(matches!(check(&Policy::default(), &without), Verdict::Deny(_)));
+        // Its properties are readable when it is forwarded.
+        let prop = call(
+            PORTAL_NAME,
+            PORTAL_PATH,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            &[
+                Value::Str("org.freedesktop.portal.Realtime".into()),
+                Value::Str("MaxRealtimePriority".into()),
+            ],
+        );
+        assert_eq!(check(&with_realtime, &prop), forward());
+        assert!(matches!(check(&Policy::default(), &prop), Verdict::Deny(_)));
     }
 
     #[test]
@@ -629,6 +704,29 @@ mod tests {
         );
         assert_eq!(service_for(":1.0", ":1.0", "/org/freedesktop/systemd1"), None);
         assert_eq!(service_for(":1.7", ":1.0", PORTAL_PATH), None);
+    }
+
+    #[test]
+    fn only_portal_and_notification_signals_reach_clients() {
+        let request = format!("{REQUEST_PREFIX}1_5/t");
+        assert!(signal_forwarded(&request, "org.freedesktop.portal.Request"));
+        assert!(signal_forwarded(PORTAL_PATH, "org.freedesktop.portal.Settings"));
+        assert!(signal_forwarded(PORTAL_PATH, "org.freedesktop.DBus.Properties"));
+        assert!(signal_forwarded(NOTIFICATIONS_PATH, "org.freedesktop.Notifications"));
+        assert!(!signal_forwarded(
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Prompt"
+        ));
+        assert!(!signal_forwarded(
+            "/org/freedesktop/secrets",
+            "org.freedesktop.DBus.Properties"
+        ));
+        assert!(!signal_forwarded(PORTAL_PATH, "org.freedesktop.Secret.Prompt"));
+        assert!(!signal_forwarded(
+            "/org/freedesktop/portal/desktopX",
+            "org.freedesktop.portal.Settings"
+        ));
+        assert!(!signal_forwarded(PORTAL_PATH, "org.freedesktop.Notifications"));
     }
 
     #[test]

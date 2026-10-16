@@ -27,6 +27,11 @@ pub struct Spec {
     /// system buses, unfiltered. `off`: no session bus.
     #[serde(default)]
     pub dbus: Dbus,
+    /// Host session bus names the sandbox may call through the gateway
+    /// (with `dbus = "portal"`). Empty unless listed: each name is an opt-in
+    /// to that host service, unfiltered.
+    #[serde(default)]
+    pub dbus_talk: Vec<String>,
     /// `isolated` (own network namespace with outbound connections through
     /// `pasta`), `host`, or `none` (loopback only). Unset means `isolated`
     /// when pasta is installed and `host` otherwise (see
@@ -634,6 +639,17 @@ impl Spec {
         if let Some(id) = &self.app_id {
             check("app-id".into(), validate_app_id(id));
         }
+        if !self.dbus_talk.is_empty() && self.dbus != Dbus::Portal {
+            check(
+                "dbus-talk".into(),
+                Err(anyhow!(
+                    "needs dbus = \"portal\"; the host bus already reaches every name"
+                )),
+            );
+        }
+        for name in &self.dbus_talk {
+            check("dbus-talk".into(), validate_talk_name(name));
+        }
         for (name, m) in &self.mount {
             let entry = format!("[mount.{name}]");
             check(entry.clone(), validate_name("mount", name));
@@ -738,6 +754,26 @@ fn validate_app_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// A well-known host bus name for `dbus-talk`: dot-separated elements of
+/// letters, digits, `_`, and `-` (none starting with a digit), at least two.
+/// The bus itself and the names the gateway already serves are refused.
+fn validate_talk_name(name: &str) -> Result<()> {
+    let ok = name.len() <= 255
+        && name.split('.').count() >= 2
+        && name.split('.').all(|e| {
+            !e.is_empty()
+                && !e.starts_with(|c: char| c.is_ascii_digit())
+                && e.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        });
+    if !ok {
+        bail!("invalid bus name {name:?}");
+    }
+    if name == crate::dbus::conn::BUS_NAME || crate::portal::GATEWAY_NAMES.contains(&name) {
+        bail!("{name} is always handled by psbox and cannot be listed");
+    }
+    Ok(())
+}
+
 /// Built-in profiles, by name.
 fn builtin_profile(name: &str) -> Option<&'static str> {
     match name {
@@ -747,7 +783,7 @@ fn builtin_profile(name: &str) -> Option<&'static str> {
 }
 
 /// Top-level lists that accumulate across profiles instead of replacing.
-const ACCUMULATING: [&str; 3] = ["rw", "ro", "devices"];
+const ACCUMULATING: [&str; 4] = ["rw", "ro", "devices", "dbus-talk"];
 
 /// Applies `extends`: each listed profile (itself possibly extending
 /// others) is merged in order, then `table` on top. Tables merge key by
@@ -1101,6 +1137,27 @@ mod tests {
     fn rejects_unknown_keys() {
         assert!(Spec::parse("no-such-key = []").is_err());
         assert!(Spec::parse("[mount.x]\nhost = \"/a\"\nmode = \"rw\"\nextra = 1").is_err());
+    }
+
+    #[test]
+    fn dbus_talk_is_opt_in_and_needs_the_portal_bus() {
+        assert!(Spec::parse("").unwrap().dbus_talk.is_empty());
+        let s = Spec::parse("dbus-talk = [\"org.freedesktop.secrets\", \"org.kde.kwalletd6\"]").unwrap();
+        assert_eq!(s.dbus_talk, ["org.freedesktop.secrets", "org.kde.kwalletd6"]);
+        assert!(Spec::parse("dbus = \"host\"\ndbus-talk = [\"org.a.b\"]").is_err());
+        assert!(Spec::parse("dbus = \"off\"\ndbus-talk = [\"org.a.b\"]").is_err());
+        for bad in [
+            "org",
+            ":1.5",
+            "org..b",
+            "org.1b",
+            "org.a b",
+            "org.freedesktop.DBus",
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.Notifications",
+        ] {
+            assert!(Spec::parse(&format!("dbus-talk = [{bad:?}]")).is_err(), "{bad}");
+        }
     }
 
     #[test]

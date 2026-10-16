@@ -5,7 +5,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 
-use super::{cstr, cvt, path_cstr};
+use super::{cstr, cvt, cvt_int, path_cstr};
 
 pub const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x04;
 pub const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x40;
@@ -185,6 +185,25 @@ impl FsContext {
 pub fn tmpfs(mode: u32, attrs: u64) -> io::Result<OwnedFd> {
     let ctx = FsContext::new("tmpfs")?;
     ctx.set_string("mode", &format!("{mode:o}"))?;
+    ctx.mount(attrs)
+}
+
+/// A writable overlay over the directory `lower`, as a detached mount. Its
+/// upper and work directories are on a private tmpfs that only the overlay
+/// keeps, so whatever is written to it is discarded with the mount. The
+/// overlay's root takes the upper directory's mode, 0755.
+pub fn overlay(lower: BorrowedFd<'_>, attrs: u64) -> io::Result<OwnedFd> {
+    let scratch = tmpfs(0o700, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
+    for dir in [c"upper", c"work"] {
+        // SAFETY: a valid directory descriptor and C string.
+        cvt_int(unsafe { libc::mkdirat(scratch.as_raw_fd(), dir.as_ptr(), 0o755) })?;
+    }
+    let ctx = FsContext::new("overlay")?;
+    ctx.set_string("lowerdir+", &fd_path(lower).to_string_lossy())?;
+    let scratch = fd_path(scratch.as_fd());
+    ctx.set_string("upperdir", &scratch.join("upper").to_string_lossy())?;
+    ctx.set_string("workdir", &scratch.join("work").to_string_lossy())?;
+    ctx.set_flag("userxattr")?;
     ctx.mount(attrs)
 }
 

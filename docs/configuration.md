@@ -35,6 +35,7 @@ applications.
 | `[task.<name>]` | | A oneshot task (see [Tasks](#instances-and-tasks)) |
 | `extends` | | [Profiles](#profiles) merged under this config |
 | `dbus` | `portal` | `portal`: a private session bus with the host gateway; `host`: the host session and system buses, unfiltered; `off`: no session bus |
+| `dbus-talk` | `[]` | Host session bus names the sandbox may call through the gateway (see [Host bus names](#host-bus-names)) |
 | `display` | `true` | Wayland (and Xwayland when `xwayland` is on) |
 | `xwayland` | `false` | A private Xwayland for X11 apps, started on the first X client |
 | `network` | `isolated` | `isolated`, `host`, or `none` (see [Network](#network)) |
@@ -187,13 +188,37 @@ first X client connects (see [architecture.md](architecture.md#xwayland)).
 Apps that support Wayland do not need it; with no `DISPLAY`, GTK, Qt,
 Electron, and SDL choose Wayland themselves.
 
+## Host bus names
+
+With `dbus = "portal"`, the sandbox reaches only the portals and
+notifications on the host bus. `dbus-talk` lists further host session bus
+names it may call, each an explicit opt-in to that host service:
+
+```toml
+dbus-talk = ["org.freedesktop.secrets"]
+```
+
+Nothing is listed by default. Calls to a listed name, and their replies,
+pass through the gateway unfiltered, with the caller's own host connection;
+the service sees psbox as an ordinary host app. Signals from these services
+are not forwarded, so services that report results only through signals
+work only in part. Names are well-known bus names (at least two
+dot-separated elements); `org.freedesktop.DBus` and the names the gateway
+already serves (`org.freedesktop.portal.Desktop` and
+`org.freedesktop.Notifications`) cannot be listed, and the key is an error
+with `dbus = "host"` (which reaches every name) or `"off"`. While the
+sandbox runs, the gateway owns every listed name on its bus, so nothing
+inside can take it or have it activated, and host service files for listed
+names are left out of the bus's activatable services. A task with
+`dbus = "portal"` gets the sandbox's list.
+
 ## Profiles
 
 `extends = ["name", ...]` merges profiles from
 `$XDG_CONFIG_HOME/psbox/profiles/<name>.toml` (the same format; profiles may
 extend others) under the config, in order. Tables merge key by key; `rw`,
-`ro`, and `devices` accumulate; other values from the config replace the
-profile's.
+`ro`, `devices`, and `dbus-talk` accumulate; other values from the config
+replace the profile's.
 
 The built-in `browser` profile adds the `camera` and `security-key` classes
 and a shared `~/Downloads/`. A user profile named `browser` replaces it.
@@ -208,6 +233,18 @@ namespaces and processes, sharing the sandbox's home.
 code. A task sees the sandbox's mounts, with the mounts named in `writable`
 read-write. It has no display, no session bus, and no devices unless it sets
 `dbus` or `devices`. `script` runs with `bash -c`.
+
+An overlay does not reliably show changes made to its host directory while
+it is mounted, so when a task ends, `psbox task` has each running instance
+of the sandbox replace its overlays over the task's `writable` directories
+with fresh ones. The swap is atomic: a program already running from the old
+overlay keeps its files until it exits, the next one sees the task's
+changes, and whatever was written to the old overlay is discarded. Mounts
+beneath the overlay, including live ones, are attached again on top. An
+overlay is not refreshed when a tmpfs or another overlay is mounted beneath
+it (such as one at `/tmp` in a sandbox with Xwayland), whose contents would
+be lost, or when something else is mounted over it, at its path or a
+parent; that instance warns and keeps the old files until it restarts.
 
 | Task key | Meaning |
 | --- | --- |
@@ -279,14 +316,15 @@ GNOME matches X11 windows by their X class, which must appear as
 A running sandbox (not a task) watches its config file and the profiles
 directory. Binds and tmpfs mounts (`rw`, `ro`, and `ro`, `rw`, or `empty`
 mounts, and the audio sockets) are attached and detached live, and device
-classes are re-published; environment, commands, app ids, and the idle
-timeout apply to the next process. Mounts beneath a changed mount, including
+classes are re-published, along with the portals they allow (Camera with
+`camera`, Realtime with `audio`); environment, commands, app ids, and the
+idle timeout apply to the next process. Mounts beneath a changed mount, including
 live mounts made by `psbox mount` or the file chooser, are detached and
 attached again with it. New mounts are prepared before
 anything is detached, so a missing source leaves the sandbox unchanged; a
 mount that still fails to apply marks the sandbox for a restart.
 
-Changes to `home`, `cache`, `dbus`, `xwayland`, `network`, or overlay
-mounts need a restart: nothing is applied live, the sandbox stops as soon
+Changes to `home`, `cache`, `dbus`, `dbus-talk`, `xwayland`, `network`, or
+overlay mounts need a restart: nothing is applied live, the sandbox stops as soon
 as it is idle, and until then `psbox run` warns and `psbox status` shows the
 pending restart. A change that fails the startup check is not applied.

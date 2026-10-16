@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::bus;
+use crate::connector::Connector;
 use crate::devices::{self, Change, HostPaths};
 use crate::forker::Forker;
 use crate::gateway::{self, Gateway};
@@ -80,6 +81,12 @@ struct Supervisor {
     dev_rw: OwnedFd,
     seccomp: Vec<libc::sock_filter>,
     state: Mutex<State>,
+    /// Held while the sandbox's mounts change (live mounts, config reloads,
+    /// overlay refreshes, re-attached sockets, file-chooser mounts), so those
+    /// changes apply one at a time and see each other's results.
+    mounting: Mutex<()>,
+    /// Opens the gateway's host bus connections; started on first use.
+    connector: Mutex<Option<Connector>>,
     started: std::time::SystemTime,
     /// The X display number, when the sandbox has Xwayland.
     display: Option<u32>,
@@ -205,6 +212,8 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         dev_rw,
         seccomp: seccomp::program(),
         state: Mutex::new(State::default()),
+        mounting: Mutex::new(()),
+        connector: Mutex::new(None),
         started: std::time::SystemTime::now(),
         display,
     });
@@ -299,12 +308,21 @@ impl Supervisor {
                 r
             }
             Request::Mount { host, at, mode } => {
+                let _mounting = self.mounting.lock().unwrap();
                 self.mount(&host, &at, mode)?;
                 protocol::send(conn, &Response::Done, &[])?;
                 Ok(())
             }
             Request::Umount { at } => {
+                let _mounting = self.mounting.lock().unwrap();
                 self.umount(&at)?;
+                protocol::send(conn, &Response::Done, &[])?;
+                Ok(())
+            }
+            Request::Refresh { hosts } => {
+                let hosts: Vec<PathBuf> = hosts.into_iter().map(PathBuf::from).collect();
+                let _mounting = self.mounting.lock().unwrap();
+                self.refresh(&hosts)?;
                 protocol::send(conn, &Response::Done, &[])?;
                 Ok(())
             }
@@ -460,6 +478,17 @@ impl Supervisor {
         mount::open_dir(&PathBuf::from(format!("/proc/{}/root", self.init_pid)))
     }
 
+    /// Whether something is mounted at the sandbox path `at` (resolved
+    /// without following symlinks; a missing path is not a mount point).
+    fn is_mount_point(&self, at: &Path) -> io::Result<bool> {
+        let rel = at.strip_prefix("/").unwrap_or(at);
+        match mount::openat2(self.root()?.as_fd(), rel, libc::O_PATH, mount::RESOLVE_SAFE_IN_ROOT) {
+            Ok(fd) => mount_root(fd.as_fd()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The plan's environment, with `DISPLAY` when the sandbox has Xwayland.
     fn env(&self) -> BTreeMap<String, String> {
         let mut env = self.plan().env.clone();
@@ -474,7 +503,7 @@ impl Supervisor {
     fn start_bus(self: &Arc<Self>) -> Result<()> {
         let paths = self.plan().bus.clone().expect("bus configured");
         let root = self.root()?;
-        bus::prepare(root.as_fd(), &paths, &self.plan().home)?;
+        bus::prepare(root.as_fd(), &paths, &self.plan().home, &self.plan().dbus_talk)?;
         let argv = vec![
             "dbus-daemon".to_string(),
             format!("--config-file={}", paths.config.display()),
@@ -504,12 +533,8 @@ impl Supervisor {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let policy = Policy {
-            camera: self.plan().node_classes.contains(&DeviceClass::Camera),
-            ..Policy::default()
-        };
         let host: Arc<dyn gateway::Host> = self.clone();
-        Gateway::start(&socket, gateway::host_bus_address()?, policy, host)?;
+        Gateway::start(&socket, &self.plan().dbus_talk, host)?;
         eprintln!(
             "psbox[{}]: session bus ready (dbus-daemon pid {})",
             self.key(),
@@ -606,25 +631,19 @@ impl Supervisor {
 
     /// The host pid of a process given its pid inside the sandbox.
     fn host_pid(&self, sandbox_pid: u32) -> Option<i32> {
-        let ns = fs::read_link(format!("/proc/{}/ns/pid", self.init_pid)).ok()?;
-        for entry in fs::read_dir("/proc").ok()?.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
-                continue;
-            };
-            if fs::read_link(format!("/proc/{pid}/ns/pid")).ok().as_ref() != Some(&ns) {
-                continue;
-            }
-            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-            let inner = status
-                .lines()
-                .find_map(|l| l.strip_prefix("NSpid:"))
-                .and_then(|v| v.split_whitespace().last())
-                .and_then(|v| v.parse::<u32>().ok());
-            if inner == Some(sandbox_pid) {
-                return Some(pid);
-            }
-        }
-        None
+        fs::read_dir("/proc")
+            .ok()?
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()))
+            .find(|&pid| self.is_sandbox_process(pid, sandbox_pid))
+    }
+
+    /// Whether host pid `pid` is, right now, the process with pid
+    /// `sandbox_pid` in the sandbox's own pid namespace.
+    fn is_sandbox_process(&self, pid: i32, sandbox_pid: u32) -> bool {
+        let ns = |pid: i32| fs::read_link(format!("/proc/{pid}/ns/pid")).ok();
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        ns(pid).is_some() && ns(pid) == ns(self.init_pid) && innermost_id(&status) == Some(sandbox_pid)
     }
 
     /// Attaches one plan mount (a bind or tmpfs) in the running sandbox.
@@ -636,7 +655,7 @@ impl Supervisor {
     }
 
     /// The detached mount tree for a mount of `plan`, or `None` for an
-    /// optional bind whose source does not exist.
+    /// optional bind or overlay whose source does not exist.
     fn prepare_plan_mount(&self, plan: &Plan, m: &Mount) -> Result<Option<Prepared>> {
         let prepared = match m {
             Mount::Bind { src, dst, ro, optional } => {
@@ -664,9 +683,158 @@ impl Supervisor {
                 dst: dst.clone(),
                 kind: PointKind::Dir,
             },
+            Mount::Overlay { lower, dst, optional } => {
+                let lower = match mount::open_source(lower, plan.source_guard(lower).as_deref()) {
+                    Ok(fd) => fd,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && *optional => return Ok(None),
+                    Err(e) => return Err(e).with_context(|| format!("source {}", lower.display())),
+                };
+                Prepared {
+                    tree: mount::overlay(lower.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?,
+                    dst: dst.clone(),
+                    kind: PointKind::Dir,
+                }
+            }
             other => bail!("cannot attach {} live", other.dst().display()),
         };
         Ok(Some(prepared))
+    }
+
+    /// Replaces each overlay over one of `hosts` with a fresh one, so the
+    /// sandbox sees what a task wrote there. The new overlay is assembled
+    /// detached, with every later plan entry and live mount beneath it
+    /// attached inside, and swapped in as one tree: if any part fails,
+    /// nothing changes. An overlay with a tmpfs or another overlay mounted
+    /// on it is not refreshed, since their contents would be lost. Processes already using the old
+    /// overlay keep it until they let go.
+    fn refresh(&self, hosts: &[PathBuf]) -> Result<()> {
+        let plan = self.plan();
+        let mut failed = Vec::new();
+        for m in &plan.mounts {
+            let Mount::Overlay { lower, dst, .. } = m else { continue };
+            if !hosts.iter().any(|h| h == lower) {
+                continue;
+            }
+            // Each overlay stands alone: one that cannot be refreshed does
+            // not keep the others from it.
+            match self.refresh_overlay(&plan, m, dst) {
+                Ok(false) => {}
+                Ok(true) => eprintln!(
+                    "psbox[{}]: refreshed {} from {}",
+                    self.key(),
+                    dst.display(),
+                    lower.display()
+                ),
+                Err(e) => {
+                    let why = format!("{}: {e:#}", dst.display());
+                    eprintln!("psbox[{}]: not refreshed: {why}", self.key());
+                    failed.push(why);
+                }
+            }
+        }
+        if !failed.is_empty() {
+            bail!("{}", failed.join("; "));
+        }
+        Ok(())
+    }
+
+    /// Refreshes the overlay `m` at `dst` (see [`Supervisor::refresh`]).
+    /// Returns whether it was replaced (`false` for an optional overlay whose
+    /// directory is still missing).
+    fn refresh_overlay(&self, plan: &Plan, m: &Mount, dst: &Path) -> Result<bool> {
+        let Some(fresh) = self.prepare_plan_mount(plan, m)? else {
+            return Ok(false);
+        };
+        // Plan entries are mounted in order: the ones after the overlay sit
+        // on it, and earlier ones beneath its path are hidden by it.
+        let index = plan
+            .mounts
+            .iter()
+            .position(|o| std::ptr::eq(o, m))
+            .expect("m is one of the plan's mounts");
+        let later = &plan.mounts[index + 1..];
+        // The swap acts on what is visible at `dst`, which must be this
+        // overlay: nothing mounted after it above it, and nothing else at
+        // its path at all (a reload attaches a new entry on top whatever its
+        // place in the plan).
+        let live = self.state.lock().unwrap().mounts.clone();
+        let covers = |at: &Path| dst.starts_with(at);
+        let elsewhere_at_dst = plan.mounts.iter().any(|o| !std::ptr::eq(o, m) && o.dst() == dst);
+        if elsewhere_at_dst || later.iter().any(|o| covers(o.dst())) || live.iter().any(|lm| covers(Path::new(&lm.at)))
+        {
+            bail!("something else is mounted over it");
+        }
+        let beneath = |at: &Path| at != dst && at.starts_with(dst);
+        for inner in later.iter().filter(|i| beneath(i.dst())) {
+            self.rebuild_within(plan, inner, fresh.tree.as_fd(), dst)
+                .with_context(|| format!("rebuild {}", inner.dst().display()))?;
+        }
+        for lm in live.iter().filter(|lm| beneath(Path::new(&lm.at))) {
+            let what = || format!("live mount {} from {}", lm.at, lm.host);
+            let (tree, kind) = self.live_tree(Path::new(&lm.host), lm.mode).with_context(what)?;
+            let p = Prepared {
+                tree,
+                dst: PathBuf::from(&lm.at),
+                kind,
+            };
+            attach_within(fresh.tree.as_fd(), dst, p).with_context(what)?;
+        }
+
+        // Nothing is mounted there when an optional overlay's directory was
+        // missing at start and the task has just created it.
+        if self.is_mount_point(dst)? {
+            inject::replace(self.init_pidfd.as_fd(), fresh.tree.as_fd(), dst).context("swap in the new overlay")?;
+        } else {
+            self.ensure_point(dst, PointKind::Dir)?;
+            inject::attach(self.init_pidfd.as_fd(), fresh.tree.as_fd(), dst).context("attach the new overlay")?;
+        }
+        Ok(true)
+    }
+
+    /// Recreates the plan entry `m` inside the detached tree `root`, which
+    /// will be mounted at `base`, as building the root made it.
+    fn rebuild_within(&self, plan: &Plan, m: &Mount, root: BorrowedFd<'_>, base: &Path) -> Result<()> {
+        let rel = m.dst().strip_prefix(base).expect("beneath the tree's mount point");
+        match m {
+            Mount::Dir { .. } => {
+                mount::make_point(root, rel, PointKind::Dir)?;
+            }
+            Mount::Symlink { target, .. } => {
+                let name = rel.file_name().context("symlink without a name")?;
+                let parent = match rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    Some(p) => mount::make_point(root, p, PointKind::Dir)?,
+                    None => root.try_clone_to_owned()?,
+                };
+                mount::symlink_at(Path::new(target), parent.as_fd(), name)?;
+            }
+            Mount::File { dst, content } => {
+                // A file whose path is a symlink was mounted at the link's
+                // target when the root was built, outside this tree.
+                if is_symlink(root, rel)? {
+                    return Ok(());
+                }
+                let p = Prepared {
+                    tree: file_tree(content)?,
+                    dst: dst.clone(),
+                    kind: PointKind::File,
+                };
+                attach_within(root, base, p)?;
+            }
+            Mount::Bind { .. } => {
+                if let Some(p) = self.prepare_plan_mount(plan, m)? {
+                    attach_within(root, base, p)?;
+                }
+            }
+            // Their contents (such as the X socket on `/tmp/.X11-unix`)
+            // cannot be carried into the new tree.
+            Mount::Tmpfs { .. } | Mount::Overlay { .. } | Mount::Proc { .. } | Mount::Dev { .. } => {
+                bail!(
+                    "{} is mounted beneath it and would lose its contents",
+                    m.dst().display()
+                )
+            }
+        }
+        Ok(())
     }
 
     fn place(&self, p: Prepared) -> Result<()> {
@@ -787,23 +955,8 @@ impl Supervisor {
 
     /// Watches the sandbox config and the profiles directory.
     fn watch_config(&self) {
-        // Only this sandbox's file in `sandboxes/`, and any profile.
-        let file = format!("{}.toml", self.id.sandbox());
-        let watch = || -> io::Result<(crate::sys::inotify::Inotify, i32, Option<i32>)> {
-            let ino = crate::sys::inotify::Inotify::new()?;
-            let mask =
-                libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM;
-            let dir = self.host.config_dir.join("sandboxes");
-            let _ = fs::create_dir_all(&dir);
-            let sandboxes = ino.add(&dir, mask)?;
-            let profiles = self.host.config_dir.join("profiles");
-            let profiles = match profiles.is_dir() {
-                true => Some(ino.add(&profiles, mask)?),
-                false => None,
-            };
-            Ok((ino, sandboxes, profiles))
-        };
-        let (ino, sandboxes, profiles) = match watch() {
+        let _ = fs::create_dir_all(self.host.config_dir.join("sandboxes"));
+        let mut watch = match ConfigWatch::new(&self.host.config_dir, self.id.sandbox()) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("psbox[{}]: cannot watch the config: {e}", self.key());
@@ -811,15 +964,13 @@ impl Supervisor {
             }
         };
         loop {
-            let Ok(events) = ino.read() else { return };
-            let relevant = events.iter().any(|e| {
-                (e.wd == sandboxes && e.name == file) || (Some(e.wd) == profiles && e.name.ends_with(".toml"))
-            });
-            if !relevant {
+            let Ok(events) = watch.ino.read() else { return };
+            if !watch.relevant(&events) {
                 continue;
             }
             // Editors write in several steps; let them finish.
             std::thread::sleep(Duration::from_millis(200));
+            let _mounting = self.mounting.lock().unwrap();
             if let Err(e) = self.reload() {
                 eprintln!("psbox[{}]: config not applied: {e:#}", self.key());
             }
@@ -877,6 +1028,7 @@ impl Supervisor {
                 else {
                     continue;
                 };
+                let _mounting = self.mounting.lock().unwrap();
                 if let Err(err) = self.reattach_socket(m) {
                     eprintln!("psbox[{}]: re-attach {}: {err:#}", self.key(), m.dst().display());
                 }
@@ -987,7 +1139,26 @@ impl Supervisor {
         if dst == Path::new("/") || dst.starts_with("/proc") || dst.starts_with("/dev") {
             bail!("cannot mount at {}", dst.display());
         }
-        let source = match mount::open_source(&src, self.plan().source_guard(&src).as_deref()) {
+        let (tree, kind) = self.live_tree(&src, mode)?;
+        self.ensure_point(&dst, kind)?;
+        inject::attach(self.init_pidfd.as_fd(), tree.as_fd(), &dst).context("attach")?;
+        eprintln!(
+            "psbox[{}]: mounted {} at {} ({mode:?})",
+            self.key(),
+            src.display(),
+            dst.display()
+        );
+        self.state.lock().unwrap().mounts.push(LiveMount {
+            host: src.to_string_lossy().into_owned(),
+            at: dst.to_string_lossy().into_owned(),
+            mode,
+        });
+        Ok(())
+    }
+
+    /// The detached tree for a live mount of the host path `src`.
+    fn live_tree(&self, src: &Path, mode: MountMode) -> Result<(OwnedFd, PointKind)> {
+        let source = match mount::open_source(src, self.plan().source_guard(src).as_deref()) {
             Ok(fd) => fd,
             Err(e) if e.kind() == io::ErrorKind::NotFound => bail!("it doesn't exist"),
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
@@ -1002,20 +1173,7 @@ impl Supervisor {
             attrs |= MOUNT_ATTR_RDONLY;
         }
         mount::set_attr_fd(tree.as_fd(), true, attrs, 0)?;
-        self.ensure_point(&dst, if meta.is_dir() { PointKind::Dir } else { PointKind::File })?;
-        inject::attach(self.init_pidfd.as_fd(), tree.as_fd(), &dst).context("attach")?;
-        eprintln!(
-            "psbox[{}]: mounted {} at {} ({mode:?})",
-            self.key(),
-            src.display(),
-            dst.display()
-        );
-        self.state.lock().unwrap().mounts.push(LiveMount {
-            host: src.to_string_lossy().into_owned(),
-            at: dst.to_string_lossy().into_owned(),
-            mode,
-        });
-        Ok(())
+        Ok((tree, if meta.is_dir() { PointKind::Dir } else { PointKind::File }))
     }
 
     fn umount(&self, at: &str) -> Result<()> {
@@ -1351,6 +1509,143 @@ fn visible_through(mounts: &[(Option<PathBuf>, PathBuf)], host_path: &Path) -> O
         .map(|(_, path)| path)
 }
 
+/// Whether `fd` is the root of a mount.
+fn mount_root(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    // SAFETY: statx is plain old data.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid descriptor, an empty C string with AT_EMPTY_PATH, and a
+    // statx buffer.
+    let r = unsafe { libc::statx(fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH, 0, &mut stx) };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flag = libc::STATX_ATTR_MOUNT_ROOT as u64;
+    if stx.stx_attributes_mask & flag == 0 {
+        return Err(io::Error::other("the kernel does not report mount roots"));
+    }
+    Ok(stx.stx_attributes & flag != 0)
+}
+
+/// A read-only bind of a file holding `content`, from a detached tmpfs.
+fn file_tree(content: &str) -> Result<OwnedFd> {
+    let t = mount::tmpfs(0o755, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
+    mount::write_at(t.as_fd(), "file", content.as_bytes())?;
+    let file = mount::openat2(t.as_fd(), Path::new("file"), libc::O_PATH, mount::RESOLVE_SAFE_IN_ROOT)?;
+    let tree = mount::clone_tree_fd(file.as_fd(), false)?;
+    mount::set_attr_fd(
+        tree.as_fd(),
+        false,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+        0,
+    )?;
+    Ok(tree)
+}
+
+/// Whether `rel` inside the tree `root` is a symlink (its parents are not
+/// followed).
+fn is_symlink(root: BorrowedFd<'_>, rel: &Path) -> Result<bool> {
+    let (Some(name), parent) = (rel.file_name(), rel.parent().filter(|p| !p.as_os_str().is_empty())) else {
+        return Ok(false);
+    };
+    let dir = match parent {
+        Some(p) => match mount::openat2(root, p, libc::O_PATH | libc::O_DIRECTORY, mount::RESOLVE_SAFE_IN_ROOT) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        },
+        None => root.try_clone_to_owned()?,
+    };
+    let name = crate::sys::path_cstr(Path::new(name))?;
+    // SAFETY: stat is plain old data.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid directory descriptor, C string, and stat buffer.
+    let r = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        return match e.kind() {
+            io::ErrorKind::NotFound => Ok(false),
+            _ => Err(e.into()),
+        };
+    }
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
+/// Attaches `p` inside the detached tree `root`, which will be mounted at
+/// `base` in the sandbox.
+fn attach_within(root: BorrowedFd<'_>, base: &Path, p: Prepared) -> Result<()> {
+    let rel = p.dst.strip_prefix(base).expect("beneath the tree's mount point");
+    let point = mount::make_point(root, rel, p.kind).with_context(|| format!("mount point {}", p.dst.display()))?;
+    mount::attach(p.tree.as_fd(), point.as_fd()).with_context(|| format!("attach {}", p.dst.display()))
+}
+
+/// Watches the config files one sandbox is built from: its own file in
+/// `sandboxes/` and every profile. `profiles/` is watched from when it
+/// exists, including when it is created after the supervisor starts.
+struct ConfigWatch {
+    ino: crate::sys::inotify::Inotify,
+    config_dir: PathBuf,
+    file: String,
+    sandboxes: i32,
+    config: i32,
+    profiles: Option<i32>,
+}
+
+impl ConfigWatch {
+    const MASK: u32 =
+        libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM;
+
+    /// `config_dir/sandboxes` must exist.
+    fn new(config_dir: &Path, sandbox: &str) -> io::Result<Self> {
+        let ino = crate::sys::inotify::Inotify::new()?;
+        let sandboxes = ino.add(&config_dir.join("sandboxes"), Self::MASK)?;
+        let config = ino.add(config_dir, libc::IN_CREATE | libc::IN_MOVED_TO)?;
+        let mut w = Self {
+            ino,
+            config_dir: config_dir.to_path_buf(),
+            file: format!("{sandbox}.toml"),
+            sandboxes,
+            config,
+            profiles: None,
+        };
+        w.watch_profiles();
+        Ok(w)
+    }
+
+    fn watch_profiles(&mut self) {
+        self.profiles = self.ino.add(&self.config_dir.join("profiles"), Self::MASK).ok();
+    }
+
+    /// Whether `events` may change this sandbox's config. A new `profiles/`
+    /// directory counts, since it may arrive with profiles already in it.
+    fn relevant(&mut self, events: &[crate::sys::inotify::Event]) -> bool {
+        let mut relevant = false;
+        for e in events {
+            if e.wd == self.config && e.name == "profiles" {
+                self.watch_profiles();
+                relevant |= self.profiles.is_some();
+            } else if Some(e.wd) == self.profiles && e.mask & libc::IN_IGNORED != 0 {
+                // The directory is gone; a new one is noticed through `config`.
+                self.profiles = None;
+            } else if (e.wd == self.sandboxes && e.name == self.file)
+                || (Some(e.wd) == self.profiles && e.name.ends_with(".toml"))
+            {
+                relevant = true;
+            }
+        }
+        relevant
+    }
+}
+
+/// The id a process or thread has in its own pid namespace: the last
+/// `NSpid` entry of its `/proc` status.
+fn innermost_id(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("NSpid:"))
+        .and_then(|v| v.split_whitespace().last())
+        .and_then(|v| v.parse().ok())
+}
+
 /// Atomically creates or replaces `/dev/<name>` as a symlink to `target`.
 /// The device is already attached at the target, so the first event an app
 /// sees for `name` refers to a working node.
@@ -1415,7 +1710,65 @@ impl gateway::Host for Supervisor {
         self.plan().app_id.clone()
     }
 
+    fn policy(&self) -> Policy {
+        let plan = self.plan();
+        Policy {
+            camera: plan.node_classes.contains(&DeviceClass::Camera),
+            realtime: plan.audio,
+            ..Policy::default()
+        }
+    }
+
+    fn connect_host(&self) -> io::Result<OwnedFd> {
+        let bus = self
+            .host
+            .session_bus
+            .as_deref()
+            .ok_or_else(|| io::Error::other("the host bus is not a unix:path= address"))?;
+        let mut connector = self.connector.lock().unwrap();
+        if let Some(c) = connector.as_ref() {
+            match c.connect() {
+                // The connector holds the socket it was started with; the
+                // host bus may have made a new one since.
+                Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+                Ok(sock) => return sock,
+                Err(e) => eprintln!("psbox[{}]: host bus connector failed: {e}", self.key()),
+            }
+        }
+        // Not started yet, failed, or holding a stale socket: start a new
+        // one, whose answer stands.
+        if let Some(old) = connector.take() {
+            old.kill();
+        }
+        let c = Connector::start(
+            &self.forker,
+            bus,
+            self.init_pidfd.as_raw_fd(),
+            self.plan().network != Network::Host,
+            &self.cg.infra,
+        )?;
+        eprintln!("psbox[{}]: host bus connector started (pid {})", self.key(), c.pid);
+        let key = self.key();
+        let reaper = c.pidfd().try_clone_to_owned().and_then(|pidfd| {
+            std::thread::Builder::new().name("connector".into()).spawn(move || {
+                let status = match spawn::wait(pidfd.as_fd()) {
+                    Ok(spawn::Exit::Code(code)) => format!("exited with code {code}"),
+                    Ok(spawn::Exit::Signal(signal)) => format!("killed by signal {signal}"),
+                    Err(e) => format!("cannot be waited for: {e}"),
+                };
+                eprintln!("psbox[{key}]: host bus connector {status}");
+            })
+        });
+        if let Err(e) = reaper {
+            c.kill();
+            let _ = spawn::wait(c.pidfd());
+            return Err(e);
+        }
+        connector.insert(c).connect()?
+    }
+
     fn expose(&self, host_path: &Path, create: bool) -> Result<PathBuf> {
+        let _mounting = self.mounting.lock().unwrap();
         if create && !host_path.exists() {
             fs::File::options().write(true).create_new(true).open(host_path)?;
         }
@@ -1441,6 +1794,50 @@ impl gateway::Host for Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_watch_notices_profiles_created_later() {
+        let dir = std::env::temp_dir().join(format!("psbox-config-watch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sandboxes")).unwrap();
+        let mut w = ConfigWatch::new(&dir, "app").unwrap();
+        assert!(w.profiles.is_none());
+
+        fs::write(dir.join("sandboxes/other.toml"), "").unwrap();
+        assert!(!w.relevant(&w.ino.read().unwrap()));
+        fs::write(dir.join("sandboxes/app.toml"), "").unwrap();
+        assert!(w.relevant(&w.ino.read().unwrap()));
+
+        fs::create_dir(dir.join("profiles")).unwrap();
+        assert!(w.relevant(&w.ino.read().unwrap()));
+        assert!(w.profiles.is_some());
+        fs::write(dir.join("profiles/chat.toml"), "").unwrap();
+        assert!(w.relevant(&w.ino.read().unwrap()));
+
+        fs::remove_dir_all(dir.join("profiles")).unwrap();
+        w.relevant(&w.ino.read().unwrap());
+        assert!(w.profiles.is_none());
+        fs::create_dir(dir.join("profiles")).unwrap();
+        assert!(w.relevant(&w.ino.read().unwrap()));
+        assert!(w.profiles.is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tells_mount_roots_from_plain_directories() {
+        assert!(mount_root(mount::open_dir(Path::new("/")).unwrap().as_fd()).unwrap());
+        let dir = std::env::temp_dir().join(format!("psbox-mount-root-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!mount_root(mount::open_dir(&dir).unwrap().as_fd()).unwrap());
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn innermost_id_is_the_last_nspid() {
+        assert_eq!(innermost_id("Name:\tx\nNSpid:\t4242\t17\nPPid:\t1\n"), Some(17));
+        assert_eq!(innermost_id("NSpid:\t4242\n"), Some(4242));
+        assert_eq!(innermost_id("Name:\tx\n"), None);
+    }
 
     #[test]
     fn resolves_host_paths_through_the_bind_the_sandbox_sees() {

@@ -111,7 +111,7 @@ is reported.
 | Supervisor | `supervisor.rs` |
 | Sandbox root, spawning, and namespace joins | `root.rs`, `spawn.rs`, `forker.rs`, `inject.rs` |
 | Kernel interfaces | `sys/` (namespaces, mount API, Landlock, seccomp, cgroups, inotify, fds, processes) |
-| D-Bus | `bus.rs`, `gateway.rs`, `portal.rs`, `dbus/` (wire format and connections) |
+| D-Bus | `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `dbus/` (wire format and connections) |
 | Devices, Xwayland, desktop entries, systemd | `devices.rs`, `x11.rs`, `desktop.rs`, `install.rs`, `systemd.rs` |
 | Fuzz entry points | `fuzz.rs`, `fuzz/fuzz_targets/` |
 

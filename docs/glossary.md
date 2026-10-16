@@ -121,7 +121,14 @@ processes.
 ## Gateway
 
 The part of the supervisor that serves the portals and notifications on the
-private session bus and forwards what the policy allows to the host.
+private session bus, and the host names a sandbox lists in `dbus-talk`, and
+forwards what the policy allows to the host.
+
+## Connector
+
+The process, in the sandbox's PID namespace, that opens the gateway's
+connections to the host bus, so the host portal reads a client's process ids
+in the sandbox's PID namespace.
 
 ## App id
 

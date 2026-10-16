@@ -1,4 +1,5 @@
-//! D-Bus values and their little-endian wire encoding.
+//! D-Bus values and their wire encoding. Values are written little-endian;
+//! either byte order is read.
 
 use std::fmt;
 
@@ -188,15 +189,17 @@ fn alignment(sig: &str) -> usize {
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// The buffer is big-endian (a message whose first byte is `B`).
+    big: bool,
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+    pub fn new(buf: &'a [u8], big: bool) -> Self {
+        Self { buf, pos: 0, big }
     }
 
-    pub fn at(buf: &'a [u8], pos: usize) -> Self {
-        Self { buf, pos }
+    pub fn at(buf: &'a [u8], pos: usize, big: bool) -> Self {
+        Self { buf, pos, big }
     }
 
     pub fn pos(&self) -> usize {
@@ -221,9 +224,32 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        let b: [u8; 2] = self.take(2)?.try_into().expect("2 bytes");
+        Ok(if self.big {
+            u16::from_be_bytes(b)
+        } else {
+            u16::from_le_bytes(b)
+        })
+    }
+
     fn u32(&mut self) -> Result<u32, DecodeError> {
         self.align(4)?;
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        let b: [u8; 4] = self.take(4)?.try_into().expect("4 bytes");
+        Ok(if self.big {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        })
+    }
+
+    fn u64(&mut self) -> Result<u64, DecodeError> {
+        let b: [u8; 8] = self.take(8)?.try_into().expect("8 bytes");
+        Ok(if self.big {
+            u64::from_be_bytes(b)
+        } else {
+            u64::from_le_bytes(b)
+        })
     }
 
     fn string(&mut self, len: usize) -> Result<String, DecodeError> {
@@ -244,11 +270,6 @@ impl<'a> Reader<'a> {
             return err("value too deep");
         }
         self.align(alignment(sig))?;
-        let le = |b: &[u8]| -> [u8; 8] {
-            let mut a = [0u8; 8];
-            a[..b.len()].copy_from_slice(b);
-            a
-        };
         Ok(match sig.as_bytes()[0] {
             b'y' => Value::Byte(self.take(1)?[0]),
             b'b' => match self.u32()? {
@@ -256,14 +277,14 @@ impl<'a> Reader<'a> {
                 1 => Value::Bool(true),
                 v => return err(format!("bad boolean {v}")),
             },
-            b'n' => Value::I16(i16::from_le_bytes(self.take(2)?.try_into().expect("2"))),
-            b'q' => Value::U16(u16::from_le_bytes(self.take(2)?.try_into().expect("2"))),
+            b'n' => Value::I16(self.u16()? as i16),
+            b'q' => Value::U16(self.u16()?),
             b'i' => Value::I32(self.u32()? as i32),
             b'u' => Value::U32(self.u32()?),
             b'h' => Value::Fd(self.u32()?),
-            b'x' => Value::I64(i64::from_le_bytes(le(self.take(8)?))),
-            b't' => Value::U64(u64::from_le_bytes(le(self.take(8)?))),
-            b'd' => Value::Double(f64::from_le_bytes(le(self.take(8)?))),
+            b'x' => Value::I64(self.u64()? as i64),
+            b't' => Value::U64(self.u64()?),
+            b'd' => Value::Double(f64::from_bits(self.u64()?)),
             b's' => {
                 let n = self.u32()? as usize;
                 Value::Str(self.string(n)?)
@@ -405,9 +426,9 @@ impl Writer {
     }
 }
 
-/// Decodes a message body with signature `sig`.
-pub fn decode_body(sig: &str, body: &[u8]) -> Result<Vec<Value>, DecodeError> {
-    let mut r = Reader::new(body);
+/// Decodes a message body with signature `sig`; `big` for a big-endian body.
+pub fn decode_body(sig: &str, body: &[u8], big: bool) -> Result<Vec<Value>, DecodeError> {
+    let mut r = Reader::new(body, big);
     let mut out = Vec::new();
     for t in split_signature(sig)? {
         out.push(r.read(t)?);
@@ -462,7 +483,28 @@ mod tests {
         let values = sample();
         let (sig, body) = encode_body(&values);
         assert_eq!(sig, "yotashda{sv}");
-        assert_eq!(decode_body(&sig, &body).unwrap(), values);
+        assert_eq!(decode_body(&sig, &body, false).unwrap(), values);
+    }
+
+    #[test]
+    fn reads_big_endian() {
+        let body = [
+            0, 0, 0, 3, b'a', b'b', b'c', 0, // s "abc"
+            0x12, 0x34, 0, 0, // q 0x1234, padding
+            0, 0, 0, 0, // padding to 8
+            0x3f, 0xf0, 0, 0, 0, 0, 0, 0, // d 1.0
+            0, 0, 0, 8, // au of 8 bytes
+            0, 0, 0, 1, 0, 0, 0, 2,
+        ];
+        assert_eq!(
+            decode_body("sqdau", &body, true).unwrap(),
+            vec![
+                Value::Str("abc".into()),
+                Value::U16(0x1234),
+                Value::Double(1.0),
+                Value::Array("u".into(), vec![Value::U32(1), Value::U32(2)]),
+            ]
+        );
     }
 
     #[test]
@@ -490,10 +532,10 @@ mod tests {
         assert!(split_signature("a").is_err());
         assert!(split_signature("(").is_err());
         assert!(split_signature("{ss}").is_ok());
-        assert!(decode_body("s", &[5, 0, 0, 0, b'a']).is_err());
-        assert!(decode_body("b", &[2, 0, 0, 0]).is_err());
+        assert!(decode_body("s", &[5, 0, 0, 0, b'a'], false).is_err());
+        assert!(decode_body("b", &[2, 0, 0, 0], false).is_err());
         // An array of one byte whose only element is four bytes long.
-        assert!(decode_body("au", &[1, 0, 0, 0, 7, 0, 0, 0]).is_err());
+        assert!(decode_body("au", &[1, 0, 0, 0, 7, 0, 0, 0], false).is_err());
         let deep = "a".repeat(100) + "y";
         assert!(split_signature(&deep).is_err());
     }

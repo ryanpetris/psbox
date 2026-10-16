@@ -1,5 +1,8 @@
 //! D-Bus message headers. Bodies stay as raw bytes until a caller decodes
 //! them, so forwarded messages are not re-encoded unless they change.
+//! Messages are written little-endian; a big-endian message is converted to
+//! little-endian as it is parsed, so everything past parsing sees one byte
+//! order.
 
 use super::value::{DecodeError, Reader, Value, Writer, decode_body, encode_body};
 
@@ -44,13 +47,30 @@ fn pad8(n: usize) -> usize {
     n.div_ceil(8) * 8
 }
 
+/// Whether a message is big-endian, from its first byte.
+fn big_endian(first: u8) -> Result<bool, DecodeError> {
+    match first {
+        b'l' => Ok(false),
+        b'B' => Ok(true),
+        _ => Err(DecodeError("unknown byte order".into())),
+    }
+}
+
+/// A `u32` of the fixed prefix at `at`, in the message's byte order.
+fn prefix_u32(prefix: &[u8], at: usize, big: bool) -> u32 {
+    let b: [u8; 4] = prefix[at..at + 4].try_into().expect("4 bytes");
+    if big {
+        u32::from_be_bytes(b)
+    } else {
+        u32::from_le_bytes(b)
+    }
+}
+
 /// The total message length, once the fixed 16-byte prefix is available.
 pub fn frame_len(prefix: &[u8; 16]) -> Result<usize, DecodeError> {
-    if prefix[0] != b'l' {
-        return Err(DecodeError("only little-endian messages are supported".into()));
-    }
-    let body = u32::from_le_bytes(prefix[4..8].try_into().expect("4")) as usize;
-    let fields = u32::from_le_bytes(prefix[12..16].try_into().expect("4")) as usize;
+    let big = big_endian(prefix[0])?;
+    let body = prefix_u32(prefix, 4, big) as usize;
+    let fields = prefix_u32(prefix, 12, big) as usize;
     let total = pad8(16 + fields) + body;
     if total > MAX_MESSAGE {
         return Err(DecodeError("message too large".into()));
@@ -90,7 +110,7 @@ impl Message {
     }
 
     pub fn args(&self) -> Result<Vec<Value>, DecodeError> {
-        decode_body(&self.signature, &self.body)
+        decode_body(&self.signature, &self.body, false)
     }
 
     pub fn set_body(&mut self, args: &[Value]) {
@@ -103,8 +123,21 @@ impl Message {
         self.interface.as_deref() == Some(iface) && self.member.as_deref() == Some(member)
     }
 
-    /// Parses one complete message.
+    /// Parses one complete message, checking that its body decodes and
+    /// converting a big-endian body to little-endian.
     pub fn parse(buf: &[u8]) -> Result<Self, DecodeError> {
+        let (mut m, big) = Self::parse_header(buf)?;
+        let args = decode_body(&m.signature, &m.body, big)?;
+        if big {
+            let (_, body) = encode_body(&args);
+            m.body = body;
+        }
+        Ok(m)
+    }
+
+    /// Parses the header of one complete message, leaving the body in its
+    /// own byte order. Returns whether that order is big-endian.
+    pub fn parse_header(buf: &[u8]) -> Result<(Self, bool), DecodeError> {
         let prefix: &[u8; 16] = buf
             .get(..16)
             .and_then(|b| b.try_into().ok())
@@ -116,13 +149,14 @@ impl Message {
         if buf[3] != 1 {
             return Err(DecodeError("unsupported protocol version".into()));
         }
+        let big = big_endian(buf[0])?;
         let mut m = Message {
             kind: buf[1],
             flags: buf[2],
-            serial: u32::from_le_bytes(buf[8..12].try_into().expect("4")),
+            serial: prefix_u32(buf, 8, big),
             ..Default::default()
         };
-        let mut r = Reader::at(buf, 12);
+        let mut r = Reader::at(buf, 12, big);
         let Value::Array(_, fields) = r.read("a(yv)")? else {
             unreachable!()
         };
@@ -146,12 +180,12 @@ impl Message {
         }
         // The body starts after the header fields the prefix declares, which
         // frame_len already counted in the total.
-        let fields_end = 16 + u32::from_le_bytes(buf[12..16].try_into().expect("4")) as usize;
+        let fields_end = 16 + prefix_u32(buf, 12, big) as usize;
         if r.pos() != fields_end {
             return Err(DecodeError("header fields length mismatch".into()));
         }
         m.body = buf[pad8(fields_end)..].to_vec();
-        Ok(m)
+        Ok((m, big))
     }
 
     /// Encodes the message with `serial`. The sender field is never
@@ -195,6 +229,59 @@ impl Message {
     }
 }
 
+/// For tests: `msg` encoded with `sender` in its header, as the bus would
+/// deliver it.
+#[cfg(test)]
+pub fn encode_from(msg: &Message, serial: u32, sender: &str) -> Vec<u8> {
+    let plain = msg.encode(serial);
+    let fields_len = u32::from_le_bytes(plain[12..16].try_into().expect("4")) as usize;
+    let mut r = Reader::at(&plain, 12, false);
+    let Ok(Value::Array(_, mut fields)) = r.read("a(yv)") else {
+        unreachable!("encode writes valid header fields")
+    };
+    fields.push(Value::Struct(vec![
+        Value::Byte(FIELD_SENDER),
+        Value::Variant(Box::new(Value::Str(sender.into()))),
+    ]));
+    let mut w = Writer::default();
+    w.buf.extend_from_slice(&plain[..12]);
+    w.write(&Value::Array("(yv)".into(), fields));
+    w.align(8);
+    w.buf.extend_from_slice(&plain[pad8(16 + fields_len)..]);
+    w.buf
+}
+
+/// For tests: a big-endian method call to `d.e` at `/p` calling `i.f.m` with one
+/// `u32` argument, written byte by byte.
+#[cfg(test)]
+pub fn big_endian_call(arg: u32, serial: u32) -> Vec<u8> {
+    let mut fields = Vec::new();
+    for (code, sig, s) in [(1u8, b'o', "/p"), (2, b's', "i.f"), (3, b's', "m"), (6, b's', "d.e")] {
+        while !(16 + fields.len()).is_multiple_of(8) {
+            fields.push(0);
+        }
+        fields.extend_from_slice(&[code, 1, sig, 0]);
+        fields.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        fields.extend_from_slice(s.as_bytes());
+        fields.push(0);
+    }
+    while !(16 + fields.len()).is_multiple_of(8) {
+        fields.push(0);
+    }
+    fields.extend_from_slice(&[FIELD_SIGNATURE, 1, b'g', 0, 1, b'u', 0]);
+
+    let mut m = vec![b'B', METHOD_CALL, 0, 1];
+    m.extend_from_slice(&4u32.to_be_bytes());
+    m.extend_from_slice(&serial.to_be_bytes());
+    m.extend_from_slice(&(fields.len() as u32).to_be_bytes());
+    m.extend_from_slice(&fields);
+    while !m.len().is_multiple_of(8) {
+        m.push(0);
+    }
+    m.extend_from_slice(&arg.to_be_bytes());
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +321,36 @@ mod tests {
         assert_eq!(back.args().unwrap()[1], Value::Str("color-scheme".into()));
         assert!(back.is("org.freedesktop.portal.Settings", "ReadOne"));
         assert!(back.expects_reply());
+    }
+
+    #[test]
+    fn big_endian_messages_parse_as_little_endian() {
+        let parsed = Message::parse(&big_endian_call(0x01020304, 7)).unwrap();
+        let mut expected = Message::method_call("d.e", "/p", "i.f", "m", &[Value::U32(0x01020304)]);
+        expected.serial = 7;
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed.args().unwrap(), vec![Value::U32(0x01020304)]);
+    }
+
+    #[test]
+    fn a_little_endian_body_that_does_not_decode_is_an_error() {
+        let mut m = Message::method_call("d.e", "/p", "i.f", "m", &[Value::U32(1000)]);
+        m.signature = "s".into();
+        let bytes = m.encode(3);
+        assert!(Message::parse(&bytes).is_err());
+        assert_eq!(Message::parse_header(&bytes).unwrap().0.serial, 3);
+    }
+
+    #[test]
+    fn a_big_endian_body_that_does_not_decode_is_an_error() {
+        let mut m = big_endian_call(1, 7);
+        // Declare a string body: the four bytes are now a too-long length.
+        let sig_at = m.windows(3).position(|w| w == [1, b'u', 0]).unwrap();
+        m[sig_at + 1] = b's';
+        assert!(Message::parse(&m).is_err());
+        let (header, big) = Message::parse_header(&m).unwrap();
+        assert!(big);
+        assert_eq!(header.serial, 7);
     }
 
     #[test]

@@ -55,7 +55,13 @@ pub fn dbus_message(data: &[u8]) {
         return;
     };
     let _ = msg.args();
-    let _ = crate::portal::check(&crate::portal::Policy::default(), &msg);
+    // Every optional portal on, so their checks are reached too.
+    let policy = crate::portal::Policy {
+        camera: true,
+        realtime: true,
+        ..crate::portal::Policy::default()
+    };
+    let _ = crate::portal::check(&policy, &msg);
     let encoded = msg.encode(1);
     let _ = Message::parse(&encoded);
 }

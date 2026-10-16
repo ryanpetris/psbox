@@ -16,9 +16,9 @@ use crate::spec::Network;
 use crate::sys::fd::Seqpacket;
 use crate::sys::mount::{
     FsContext, MOUNT_ATTR_NODEV, MOUNT_ATTR_NOSUID, MOUNT_ATTR_RDONLY, PointKind, attach, clone_tree, clone_tree_fd,
-    fd_path, make_point, open_dir, open_source, set_attr_fd, set_attr_path, tmpfs,
+    make_point, open_dir, open_source, overlay, set_attr_fd, set_attr_path, tmpfs,
 };
-use crate::sys::{cvt_int, ns, path_cstr};
+use crate::sys::ns;
 
 /// Writable views of the read-only root and `/dev` tmpfs mounts. The
 /// supervisor keeps these to create mount points and device links without
@@ -41,7 +41,6 @@ pub fn build(plan: &Plan, new_root: &Path) -> Result<RootHandles> {
     attach(tree.as_fd(), open_dir(new_root)?.as_fd()).context("attach root")?;
     let root = open_dir(new_root)?;
     let mut dev_rw = None;
-    let mut overlays = 0;
     let mut files = 0;
 
     for m in &plan.mounts {
@@ -65,8 +64,8 @@ pub fn build(plan: &Plan, new_root: &Path) -> Result<RootHandles> {
                         Err(e) if e.kind() == io::ErrorKind::NotFound && *optional => return Ok(()),
                         Err(e) => return Err(e).with_context(|| format!("source {}", lower.display())),
                     };
-                    overlays += 1;
-                    overlay(root.as_fd(), new_root, lower.as_fd(), dst, overlays)?;
+                    let ov = overlay(lower.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
+                    attach(ov.as_fd(), make_point(root.as_fd(), rel(dst), PointKind::Dir)?.as_fd())?;
                 }
                 Mount::Symlink { target, dst } => {
                     let path = new_root.join(rel(dst));
@@ -127,37 +126,6 @@ fn bind(
     set_attr_fd(tree.as_fd(), true, attrs, 0)?;
     let kind = if meta.is_dir() { PointKind::Dir } else { PointKind::File };
     attach(tree.as_fd(), make_point(root, rel(dst), kind)?.as_fd())?;
-    Ok(())
-}
-
-/// A writable overlay over `lower` whose upper layer lives on a private
-/// tmpfs and is discarded with the sandbox.
-fn overlay(
-    root: std::os::fd::BorrowedFd<'_>,
-    new_root: &Path,
-    lower: std::os::fd::BorrowedFd<'_>,
-    dst: &Path,
-    n: usize,
-) -> Result<()> {
-    let scratch_rel = PathBuf::from(format!(".psbox-overlay-{n}"));
-    let scratch = new_root.join(&scratch_rel);
-    let t = tmpfs(0o700, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
-    attach(t.as_fd(), make_point(root, &scratch_rel, PointKind::Dir)?.as_fd())?;
-    fs::create_dir(scratch.join("upper"))?;
-    fs::create_dir(scratch.join("work"))?;
-
-    let ctx = FsContext::new("overlay")?;
-    ctx.set_string("lowerdir+", &fd_path(lower).to_string_lossy())?;
-    ctx.set_string("upperdir", &scratch.join("upper").to_string_lossy())?;
-    ctx.set_string("workdir", &scratch.join("work").to_string_lossy())?;
-    ctx.set_flag("userxattr")?;
-    let ov = ctx.mount(MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
-    attach(ov.as_fd(), make_point(root, rel(dst), PointKind::Dir)?.as_fd())?;
-
-    let c = path_cstr(&scratch)?;
-    // SAFETY: valid path; the overlay keeps its own references to the layers.
-    cvt_int(unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) })?;
-    fs::remove_dir(&scratch)?;
     Ok(())
 }
 

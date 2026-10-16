@@ -57,8 +57,9 @@ fn service_name(text: &str) -> Option<&str> {
 }
 
 /// Writes the configuration and the filtered service directory, through
-/// `root`, a descriptor for the sandbox root.
-pub fn prepare(root: BorrowedFd<'_>, paths: &BusPaths, home: &Path) -> Result<()> {
+/// `root`, a descriptor for the sandbox root. Names in `talk` belong to the
+/// host (through the gateway) and are never activated inside.
+pub fn prepare(root: BorrowedFd<'_>, paths: &BusPaths, home: &Path, talk: &[String]) -> Result<()> {
     let config_dir = paths.config.parent().expect("config has a parent");
     let services = config_dir.join("services");
     let services_dir = make_point(root, in_root(&services), PointKind::Dir)
@@ -71,7 +72,7 @@ pub fn prepare(root: BorrowedFd<'_>, paths: &BusPaths, home: &Path) -> Result<()
                 continue;
             }
             let Ok(text) = fs::read_to_string(&path) else { continue };
-            if service_name(&text).is_some_and(activation_allowed) {
+            if service_name(&text).is_some_and(|n| activation_allowed(n) && !talk.iter().any(|t| t == n)) {
                 symlink_at(&path, services_dir.as_fd(), &entry.file_name())
                     .with_context(|| format!("link {}", services.join(entry.file_name()).display()))?;
             }
@@ -114,7 +115,7 @@ mod tests {
         fs::create_dir_all(&view).unwrap();
         let paths = BusPaths::new(Path::new("/run/user/1000"));
         let root = crate::sys::mount::open_dir(&view).unwrap();
-        prepare(root.as_fd(), &paths, Path::new("/home/u")).unwrap();
+        prepare(root.as_fd(), &paths, Path::new("/home/u"), &[]).unwrap();
         let config = fs::read_to_string(view.join(in_root(&paths.config))).unwrap();
         assert!(config.contains("<listen>unix:path=/run/user/1000/bus</listen>"));
         assert!(config.contains("<servicedir>/run/user/1000/psbox/dbus/services</servicedir>"));
@@ -138,7 +139,7 @@ mod tests {
         fs::create_dir_all(planted.join("run/user")).unwrap();
         std::os::unix::fs::symlink(&view, planted.join("run/user/1000")).unwrap();
         let root = crate::sys::mount::open_dir(&planted).unwrap();
-        assert!(prepare(root.as_fd(), &paths, Path::new("/home/u")).is_err());
+        assert!(prepare(root.as_fd(), &paths, Path::new("/home/u"), &[]).is_err());
         fs::remove_dir_all(&planted).unwrap();
         fs::remove_dir_all(&view).unwrap();
     }

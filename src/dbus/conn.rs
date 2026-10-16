@@ -1,7 +1,8 @@
 //! A blocking D-Bus client connection with descriptor passing.
 //!
 //! One thread reads (`recv`) while any thread may send (`send`). `call` is
-//! for setup, before a reader loop owns the connection.
+//! for setup, before a reader loop owns the connection; messages from the bus
+//! itself that arrive while it waits are kept for `recv`.
 
 use std::collections::VecDeque;
 use std::io;
@@ -25,6 +26,9 @@ pub const BUS_PATH: &str = "/org/freedesktop/DBus";
 struct ReadState {
     buf: Vec<u8>,
     fds: VecDeque<OwnedFd>,
+    /// Messages from the bus itself (such as `NameOwnerChanged`) that
+    /// arrived while `call` waited for its reply.
+    backlog: VecDeque<(Message, Vec<OwnedFd>)>,
 }
 
 pub struct Conn {
@@ -37,6 +41,30 @@ pub struct Conn {
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+/// A received message whose header was read but whose body could not be
+/// decoded. Its descriptors are closed and the connection stays usable;
+/// `message` has the header and an empty body.
+#[derive(Debug)]
+pub struct Undecodable {
+    pub message: Message,
+    pub reason: String,
+}
+
+impl std::fmt::Display for Undecodable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "undecodable message: {}", self.reason)
+    }
+}
+
+impl std::error::Error for Undecodable {}
+
+impl Undecodable {
+    /// The `Undecodable` inside an error from [`Conn::recv`], if it is one.
+    pub fn of(e: &io::Error) -> Option<&Self> {
+        e.get_ref().and_then(|inner| inner.downcast_ref::<Self>())
+    }
 }
 
 /// Decodes `%xx` escapes in a D-Bus address value.
@@ -85,15 +113,17 @@ fn open_address(address: &str) -> io::Result<OwnedFd> {
 impl Conn {
     /// Connects to a bus address, authenticates, and says `Hello`.
     pub fn connect(address: &str) -> io::Result<Self> {
-        Self::setup(open_address(address)?)
+        Self::over(open_address(address)?)
     }
 
     /// Connects to a bus socket path.
     pub fn connect_path(path: &Path) -> io::Result<Self> {
-        Self::setup(stream_connect(path.as_os_str().as_bytes(), false)?)
+        Self::over(stream_connect(path.as_os_str().as_bytes(), false)?)
     }
 
-    fn setup(sock: OwnedFd) -> io::Result<Self> {
+    /// Authenticates over a socket already connected to a bus, and says
+    /// `Hello`.
+    pub fn over(sock: OwnedFd) -> io::Result<Self> {
         auth(&sock)?;
         let mut conn = Self {
             sock,
@@ -132,25 +162,51 @@ impl Conn {
         Ok(serial)
     }
 
-    /// Blocks until a whole message arrives.
+    /// Blocks until a whole message arrives. A message whose body cannot
+    /// be decoded is returned as an [`Undecodable`] error, after which the
+    /// connection can still be read; any other error ends it.
     pub fn recv(&self) -> io::Result<(Message, Vec<OwnedFd>)> {
         let mut st = self.read.lock().unwrap();
+        if let Some(m) = st.backlog.pop_front() {
+            return Ok(m);
+        }
+        self.read_one(&mut st)
+    }
+
+    /// Reads the next message from the socket, past the backlog.
+    fn read_one(&self, st: &mut ReadState) -> io::Result<(Message, Vec<OwnedFd>)> {
         loop {
             if st.buf.len() >= 16 {
                 let prefix: [u8; 16] = st.buf[..16].try_into().expect("16 bytes");
                 let total = frame_len(&prefix).map_err(|e| invalid(e.to_string()))?;
                 if st.buf.len() >= total {
                     let raw: Vec<u8> = st.buf.drain(..total).collect();
-                    let msg = Message::parse(&raw).map_err(|e| invalid(e.to_string()))?;
-                    let n = msg.unix_fds as usize;
+                    // The header names the descriptors that came with the
+                    // message, so they can be taken (or dropped) even when
+                    // the body cannot be decoded.
+                    let (header, _) = Message::parse_header(&raw).map_err(|e| invalid(e.to_string()))?;
+                    let n = header.unix_fds as usize;
                     if st.fds.len() < n {
                         return Err(invalid("message references missing descriptors"));
                     }
-                    let fds = st.fds.drain(..n).collect();
-                    return Ok((msg, fds));
+                    let fds: Vec<OwnedFd> = st.fds.drain(..n).collect();
+                    return match Message::parse(&raw) {
+                        Ok(msg) => Ok((msg, fds)),
+                        Err(e) => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            Undecodable {
+                                message: Message {
+                                    body: Vec::new(),
+                                    signature: String::new(),
+                                    ..header
+                                },
+                                reason: e.to_string(),
+                            },
+                        )),
+                    };
                 }
             }
-            let ReadState { buf, fds } = &mut *st;
+            let ReadState { buf, fds, .. } = &mut *st;
             if recvmsg(&self.sock, buf, fds)? == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -160,15 +216,28 @@ impl Conn {
         }
     }
 
-    /// Sends a method call and waits for its reply, discarding anything
-    /// else that arrives meanwhile. Only for setup.
+    /// Sends a method call and waits for its reply. Messages from the bus
+    /// itself that arrive meanwhile are kept, in order, for `recv`; anything
+    /// else is dropped, so a connection only ever used for calls does not
+    /// collect what other peers send it. Only for setup and for queries on
+    /// a connection that no reader owns.
     pub fn call(&self, msg: &Message) -> io::Result<Message> {
         let serial = self.send(msg, &[])?;
+        let mut st = self.read.lock().unwrap();
         loop {
-            let (reply, _) = self.recv()?;
-            if reply.reply_serial != Some(serial) {
-                continue;
-            }
+            let reply = match self.read_one(&mut st) {
+                Ok((reply, _)) if reply.reply_serial == Some(serial) => reply,
+                Ok(other) => {
+                    if other.0.sender.as_deref() == Some(BUS_NAME) {
+                        st.backlog.push_back(other);
+                    }
+                    continue;
+                }
+                Err(e) => match Undecodable::of(&e) {
+                    Some(u) if u.message.reply_serial != Some(serial) => continue,
+                    _ => return Err(e),
+                },
+            };
             if reply.kind == message::ERROR {
                 let text = reply
                     .args()
@@ -344,6 +413,101 @@ fn recvmsg(sock: &OwnedFd, buf: &mut Vec<u8>, fds: &mut VecDeque<OwnedFd>) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undecodable_message_leaves_the_connection_usable() {
+        let mut pair = [0; 2];
+        // SAFETY: socketpair fills two descriptors we then own.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: both descriptors were just created and are owned here.
+        let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let conn = Conn {
+            sock: ours,
+            write: Mutex::new(()),
+            read: Mutex::new(ReadState::default()),
+            serial: AtomicU32::new(1),
+            unique: String::new(),
+        };
+
+        // A big-endian call whose body claims to be a string but is not,
+        // then a good one.
+        let mut bytes = message::big_endian_call(1000, 5);
+        let sig_at = bytes
+            .windows(3)
+            .position(|w| w == [1, b'u', 0])
+            .expect("signature field");
+        bytes[sig_at + 1] = b's';
+        let good = Message::method_call("d.e", "/p", "i.f", "ok", &[Value::U32(1)]);
+        bytes.extend(good.encode(6));
+        write_all(&theirs, &bytes).unwrap();
+
+        let e = conn.recv().unwrap_err();
+        let u = Undecodable::of(&e).expect("undecodable");
+        assert_eq!(u.message.serial, 5);
+        let (msg, _) = conn.recv().unwrap();
+        assert_eq!(msg.serial, 6);
+        assert_eq!(msg.member.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn a_call_keeps_bus_messages_for_recv_and_drops_others() {
+        let mut pair = [0; 2];
+        // SAFETY: socketpair fills two descriptors we then own.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: both descriptors were just created and are owned here.
+        let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let conn = Conn {
+            sock: ours,
+            write: Mutex::new(()),
+            read: Mutex::new(ReadState::default()),
+            serial: AtomicU32::new(1),
+            unique: String::new(),
+        };
+
+        let mut changed = Message::method_call("x", BUS_PATH, BUS_NAME, "NameOwnerChanged", &[]);
+        changed.kind = message::SIGNAL;
+        changed.destination = None;
+        let mut stray = Message::method_call("x", "/p", "i.f", "Spam", &[]);
+        stray.kind = message::SIGNAL;
+        let reply = Message {
+            kind: message::METHOD_RETURN,
+            reply_serial: Some(1),
+            ..Default::default()
+        };
+        let mut bytes = message::encode_from(&changed, 10, BUS_NAME);
+        bytes.extend(message::encode_from(&stray, 11, ":1.9"));
+        bytes.extend(message::encode_from(&reply, 12, BUS_NAME));
+        write_all(&theirs, &bytes).unwrap();
+
+        let r = conn
+            .call(&Message::method_call(BUS_NAME, BUS_PATH, BUS_NAME, "Ping", &[]))
+            .unwrap();
+        assert_eq!(r.serial, 12);
+        let (kept, _) = conn.recv().unwrap();
+        assert_eq!(kept.serial, 10);
+        assert_eq!(kept.member.as_deref(), Some("NameOwnerChanged"));
+        assert!(conn.read.lock().unwrap().backlog.is_empty());
+    }
 
     #[test]
     fn unescapes_addresses() {

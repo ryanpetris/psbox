@@ -36,6 +36,13 @@ unmounted to reveal what they cover or remounted read-write.
   namespace; `host` sandboxes share the host's (see [Network](#network)).
 - **Capabilities:** every process in the sandbox runs with none, and with
   `no_new_privs`, so setuid binaries and file capabilities gain nothing.
+  The one exception is the gateway's
+  [connector](architecture.md#d-bus), which appears in the sandbox's process
+  list. It runs no program and only opens host bus connections, and it keeps
+  the supervisor's capabilities and has no seccomp filter. Holding those
+  capabilities is what stops sandbox processes from ptracing it or opening
+  its descriptors. It shares the sandbox's mount and network namespaces, so
+  its `/proc` entries show nothing the sandbox cannot already see.
 - **seccomp:** a deny-list returns `EPERM` for the kernel keyring
   (`keyctl`, `add_key`, `request_key`), `kexec_load` and `kexec_file_load`,
   module loading and removal, `reboot`, `swapon`/`swapoff`, `acct`,
@@ -71,7 +78,8 @@ before it is published.
 With `dbus = "portal"` (the default), the sandbox has its own session bus.
 Services activated on it (such as `dconf` and `gvfsd`) run inside the
 sandbox and keep their state in the private home. Only the portals and
-notifications reach the host, through the supervisor's gateway:
+notifications reach the host, through the supervisor's gateway, plus any
+names the config lists in `dbus-talk` (see below):
 
 | Portal interfaces | Treatment |
 | --- | --- |
@@ -82,11 +90,15 @@ notifications reach the host, through the supervisor's gateway:
 | ScreenCast | `persist_mode` and `restore_token` removed |
 | FileChooser | Sandbox paths in options removed; the chosen files are made visible (existing writable shares are reused, otherwise the file is mounted at `$XDG_RUNTIME_DIR/doc/<n>/<name>`; save dialogs create the file first) |
 | Camera | Only with the `camera` device class |
-| Anything else (Background, DynamicLauncher, RemoteDesktop, Location, Realtime, Wallpaper, Usb, Documents, ...) | Refused with `AccessDenied` and logged |
+| Realtime | Only with the `audio` device class, and only `MakeThreadRealtimeWithPID` and `MakeThreadHighPriorityWithPID` for threads of the sandbox's own processes (the host portal looks the ids up in the sandbox's PID namespace, so no other process can be named) |
+| Anything else (Background, DynamicLauncher, RemoteDesktop, Location, Wallpaper, Usb, Documents, ...) | Refused with `AccessDenied` and logged |
 
 `org.freedesktop.Notifications` is forwarded with the `image-path` and
-`sound-file` hints removed. Every other host bus name is unreachable, and
-the system bus is not available.
+`sound-file` hints removed. Names listed in
+[`dbus-talk`](configuration.md#host-bus-names) are reachable too, with
+calls and replies passed unfiltered: listing one gives the sandbox that
+service's full access, as yours. Every other host bus name is unreachable,
+and the system bus is not available.
 
 With `dbus = "host"`, the sandbox gets the host session bus and the system
 bus unfiltered: every host service is reachable with your own permissions.

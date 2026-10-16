@@ -43,6 +43,12 @@ pub enum Request {
     Umount {
         at: String,
     },
+    /// Replace the overlays over these host directories with fresh ones,
+    /// after a task wrote to them: an overlay does not reliably show changes
+    /// made to its lower directory while it is mounted.
+    Refresh {
+        hosts: Vec<String>,
+    },
     Status,
     Stop,
 }

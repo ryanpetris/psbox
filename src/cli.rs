@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::devices::{self, HostPaths};
 use crate::plan::{HostEnv, Identity, Plan, find_in_path, resolve_network};
 use crate::protocol::{Request, Response};
-use crate::spec::{DeviceClass, MountMode, Network, Spec};
+use crate::spec::{DeviceClass, MountMode, Network, Spec, Tokens};
 use crate::systemd::{self, Systemd};
 use crate::ui::{self, BOLD, CYAN, Cell, DIM, GREEN, RED, Table, YELLOW, paint};
 use crate::{client, install, sys};
@@ -307,6 +307,69 @@ pub fn umount(id: &Identity, at: String) -> Result<i32> {
         paint(BOLD, id.describe())
     ));
     Ok(0)
+}
+
+/// Runs a task, then has the sandbox's running instances refresh the
+/// overlays over the directories the task could write, so they see what it
+/// changed (see [`Request::Refresh`]). Problems refreshing are warnings; the
+/// task's own exit code stands.
+pub fn task(sandbox: &str, task: &str, args: Vec<String>, create_dirs: bool) -> Result<i32> {
+    let id = Identity::Task {
+        sandbox: sandbox.into(),
+        task: task.into(),
+    };
+    let code = client::run(&id, Some(task.into()), args, false, create_dirs)?;
+    if let Err(e) = refresh_after_task(sandbox, task) {
+        ui::warning(format!(
+            "running instances of {sandbox} may not show what the task changed ({e:#}); {} restarts them",
+            ui::code(format!("psbox stop {sandbox}"))
+        ));
+    }
+    Ok(code)
+}
+
+fn refresh_after_task(sandbox: &str, task: &str) -> Result<()> {
+    let host = HostEnv::from_process()?;
+    let hosts = writable_hosts(&Spec::load(sandbox, &host.config_dir)?, sandbox, task, &host)?;
+    if hosts.is_empty() {
+        return Ok(());
+    }
+    let running = Systemd::connect()?.active_units(&format!("{}{sandbox}*.service", systemd::UNIT_PREFIX))?;
+    for key in running
+        .iter()
+        .filter_map(|u| u.strip_prefix(systemd::UNIT_PREFIX)?.strip_suffix(".service"))
+    {
+        let instance = match Identity::from_key(key) {
+            Ok(i @ Identity::Instance { .. }) if i.sandbox() == sandbox => i,
+            _ => continue,
+        };
+        // One instance that cannot refresh does not stop the others.
+        if let Err(e) = client::request(&instance, Request::Refresh { hosts: hosts.clone() }) {
+            ui::warning(format!(
+                "{} still shows what was there before the task ({e:#}); {} restarts it",
+                instance.describe(),
+                ui::code(format!("psbox stop {}", instance.cli_args()))
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The host directories behind a task's `writable` mounts.
+fn writable_hosts(spec: &Spec, sandbox: &str, task: &str, host: &HostEnv) -> Result<Vec<String>> {
+    let Some(t) = spec.task.get(task) else {
+        return Ok(Vec::new());
+    };
+    let tokens = Tokens {
+        home: &host.home,
+        root: &host.root,
+        name: sandbox,
+    };
+    t.writable
+        .iter()
+        .filter_map(|name| spec.mount.get(name)?.host.as_deref())
+        .map(|h| Ok(tokens.expand(h)?.to_string_lossy().into_owned()))
+        .collect()
 }
 
 pub fn stop(id: &Identity) -> Result<i32> {
@@ -874,6 +937,33 @@ pub fn completions(shell: &dyn EnvCompleter) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tasks_writable_hosts_are_expanded() {
+        let host = HostEnv {
+            uid: 1000,
+            gid: 1000,
+            user: "u".into(),
+            home: "/home/u".into(),
+            runtime_dir: "/run/user/1000".into(),
+            wayland_socket: None,
+            session_bus: None,
+            config_dir: "/home/u/.config/psbox".into(),
+            root: "/home/u/Sandbox".into(),
+            pasta: true,
+        };
+        let spec = Spec::parse(
+            "[mount.bin]\nhost = \"@self.bin/\"\nat = \"~/.bin\"\nmode = \"overlay\"\n\
+             [mount.data]\nhost = \"~/data\"\nmode = \"ro\"\n\
+             [task.update]\nexec = [\"x\"]\nwritable = [\"bin\"]\n\
+             [task.check]\nexec = [\"x\"]\n",
+        )
+        .unwrap();
+        let hosts = writable_hosts(&spec, "app", "update", &host).unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(Path::new(&hosts[0]), Path::new("/home/u/Sandbox/app.bin"));
+        assert!(writable_hosts(&spec, "app", "check", &host).unwrap().is_empty());
+    }
 
     #[test]
     fn config_errors_fit_on_one_line() {

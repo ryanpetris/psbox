@@ -33,7 +33,8 @@ fn sockaddr_bytes(name: &[u8], abstract_name: bool) -> io::Result<(libc::sockadd
     Ok((addr, len as libc::socklen_t))
 }
 
-fn sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+/// Builds a socket address for a path.
+pub fn sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     sockaddr_bytes(path.as_os_str().as_bytes(), false)
 }
 

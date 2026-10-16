@@ -34,7 +34,11 @@ Commands start in the caller's working directory when the sandbox has it
 home, else in `/`.
 
 `psbox task <sandbox> <task>` runs a task in its own supervisor and waits
-for it. `--create-dirs` on `run`, `task`, and `sandbox` also creates missing
+for it. Afterwards, running instances of the sandbox replace their overlays
+over the task's `writable` directories, so they see what it changed (see
+[configuration.md](configuration.md#instances-and-tasks)); an instance that
+cannot is named in a warning, and keeps the old files until it restarts.
+`--create-dirs` on `run`, `task`, and `sandbox` also creates missing
 directories marked with a trailing `/` outside the sandbox root, and
 confirms each one (see [configuration.md](configuration.md#paths-and-tokens)).
 Paths without the `/` are never created; the startup check says so when
@@ -143,6 +147,7 @@ status passes through. Exactly one home flag is required:
 | `--cache tmpfs\|home` | As the `cache` key |
 | `--devices LIST` | Comma-separated classes replacing `gpu,audio`; `none` for no devices |
 | `--dbus portal\|host\|off` | As the `dbus` key |
+| `--dbus-talk NAME` | A host bus name the sandbox may call, as the `dbus-talk` key; repeatable |
 | `--network isolated\|host\|none` | As the `network` key |
 | `--no-display` | No Wayland and no Xwayland |
 | `--xwayland` | Xwayland for X11 apps, as the `xwayland` key |
