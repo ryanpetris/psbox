@@ -208,15 +208,26 @@ unsafe fn child(r: &Raw<'_>) -> ! {
         let mut report = [0u8; 8];
         report[..4].copy_from_slice(&stage.to_ne_bytes());
         report[4..].copy_from_slice(&errno.to_ne_bytes());
+        // SAFETY: write and _exit are async-signal-safe; the report is on
+        // this child's stack and `err_fd` is the pipe set up before the fork.
         unsafe {
             libc::write(r.err_fd, report.as_ptr().cast(), report.len());
             libc::_exit(127)
         }
     }
     unsafe fn errno() -> i32 {
+        // SAFETY: reads this thread's errno, which needs no lock.
         unsafe { *libc::__errno_location() }
     }
 
+    // SAFETY: this runs in the child of `clone3` in a multithreaded process,
+    // so it may only make async-signal-safe calls: every call below is a
+    // raw syscall or a libc wrapper that is one (prctl, sigemptyset,
+    // sigprocmask, signal, setns, setsid, dup2, fcntl, isatty, ioctl, chdir,
+    // close_range, seccomp, execve, write, _exit). Nothing allocates or takes
+    // a lock, and every pointer used refers to data `spawn` prepared before
+    // the fork (`r`, its C strings, argv, envp, and the seccomp program),
+    // which the child's copy of the parent's memory keeps valid until exec.
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         let mut set: libc::sigset_t = std::mem::zeroed();

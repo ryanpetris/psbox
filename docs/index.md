@@ -19,4 +19,5 @@ setup. Then:
 | [Dependencies](dependencies.md) | Crates and their licenses |
 | [Glossary](glossary.md) | Canonical terms |
 
-Linux only. Release binaries are static `amd64` and `arm64` builds.
+Linux only. The release archives hold static `amd64` and `arm64` binaries;
+the Arch and Debian packages are native builds for their distribution.

@@ -105,8 +105,10 @@ and nothing changes.
 `security-key`, and `alsa` classes match; `--all` lists every device, with
 the IDs `usb:<vid>:<pid>` needs.
 
-`check` lists Landlock, user namespaces, cgroup v2, the units, and
-`dbus-daemon` as required (`✗`, exit status 1 when one is missing), and
+`check` lists Landlock, the kernel version, user namespaces (by creating
+one, with a mount namespace inside, in a short-lived child process), cgroup
+v2, the units, and `dbus-daemon` as required (`✗`, exit status 1 when one
+is missing), and
 `xwayland-satellite` and `pasta` as optional (`!`). `check <sandbox>` runs
 the [startup check](#the-startup-check) for the sandbox and each of its
 tasks without starting anything (exit status 1 when one cannot start);

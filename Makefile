@@ -37,9 +37,11 @@ check: check/fmt check/clippy test check/deny
 check/fmt:
 	$(CARGO) fmt --check
 
-# Clippy for both release targets, so architecture-specific code is checked.
+# Clippy for the native build (what the distribution packages ship) and both
+# release targets, so C library and architecture differences are checked.
 check/clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
 	$(CARGO) clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
 
 check/deny:

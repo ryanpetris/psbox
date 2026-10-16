@@ -24,24 +24,57 @@ pub const GATEWAY_NAMES: [&str; 2] = [PORTAL_NAME, NOTIFICATIONS_NAME];
 const REQUEST_PREFIX: &str = "/org/freedesktop/portal/desktop/request/";
 const SESSION_PREFIX: &str = "/org/freedesktop/portal/desktop/session/";
 
-/// Portal interfaces forwarded without changes.
-const PLAIN: [&str; 15] = [
-    "org.freedesktop.portal.Account",
-    "org.freedesktop.portal.Email",
-    "org.freedesktop.portal.FileChooser",
-    "org.freedesktop.portal.GlobalShortcuts",
-    "org.freedesktop.portal.Inhibit",
-    "org.freedesktop.portal.MemoryMonitor",
-    "org.freedesktop.portal.NetworkMonitor",
-    "org.freedesktop.portal.Notification",
-    "org.freedesktop.portal.PowerProfileMonitor",
-    "org.freedesktop.portal.Print",
-    "org.freedesktop.portal.ProxyResolver",
-    "org.freedesktop.portal.Secret",
-    "org.freedesktop.portal.Settings",
-    "org.freedesktop.portal.Trash",
-    "org.freedesktop.portal.OpenURI",
+/// The portal interfaces the gateway forwards and the methods of each it
+/// passes on, from xdg-desktop-portal's interface definitions. Any other
+/// method, including one a later portal version adds, is refused.
+const METHODS: [(&str, &[&str]); 19] = [
+    ("org.freedesktop.portal.Account", &["GetUserInformation"]),
+    ("org.freedesktop.portal.Email", &["ComposeEmail"]),
+    (
+        "org.freedesktop.portal.FileChooser",
+        &["OpenFile", "SaveFile", "SaveFiles"],
+    ),
+    (
+        "org.freedesktop.portal.GlobalShortcuts",
+        &["CreateSession", "BindShortcuts", "ListShortcuts", "ConfigureShortcuts"],
+    ),
+    (
+        "org.freedesktop.portal.Inhibit",
+        &["Inhibit", "CreateMonitor", "QueryEndResponse"],
+    ),
+    ("org.freedesktop.portal.MemoryMonitor", &[]),
+    (
+        "org.freedesktop.portal.NetworkMonitor",
+        &["GetAvailable", "GetMetered", "GetConnectivity", "GetStatus", "CanReach"],
+    ),
+    (
+        "org.freedesktop.portal.Notification",
+        &["AddNotification", "RemoveNotification"],
+    ),
+    ("org.freedesktop.portal.PowerProfileMonitor", &[]),
+    ("org.freedesktop.portal.Print", &["PreparePrint", "Print"]),
+    ("org.freedesktop.portal.ProxyResolver", &["Lookup"]),
+    ("org.freedesktop.portal.Secret", &["RetrieveSecret"]),
+    ("org.freedesktop.portal.Settings", &["ReadAll", "Read", "ReadOne"]),
+    ("org.freedesktop.portal.Trash", &["TrashFile"]),
+    (
+        "org.freedesktop.portal.OpenURI",
+        &["OpenURI", "OpenFile", "OpenDirectory", "SchemeSupported"],
+    ),
+    ("org.freedesktop.portal.Screenshot", &["Screenshot", "PickColor"]),
+    (
+        "org.freedesktop.portal.ScreenCast",
+        &["CreateSession", "SelectSources", "Start", "OpenPipeWireRemote"],
+    ),
+    ("org.freedesktop.portal.Camera", &["AccessCamera", "OpenPipeWireRemote"]),
+    (
+        "org.freedesktop.portal.Realtime",
+        &["MakeThreadRealtimeWithPID", "MakeThreadHighPriorityWithPID"],
+    ),
 ];
+
+/// The methods of `org.freedesktop.Notifications` that are forwarded.
+const NOTIFICATIONS_METHODS: [&str; 4] = ["Notify", "CloseNotification", "GetCapabilities", "GetServerInformation"];
 
 /// Whether `name` may be D-Bus activated inside the sandbox. Portals belong
 /// to the host (through the gateway); started inside, they would act on the
@@ -146,18 +179,18 @@ pub fn check(policy: &Policy, msg: &Message) -> Verdict {
     let member = msg.member.as_deref().unwrap_or_default();
     match dest {
         PORTAL_NAME if path == PORTAL_PATH => check_portal(policy, msg, iface, member),
-        PORTAL_NAME if path.starts_with(REQUEST_PREFIX) => match iface {
-            "org.freedesktop.portal.Request" => forward(),
-            _ => deny("only org.freedesktop.portal.Request on request objects"),
+        PORTAL_NAME if path.starts_with(REQUEST_PREFIX) => match (iface, member) {
+            ("org.freedesktop.portal.Request", "Close") => forward(),
+            _ => deny("only org.freedesktop.portal.Request.Close on request objects"),
         },
-        PORTAL_NAME if path.starts_with(SESSION_PREFIX) => match iface {
-            "org.freedesktop.portal.Session" => forward(),
-            "org.freedesktop.DBus.Properties" if member == "Get" || member == "GetAll" => forward(),
-            _ => deny("only org.freedesktop.portal.Session on session objects"),
+        PORTAL_NAME if path.starts_with(SESSION_PREFIX) => match (iface, member) {
+            ("org.freedesktop.portal.Session", "Close") => forward(),
+            ("org.freedesktop.DBus.Properties", "Get" | "GetAll") => forward(),
+            _ => deny("only org.freedesktop.portal.Session.Close on session objects"),
         },
         NOTIFICATIONS_NAME if path == NOTIFICATIONS_PATH => match iface {
             "org.freedesktop.Notifications" if member == "Notify" => strip_notify_paths(msg),
-            "org.freedesktop.Notifications" => forward(),
+            "org.freedesktop.Notifications" if NOTIFICATIONS_METHODS.contains(&member) => forward(),
             "org.freedesktop.DBus.Properties" if member == "Get" || member == "GetAll" => forward(),
             i if introspection(i) => forward(),
             _ => deny("interface not allowed"),
@@ -166,12 +199,19 @@ pub fn check(policy: &Policy, msg: &Message) -> Verdict {
     }
 }
 
-fn allowed_portal_iface(policy: &Policy, iface: &str) -> bool {
-    PLAIN.contains(&iface)
-        || iface == "org.freedesktop.portal.Screenshot"
-        || iface == "org.freedesktop.portal.ScreenCast"
-        || (policy.camera && iface == "org.freedesktop.portal.Camera")
-        || (policy.realtime && iface == "org.freedesktop.portal.Realtime")
+/// The forwarded methods of `iface` under `policy`, or `None` when the
+/// interface is not forwarded at all.
+fn portal_methods(policy: &Policy, iface: &str) -> Option<&'static [&'static str]> {
+    let gated = match iface {
+        "org.freedesktop.portal.Camera" => policy.camera,
+        "org.freedesktop.portal.Realtime" => policy.realtime,
+        _ => true,
+    };
+    METHODS
+        .iter()
+        .find(|(name, _)| *name == iface)
+        .filter(|_| gated)
+        .map(|(_, methods)| *methods)
 }
 
 fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Verdict {
@@ -184,12 +224,14 @@ fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Ve
             .ok()
             .and_then(|a| a.first().and_then(|v| v.as_str().map(str::to_string)));
         return match (member, target) {
-            ("Get" | "GetAll", Some(t)) if allowed_portal_iface(policy, &t) => forward(),
+            ("Get" | "GetAll", Some(t)) if portal_methods(policy, &t).is_some() => forward(),
             _ => deny("property access not allowed"),
         };
     }
-    if !allowed_portal_iface(policy, iface) {
-        return deny(format!("{iface} is not forwarded"));
+    match portal_methods(policy, iface) {
+        None => return deny(format!("{iface} is not forwarded")),
+        Some(methods) if !methods.contains(&member) => return deny(format!("{iface}.{member} is not forwarded")),
+        Some(_) => {}
     }
     let Ok(mut args) = msg.args() else {
         return deny("malformed arguments");
@@ -256,13 +298,16 @@ fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Ve
         // sandbox's.
         ("org.freedesktop.portal.Realtime", "MakeThreadRealtimeWithPID") if msg.signature == "ttu" => forward(),
         ("org.freedesktop.portal.Realtime", "MakeThreadHighPriorityWithPID") if msg.signature == "tti" => forward(),
-        ("org.freedesktop.portal.Realtime", _) => deny("only the WithPID calls of the Realtime portal"),
+        ("org.freedesktop.portal.Realtime", _) => deny("malformed arguments"),
         ("org.freedesktop.portal.FileChooser", "OpenFile" | "SaveFile" | "SaveFiles") => {
-            // Sandbox paths mean nothing to the host dialog.
+            // Sandbox paths mean nothing to the host dialog. SaveFiles'
+            // `files` are the names to save in the folder the user picks.
             if let Some(opts) = args.get_mut(2) {
                 opts.dict_remove("current_folder");
                 opts.dict_remove("current_file");
-                opts.dict_remove("files");
+                if opts.dict_get("files").is_some_and(|f| !plain_file_names(f)) {
+                    return deny("SaveFiles takes plain file names");
+                }
             }
             let file = if member == "OpenFile" {
                 FileRequest::Open
@@ -276,6 +321,29 @@ fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Ve
         }
         _ => forward(),
     }
+}
+
+/// Whether `files` (the `SaveFiles` option) is a list of plain file names:
+/// byte strings, NUL-terminated as GLib sends them, with no `/` and not `.`
+/// or `..`, so each stays inside the folder the user picks.
+fn plain_file_names(files: &Value) -> bool {
+    let Value::Array(sig, names) = files else { return false };
+    let plain = |name: &Value| {
+        let Value::Array(_, bytes) = name else { return false };
+        let Some(bytes) = bytes
+            .iter()
+            .map(|b| match b {
+                Value::Byte(b) => Some(*b),
+                _ => None,
+            })
+            .collect::<Option<Vec<u8>>>()
+        else {
+            return false;
+        };
+        let name = bytes.strip_suffix(b"\0").unwrap_or(&bytes);
+        !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+    };
+    sig == "ay" && names.iter().all(plain)
 }
 
 /// Image and sound hints name files by path, which only make sense inside
@@ -404,6 +472,58 @@ mod tests {
     }
 
     #[test]
+    fn only_listed_methods_forward() {
+        let fd = [Value::Str("".into()), Value::Fd(0), opts()];
+        assert_eq!(
+            portal("org.freedesktop.portal.OpenURI", "OpenDirectory", &fd),
+            forward()
+        );
+        assert!(matches!(
+            portal("org.freedesktop.portal.OpenURI", "OpenEverything", &fd),
+            Verdict::Deny(_)
+        ));
+        assert!(matches!(
+            portal("org.freedesktop.portal.Settings", "Write", &[]),
+            Verdict::Deny(_)
+        ));
+        let on = |path: String, iface: &str, member: &str| {
+            check(&Policy::default(), &call(PORTAL_NAME, &path, iface, member, &[]))
+        };
+        let request = format!("{REQUEST_PREFIX}1_5/t");
+        assert_eq!(
+            on(request.clone(), "org.freedesktop.portal.Request", "Close"),
+            forward()
+        );
+        assert!(matches!(
+            on(request, "org.freedesktop.portal.Request", "Respond"),
+            Verdict::Deny(_)
+        ));
+        let session = format!("{SESSION_PREFIX}1_5/s");
+        assert_eq!(
+            on(session.clone(), "org.freedesktop.portal.Session", "Close"),
+            forward()
+        );
+        assert!(matches!(
+            on(session, "org.freedesktop.portal.Session", "Rename"),
+            Verdict::Deny(_)
+        ));
+        let notifications = |member: &str| {
+            check(
+                &Policy::default(),
+                &call(
+                    NOTIFICATIONS_NAME,
+                    NOTIFICATIONS_PATH,
+                    "org.freedesktop.Notifications",
+                    member,
+                    &[],
+                ),
+            )
+        };
+        assert_eq!(notifications("GetCapabilities"), forward());
+        assert!(matches!(notifications("Inject"), Verdict::Deny(_)));
+    }
+
+    #[test]
     fn dangerous_interfaces_are_denied() {
         for iface in [
             "org.freedesktop.portal.Background",
@@ -432,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_needs_the_policy_and_translates_ids() {
+    fn realtime_needs_the_policy() {
         let with_realtime = Policy {
             realtime: true,
             ..Policy::default()
@@ -572,6 +692,36 @@ mod tests {
             args[2].dict_get("current_name").and_then(Value::as_str),
             Some("notes.txt")
         );
+    }
+
+    #[test]
+    fn save_files_keeps_only_plain_file_names() {
+        let names = |names: &[&[u8]]| {
+            let mut o = opts();
+            o.dict_set(
+                "files",
+                Value::Array(
+                    "ay".into(),
+                    names
+                        .iter()
+                        .map(|n| Value::Array("y".into(), n.iter().map(|b| Value::Byte(*b)).collect()))
+                        .collect(),
+                ),
+            );
+            portal(
+                "org.freedesktop.portal.FileChooser",
+                "SaveFiles",
+                &[Value::Str("".into()), Value::Str("Save".into()), o],
+            )
+        };
+        let Verdict::Forward { args: Some(args), file } = names(&[b"a.txt\0", b"b.txt"]) else {
+            panic!("expected forward")
+        };
+        assert_eq!(file, Some(FileRequest::Save));
+        assert!(args[2].dict_get("files").is_some());
+        for bad in [&b"../x\0"[..], b"a/b\0", b"..\0", b".\0", b"\0", b"a\0b\0"] {
+            assert!(matches!(names(&[b"ok\0", bad]), Verdict::Deny(_)), "{bad:?}");
+        }
     }
 
     #[test]

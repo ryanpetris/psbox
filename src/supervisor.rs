@@ -42,10 +42,14 @@ struct Prepared {
     kind: PointKind,
 }
 
+#[derive(Clone)]
 struct Published {
     names: Vec<String>,
     hidden: String,
     classes: Vec<String>,
+    /// All links are in place. A device whose publishing failed and could
+    /// not be undone stays recorded as incomplete until it is cleaned up.
+    complete: bool,
 }
 
 #[derive(Default)]
@@ -59,10 +63,13 @@ struct State {
     docs: u32,
     /// Whether any client has started a process yet.
     served: bool,
-    /// Config changes that need a restart; the sandbox stops when idle.
+    /// Why the sandbox needs a restart: config changes that cannot apply
+    /// live, and the entries of `unapplied`. The sandbox stops when idle.
     pending_restart: Vec<String>,
-    /// Mounts a reload failed to apply. The running mounts no longer match
-    /// any plan, so they stay a restart reason until the sandbox stops.
+    /// Changes the supervisor could not make: mounts a reload failed to
+    /// apply, and devices it could not remove. The running sandbox no
+    /// longer matches its plan, so each stays a restart reason until the
+    /// sandbox stops or, for a device, a later attempt removes it.
     unapplied: Vec<String>,
     /// Forwarded host sockets currently attached (sandbox paths).
     sockets: HashSet<PathBuf>,
@@ -87,6 +94,10 @@ struct Supervisor {
     mounting: Mutex<()>,
     /// Opens the gateway's host bus connections; started on first use.
     connector: Mutex<Option<Connector>>,
+    /// Held while one device is reconciled, so the device watcher and
+    /// config reloads never publish or remove the same device at once, and
+    /// a reload's reconcile sees what the watcher did with the old plan.
+    reconciling: Mutex<()>,
     started: std::time::SystemTime,
     /// The X display number, when the sandbox has Xwayland.
     display: Option<u32>,
@@ -214,6 +225,7 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         state: Mutex::new(State::default()),
         mounting: Mutex::new(()),
         connector: Mutex::new(None),
+        reconciling: Mutex::new(()),
         started: std::time::SystemTime::now(),
         display,
     });
@@ -1272,7 +1284,7 @@ impl Supervisor {
             let pending = self.state.lock().unwrap().pending_restart.clone();
             if !pending.is_empty() {
                 eprintln!(
-                    "psbox[{}]: idle with a config change that needs a restart ({}), stopping",
+                    "psbox[{}]: idle with changes that need a restart ({}), stopping",
                     self.key(),
                     pending.join(", ")
                 );
@@ -1344,11 +1356,24 @@ impl Supervisor {
     /// Publishes or unpublishes one device so `/dev` matches the host and
     /// the configured classes.
     fn reconcile(&self, host: &HostPaths, maj: u32, min: u32) {
+        let _reconciling = self.reconciling.lock().unwrap();
         let dev = devices::read_device(host, maj, min);
         let classes = dev
             .as_ref()
             .map(|d| devices::classify(d, &self.plan().node_classes))
             .unwrap_or_default();
+        // A failed publish is cleaned up before anything else.
+        let incomplete = self
+            .state
+            .lock()
+            .unwrap()
+            .devices
+            .get(&(maj, min))
+            .is_some_and(|p| !p.complete);
+        if incomplete && let Err(e) = self.unpublish(maj, min) {
+            eprintln!("psbox[{}]: device {maj}:{min}: {e:#}", self.key());
+            return;
+        }
         let published = self.state.lock().unwrap().devices.contains_key(&(maj, min));
         let r = match (dev, classes.is_empty(), published) {
             (Some(d), false, false) => self.publish(&d, &classes),
@@ -1382,39 +1407,72 @@ impl Supervisor {
         )
         .context("attach node")?;
 
+        // Recorded as soon as the node is attached, so a failure from here
+        // on can always be undone by `unpublish`.
         let mut names = vec![dev.devname.clone()];
         names.extend(dev.links.iter().cloned());
-        for name in &names {
-            publish_link(self.dev_rw.as_fd(), name, &devices::link_target(name, &hidden))
-                .with_context(|| format!("link /dev/{name}"))?;
-        }
         let class_names: Vec<String> = classes.iter().map(|c| c.to_string()).collect();
+        self.state.lock().unwrap().devices.insert(
+            (dev.major, dev.minor),
+            Published {
+                names: names.clone(),
+                hidden: hidden.clone(),
+                classes: class_names.clone(),
+                complete: false,
+            },
+        );
+        for name in &names {
+            if let Err(e) = publish_link(self.dev_rw.as_fd(), name, &devices::link_target(name, &hidden)) {
+                if let Err(undo) = self.unpublish(dev.major, dev.minor) {
+                    eprintln!("psbox[{}]: device {}:{}: {undo:#}", self.key(), dev.major, dev.minor);
+                }
+                return Err(e).with_context(|| format!("link /dev/{name}"));
+            }
+        }
+        if let Some(p) = self.state.lock().unwrap().devices.get_mut(&(dev.major, dev.minor)) {
+            p.complete = true;
+        }
         eprintln!(
             "psbox[{}]: published /dev/{} ({})",
             self.key(),
             dev.devname,
             class_names.join(", ")
         );
-        self.state.lock().unwrap().devices.insert(
-            (dev.major, dev.minor),
-            Published {
-                names,
-                hidden,
-                classes: class_names,
-            },
-        );
         Ok(())
     }
 
+    /// Removes a published (or partly published) device. Its record stays
+    /// until the node is detached: if that fails, the next event for the
+    /// device tries again, and the sandbox stops when idle, since the node
+    /// is still reachable.
     fn unpublish(&self, maj: u32, min: u32) -> Result<()> {
-        let Some(p) = self.state.lock().unwrap().devices.remove(&(maj, min)) else {
+        let Some(p) = self.state.lock().unwrap().devices.get_mut(&(maj, min)).map(|p| {
+            // From here on the links are going: if the node stays, the
+            // next reconcile cleans up before it decides anything.
+            p.complete = false;
+            p.clone()
+        }) else {
             return Ok(());
         };
         for name in &p.names {
             let _ = unlink_if_ours(self.dev_rw.as_fd(), name, &devices::link_target(name, &p.hidden));
         }
         let hidden_rel = Path::new(".psbox").join(&p.hidden);
-        inject::detach(self.init_pidfd.as_fd(), &Path::new("/dev").join(&hidden_rel)).context("detach node")?;
+        let reason = format!("removing /dev/{} ({maj}:{min})", p.names[0]);
+        if let Err(e) = inject::detach(self.init_pidfd.as_fd(), &Path::new("/dev").join(&hidden_rel)) {
+            let mut st = self.state.lock().unwrap();
+            if !st.unapplied.contains(&reason) {
+                st.unapplied.push(reason.clone());
+                st.pending_restart.push(reason);
+            }
+            return Err(e).context("detach node");
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            st.devices.remove(&(maj, min));
+            st.unapplied.retain(|r| *r != reason);
+            st.pending_restart.retain(|r| *r != reason);
+        }
         let c = path_cstr(&hidden_rel)?;
         // SAFETY: valid dirfd and path.
         unsafe { libc::unlinkat(self.dev_rw.as_raw_fd(), c.as_ptr(), 0) };

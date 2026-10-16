@@ -8,7 +8,7 @@ and talks to the desktop through portals. It does not see your real `~/`,
 other apps' data, or devices you have not granted it. Profiles, caches, and
 other app data stay in the sandbox.
 
-psbox is one static binary built directly on Linux namespaces, the new mount
+psbox is one binary built directly on Linux namespaces, the new mount
 API, Landlock, seccomp, and cgroups. Sandboxes run as systemd user services,
 start on demand, accept live mounts and hotplugged devices, and stop when
 idle.

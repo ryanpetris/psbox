@@ -116,6 +116,13 @@ appears on the host; under a read-only mount (such as `/usr` or `/etc`), the
 sandbox does not start, and the [startup check](cli.md#the-startup-check)
 names the host path to create. Paths containing `:` cannot be bound.
 
+A share or mount of `$XDG_RUNTIME_DIR` or anything that contains part of it
+hands the sandbox your account, like mounting the Docker socket into a
+container: `$XDG_RUNTIME_DIR/psbox` holds the supervisor sockets, through
+which a process can mount any host path into a sandbox or start commands in
+other sandboxes, and `$XDG_RUNTIME_DIR/bus` is the host session bus, which
+can start any program on the host.
+
 ## Environment
 
 Every process gets `HOME`, `USER`, `LOGNAME`, `XDG_RUNTIME_DIR`, a `PATH` of

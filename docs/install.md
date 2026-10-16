@@ -19,7 +19,9 @@
 
 Each release has an Arch package (`psbox-<version>-<rel>-x86_64.pkg.tar.zst`)
 and Debian packages for amd64 and arm64 (`psbox_<version>-<rel>_<arch>.deb`,
-built on Debian 13). They install the binary, the user units, and the bash
+built on Debian 13). They are native builds, linked against the
+distribution's C library; the [archives](#from-a-release-archive) hold the
+static binary. They install the binary, the user units, and the bash
 and zsh completions, and depend on `dbus` and `systemd`; `passt` and
 `xwayland-satellite` are optional:
 

@@ -8,7 +8,10 @@
 //! entries.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -16,6 +19,7 @@ use anyhow::{Context, Result};
 use crate::desktop::{self, Entry, GENERATOR_MARKER, SANDBOX_TAG, Target};
 use crate::plan::HostEnv;
 use crate::spec::{Spec, Tokens};
+use crate::sys::path_cstr;
 
 /// Where entries are read from and written to.
 #[derive(Debug, Clone)]
@@ -225,6 +229,52 @@ pub fn desktop_id(command: &str, app_id: Option<&str>, id: Option<&str>) -> Stri
     id.or(app_id).unwrap_or(command).to_string()
 }
 
+/// Replaces the file at `path` with `body`. The content goes to a new,
+/// uniquely named file beside it, which is then renamed over it, both
+/// relative to the directory opened once. `O_EXCL` refuses an existing file
+/// or symlink by that name, so nothing placed in the directory (which a
+/// sandbox sharing it could write) can redirect the write elsewhere.
+fn replace(path: &Path, body: &str) -> io::Result<()> {
+    let dir = fs::File::open(path.parent().expect("entry paths have a parent"))?;
+    let file_name = path.file_name().expect("entry paths have a file name");
+    let name = path_cstr(Path::new(file_name))?;
+    let mut attempt = 0;
+    let (tmp, mut file) = loop {
+        let mut tmp = OsString::from(".");
+        tmp.push(file_name);
+        tmp.push(format!(".{}-{attempt}.psbox-tmp", std::process::id()));
+        let tmp = path_cstr(Path::new(&tmp))?;
+        // SAFETY: a valid directory descriptor and C string.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                tmp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat returned a new descriptor we now own.
+            break (tmp, unsafe { fs::File::from_raw_fd(fd) });
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::AlreadyExists || attempt >= 100 {
+            return Err(e);
+        }
+        attempt += 1;
+    };
+    let written = file.write_all(body.as_bytes()).and_then(|()| {
+        // SAFETY: a valid directory descriptor and C strings.
+        let r = unsafe { libc::renameat(dir.as_raw_fd(), tmp.as_ptr(), dir.as_raw_fd(), name.as_ptr()) };
+        if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    });
+    if written.is_err() {
+        // SAFETY: a valid directory descriptor and C string.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+    }
+    written
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
     /// Entries written where there was no file.
@@ -262,9 +312,7 @@ pub fn apply(generation: &Generation, failed_sandboxes: &[String], dirs: &Dirs, 
                 if !dry_run {
                     let dir = g.path.parent().expect("entry paths have a parent");
                     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-                    let tmp = g.path.with_extension("desktop.psbox-tmp");
-                    fs::write(&tmp, &g.body).with_context(|| format!("write {}", tmp.display()))?;
-                    fs::rename(&tmp, &g.path).with_context(|| format!("replace {}", g.path.display()))?;
+                    replace(&g.path, &g.body).with_context(|| format!("write {}", g.path.display()))?;
                 }
                 match existing {
                     Some(_) => report.updated.push(g.path.clone()),
@@ -308,6 +356,22 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn replace_does_not_follow_a_planted_link() {
+        let d = tempdir("replace");
+        let victim = d.join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let entry = d.join("app.desktop");
+        let planted = d.join(format!(".app.desktop.{}-0.psbox-tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        replace(&entry, "[Desktop Entry]\n").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&entry).unwrap(), "[Desktop Entry]\n");
+        assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
+        let _ = fs::remove_dir_all(&d);
     }
 
     fn setup(tag: &str) -> (PathBuf, Dirs, HostEnv) {

@@ -133,8 +133,8 @@ make check
 make fmt
 ```
 
-`make check` runs `cargo fmt --check`, clippy with `-D warnings` for both
-release targets, the tests, and `cargo deny check`; it must pass before a
+`make check` runs `cargo fmt --check`, clippy with `-D warnings` for the
+native build and both release targets, the tests, and `cargo deny check`; it must pass before a
 code change is complete. During development, run focused tests first:
 
 ```sh
@@ -146,7 +146,8 @@ use direct documentation and diff validation instead of the full suite.
 
 Release binaries are static musl builds for `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl` (`make release`, `make dist`), linked with
-Rust's `rust-lld`. Do not add a C dependency or a build step that needs a C
+Rust's `rust-lld`; the Arch and Debian packages are native builds against
+their distribution's C library. Do not add a C dependency or a build step that needs a C
 toolchain unless the user explicitly approves changing that property.
 Archives, workflows, and packaging are in [docs/release.md](docs/release.md).
 

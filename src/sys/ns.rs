@@ -16,6 +16,60 @@ pub fn unshare(flags: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether this process may create a user namespace and, in it, a mount
+/// namespace, as every supervisor does at start. A forked child tries and
+/// reports the result in its exit status, so the caller is unchanged.
+pub fn probe_user_namespace() -> io::Result<()> {
+    // SAFETY: the child only issues raw syscalls before `_exit`, so it is
+    // safe even if this process has other threads.
+    let pid = cvt_int(unsafe { libc::fork() })?;
+    if pid == 0 {
+        // SAFETY: raw syscalls in the forked child, which never returns. It
+        // needs no descriptors, and holding the parent's would keep files
+        // it has open alive after the parent lets them go.
+        unsafe {
+            libc::syscall(libc::SYS_close_range, 0, u32::MAX, 0);
+            let code = if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == 0 {
+                0
+            } else {
+                *libc::__errno_location()
+            };
+            libc::_exit(code);
+        }
+    }
+    let mut status = 0;
+    // SAFETY: waits for the child forked above, into a local.
+    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    match (libc::WIFEXITED(status), libc::WEXITSTATUS(status)) {
+        (true, 0) => Ok(()),
+        (true, errno) => Err(io::Error::from_raw_os_error(errno)),
+        _ => Err(io::Error::other("the probe was killed")),
+    }
+}
+
+/// The running kernel's `major.minor` version, from `uname`.
+pub fn kernel_version() -> io::Result<(u32, u32)> {
+    // SAFETY: utsname is plain old data filled by uname.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: uname writes into the local buffer.
+    cvt_int(unsafe { libc::uname(&mut uts) })?;
+    // SAFETY: uname NUL-terminates every field.
+    let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }.to_string_lossy();
+    parse_kernel_version(&release).ok_or_else(|| io::Error::other(format!("unrecognized kernel release {release:?}")))
+}
+
+fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// Maps only the caller's own uid and gid into its new user namespace.
 pub fn write_self_maps(uid: u32, gid: u32) -> io::Result<()> {
     fs::write("/proc/self/setgroups", "deny")?;
@@ -102,4 +156,24 @@ pub fn drop_all_caps() -> io::Result<()> {
     // SAFETY: capset with a v3 header and two zeroed data words.
     cvt(unsafe { libc::syscall(libc::SYS_capset, &header as *const Header, data.as_ptr()) })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_versions_parse() {
+        assert_eq!(parse_kernel_version("7.2.8-arch1-2"), Some((7, 2)));
+        assert_eq!(parse_kernel_version("7.10.0"), Some((7, 10)));
+        assert_eq!(parse_kernel_version("6.18-rc1"), Some((6, 18)));
+        assert_eq!(parse_kernel_version("garbage"), None);
+    }
+
+    #[test]
+    fn probe_leaves_the_caller_alone() {
+        let before = fs::read_link("/proc/self/ns/user").unwrap();
+        let _ = probe_user_namespace();
+        assert_eq!(fs::read_link("/proc/self/ns/user").unwrap(), before);
+    }
 }

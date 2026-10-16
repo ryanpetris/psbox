@@ -56,7 +56,8 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Response {
-    /// `restart_pending` lists config changes waiting for a restart;
+    /// `restart_pending` lists what waits for a restart (config changes that
+    /// cannot apply live, and mounts or devices that could not be changed);
     /// `network_fallback` is set when the sandbox uses the host network
     /// only because pasta is not installed.
     Spawned {

@@ -50,8 +50,10 @@ make package-arch     # dist/psbox-<version>-<rel>-<arch>.pkg.tar.zst (needs mak
 make package-deb      # dist/psbox_<version>-<rel>_<arch>.deb (needs dpkg-buildpackage)
 ```
 
-Each package is for the architecture it is built on, and its debug package
-stays in `target/package/`. `package-deb` writes `debian/changelog` with the
+Each package is a native build for the architecture and distribution it is
+built on, linked against that distribution's C library rather than the
+static musl binary of the archives, and its debug package stays in
+`target/package/`. `package-deb` writes `debian/changelog` with the
 version, `DEB_DISTRIBUTION` (default `unstable`), and the commit's date.
 Debian's Rust is older than psbox needs (`rust-version` in `Cargo.toml`),
 so the Debian package build-depends on `rustup`, and `debian/rules` installs
@@ -81,8 +83,9 @@ make install DESTDIR="$pkgdir" PREFIX=/usr
 - `.github/workflows/ci.yml` runs `make check` and `make release` on pull
   requests and pushes to `master` or `main`.
 - `.github/workflows/release.yml` runs on a `v*` tag: it checks that the tag
-  is `v` plus `MAJOR.MINOR.PATCH` and sets `PSBOX_VERSION` from it, then
-  builds the archives and the source archive (`make dist`, `make source`),
+  is `v` plus `MAJOR.MINOR.PATCH` and sets `PSBOX_VERSION` from it, runs
+  `make check` on the tagged commit, and only when that passes builds the
+  archives and the source archive (`make dist`, `make source`),
   the Arch package for x86_64 in an `archlinux` container, and the Debian
   packages for amd64 and arm64 in `debian:13` containers. It publishes all
   of them with `checksums.txt` as a GitHub release with generated notes.

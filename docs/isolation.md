@@ -83,18 +83,19 @@ names the config lists in `dbus-talk` (see below):
 
 | Portal interfaces | Treatment |
 | --- | --- |
-| Account, Email, FileChooser, GlobalShortcuts, Inhibit, MemoryMonitor, NetworkMonitor, Notification, OpenURI, PowerProfileMonitor, Print, ProxyResolver, Secret, Settings, Trash | Forwarded |
+| Account, Email, FileChooser, GlobalShortcuts, Inhibit, MemoryMonitor, NetworkMonitor, Notification, OpenURI, PowerProfileMonitor, Print, ProxyResolver, Secret, Settings, Trash | Forwarded: the methods xdg-desktop-portal 1.22 defines for each, such as `OpenURI.OpenDirectory`, which shows a folder in the host file manager without asking; a method psbox does not list, including one a later portal adds, is refused |
 | `OpenURI.OpenURI` | Only `http`, `https`, and `mailto` |
 | `OpenURI.OpenFile` | Forced `ask`: the host always asks which app opens the file |
 | Screenshot | Forced `interactive`; the image is made visible like a file-chooser result |
 | ScreenCast | `persist_mode` and `restore_token` removed |
-| FileChooser | Sandbox paths in options removed; the chosen files are made visible (existing writable shares are reused, otherwise the file is mounted at `$XDG_RUNTIME_DIR/doc/<n>/<name>`; save dialogs create the file first) |
+| FileChooser | Sandbox paths in options removed, and `SaveFiles` refused unless the names to save are plain file names; the chosen files are made visible (existing writable shares are reused, otherwise the file is mounted at `$XDG_RUNTIME_DIR/doc/<n>/<name>`; save dialogs create the file first) |
 | Camera | Only with the `camera` device class |
 | Realtime | Only with the `audio` device class, and only `MakeThreadRealtimeWithPID` and `MakeThreadHighPriorityWithPID` for threads of the sandbox's own processes (the host portal looks the ids up in the sandbox's PID namespace, so no other process can be named) |
 | Anything else (Background, DynamicLauncher, RemoteDesktop, Location, Wallpaper, Usb, Documents, ...) | Refused with `AccessDenied` and logged |
 
-`org.freedesktop.Notifications` is forwarded with the `image-path` and
-`sound-file` hints removed. Names listed in
+`org.freedesktop.Notifications` is forwarded (`Notify`, `CloseNotification`,
+`GetCapabilities`, and `GetServerInformation`) with the `image-path` and
+`sound-file` hints removed. Request and session objects take only `Close`. Names listed in
 [`dbus-talk`](configuration.md#host-bus-names) are reachable too, with
 calls and replies passed unfiltered: listing one gives the sandbox that
 service's full access, as yours. Every other host bus name is unreachable,
@@ -133,5 +134,8 @@ X11 apps get a private Xwayland per sandbox (`xwayland = true`).
 - **System files:** `/usr`, `/etc`, and `/sys` are readable, as for any
   process of your user.
 - **Shares:** anything listed in `rw`, `ro`, or a mount is readable (and
-  writable if so configured) with your own permissions.
+  writable if so configured) with your own permissions. Supervisors accept
+  any client of your user, so a share that exposes `$XDG_RUNTIME_DIR/psbox`
+  (or the session bus) gives the sandbox control of every sandbox and of
+  your account (see [Mounts](configuration.md#mounts)).
 - **`dbus = "host"` and `network = "host"`:** as described above.

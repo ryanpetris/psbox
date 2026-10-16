@@ -188,11 +188,11 @@ pub fn run(id: &Identity, command: Option<String>, args: Vec<String>, exec: bool
                     }
                     if !restart_pending.is_empty() {
                         ui::warning(format!(
-                            "{who} is still on its old config {}",
-                            ui::paint(ui::DIM, format!("· {} changed", restart_pending.join(", ")))
+                            "{who} has changes waiting for a restart {}",
+                            ui::paint(ui::DIM, format!("· {}", restart_pending.join(", ")))
                         ));
                         ui::fix(format!(
-                            "it restarts by itself when idle; {} restarts it now",
+                            "it restarts by itself when idle if they are still pending; {} restarts it now",
                             ui::code(format!("psbox stop {}", id.cli_args()))
                         ));
                     }

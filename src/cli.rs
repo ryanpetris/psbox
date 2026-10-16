@@ -811,6 +811,10 @@ pub fn check_sandbox(name: &str) -> Result<i32> {
     Ok(code)
 }
 
+/// The oldest kernel psbox supports: it uses the newest interfaces without
+/// fallbacks.
+const REQUIRED_KERNEL: (u32, u32) = (7, 2);
+
 pub fn check() -> Result<i32> {
     let mut items: Vec<(Level, &str, String)> = Vec::new();
     let need = sys::landlock::REQUIRED_ABI;
@@ -820,24 +824,29 @@ pub fn check() -> Result<i32> {
         Err(e) => (Level::Fail, "Landlock", format!("unavailable: {e}")),
     });
 
+    let (major, minor) = REQUIRED_KERNEL;
+    items.push(match sys::ns::kernel_version() {
+        Ok(v) if v >= REQUIRED_KERNEL => (Level::Ok, "kernel", format!("{}.{} (needs {major}.{minor})", v.0, v.1)),
+        Ok(v) => (Level::Fail, "kernel", format!("{}.{}, needs {major}.{minor}", v.0, v.1)),
+        Err(e) => (Level::Fail, "kernel", format!("{e}")),
+    });
+
+    // A real attempt, explained by the usual settings when it fails.
     let read = |p: &str| std::fs::read_to_string(p).map(|s| s.trim().to_string()).ok();
-    items.push(
-        if read("/proc/sys/user/max_user_namespaces").is_some_and(|v| v == "0") {
-            (
-                Level::Fail,
-                "user namespaces",
-                "disabled (user.max_user_namespaces = 0)".into(),
-            )
-        } else if read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_some_and(|v| v == "1") {
-            (
-                Level::Fail,
-                "user namespaces",
-                "restricted by AppArmor (kernel.apparmor_restrict_unprivileged_userns = 1)".into(),
-            )
-        } else {
-            (Level::Ok, "user namespaces", "available".into())
-        },
-    );
+    items.push(match sys::ns::probe_user_namespace() {
+        Ok(()) => (Level::Ok, "user namespaces", "available".into()),
+        Err(_) if read("/proc/sys/user/max_user_namespaces").is_some_and(|v| v == "0") => (
+            Level::Fail,
+            "user namespaces",
+            "disabled (user.max_user_namespaces = 0)".into(),
+        ),
+        Err(_) if read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_some_and(|v| v == "1") => (
+            Level::Fail,
+            "user namespaces",
+            "restricted by AppArmor (kernel.apparmor_restrict_unprivileged_userns = 1)".into(),
+        ),
+        Err(e) => (Level::Fail, "user namespaces", format!("cannot create one: {e}")),
+    });
 
     items.push(if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         (Level::Ok, "cgroup v2", "unified hierarchy".into())

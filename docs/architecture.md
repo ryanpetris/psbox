@@ -109,7 +109,12 @@ finished with the device. Matching devices are attached at
 symlink into place (with their udev symlinks, such as `by-path` links), so
 an app watching `/dev` never sees a half-ready node. The cloned node is
 checked against the expected `st_rdev` before it is attached. Removed
-devices are unpublished the same way.
+devices are unpublished the same way. Devices are handled one at a time, so
+the watcher and a config reload never act on the same device at once. A
+device whose links cannot all be created is removed again; if its node
+cannot be detached, the device stays recorded and the next event for it
+tries again; until one succeeds, the sandbox restarts when idle, since the
+node is still reachable.
 
 ## D-Bus
 
