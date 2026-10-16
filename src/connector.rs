@@ -20,9 +20,14 @@
 //! when it holds every capability the other has, so sandbox processes,
 //! which hold none, cannot. The host portal can, as the owner of the
 //! supervisor's user namespace, and it reads the connector's `/proc` entry
-//! when the supervisor registers a client. A core dump limit of one byte
-//! means a signal from the sandbox cannot make it dump the supervisor's
-//! memory on the host.
+//! when the supervisor registers a client. It is forked with the signals
+//! that dump core blocked, ignores them before unblocking them, and sets
+//! its core dump limit to at most one byte, so a signal from the sandbox
+//! cannot make it dump the supervisor's memory on the host. Both limits
+//! become the lower of the inherited hard limit and one byte: the hard limit
+//! only ever goes down, and the soft limit may rise only to it, both of which
+//! are always allowed, so this works under any inherited limit, including a
+//! hard limit of 0 (see `core_limit`).
 //!
 //! The connector is forked from the multithreaded supervisor and never
 //! execs, so it uses only raw syscalls on data prepared before the fork.
@@ -38,6 +43,56 @@ use crate::sys::process::clone3;
 
 /// How long a request may take before the connector is replaced.
 const REPLY_TIMEOUT_MS: i32 = 5000;
+
+/// Signals whose default action dumps core.
+const DUMPING: [libc::c_int; 10] = [
+    libc::SIGQUIT,
+    libc::SIGILL,
+    libc::SIGTRAP,
+    libc::SIGABRT,
+    libc::SIGBUS,
+    libc::SIGFPE,
+    libc::SIGSEGV,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+    libc::SIGSYS,
+];
+
+/// The kernel's `sigset_t` holding `DUMPING`, for raw syscalls.
+const DUMPING_MASK: u64 = {
+    let mut mask = 0;
+    let mut i = 0;
+    while i < DUMPING.len() {
+        mask |= 1 << (DUMPING[i] - 1);
+        i += 1;
+    }
+    mask
+};
+
+/// Blocks `DUMPING` on the calling thread and returns the previous mask.
+fn block_dumping() -> io::Result<libc::sigset_t> {
+    // SAFETY: sigset_t is plain old data, filled by sigemptyset and
+    // pthread_sigmask; all pointers are to locals.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in DUMPING {
+            libc::sigaddset(&mut set, sig);
+        }
+        match libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) {
+            0 => Ok(old),
+            e => Err(io::Error::from_raw_os_error(e)),
+        }
+    }
+}
+
+/// Restores a mask returned by `block_dumping`.
+fn restore_mask(old: &libc::sigset_t) {
+    // SAFETY: a valid mask from pthread_sigmask; failure is impossible for
+    // SIG_SETMASK with a valid set.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, old, std::ptr::null_mut()) };
+}
 
 pub struct Connector {
     ctl: Seqpacket,
@@ -60,9 +115,12 @@ impl Connector {
         let (ctl, child_ctl) = Seqpacket::pair()?;
         let cgroup = OwnedFd::from(std::fs::File::open(cgroup)?);
         let cloned = forker.run(move || {
+            // Blocked from before the fork, so no signal can reach the child
+            // before it ignores them.
+            let old = block_dumping()?;
             // SAFETY: the child runs only `serve`, which issues raw syscalls
             // on data prepared before the fork.
-            match unsafe { clone3(0, cgroup.as_raw_fd()) } {
+            let cloned = match unsafe { clone3(0, cgroup.as_raw_fd()) } {
                 Ok(None) => serve(
                     child_ctl.as_raw_fd(),
                     bus.as_raw_fd(),
@@ -71,7 +129,9 @@ impl Connector {
                     len,
                 ),
                 other => other,
-            }
+            };
+            restore_mask(&old);
+            cloned
         })??;
         let cloned = cloned.expect("clone3 returns the child only in the child");
         Ok(Self {
@@ -127,6 +187,18 @@ fn open_socket(path: &Path) -> io::Result<OwnedFd> {
     Ok(file.into())
 }
 
+/// The core dump limit the connector sets, given the one it inherited: both
+/// soft and hard become the lower of the inherited hard limit and one byte.
+/// One byte also stops pipe handlers; a hard limit of 0 cannot be raised, so
+/// it stays 0.
+fn core_limit(inherited: libc::rlimit64) -> libc::rlimit64 {
+    let limit = inherited.rlim_max.min(1);
+    libc::rlimit64 {
+        rlim_cur: limit,
+        rlim_max: limit,
+    }
+}
+
 /// The connector's main loop, in the forked child: joins the namespaces in
 /// `join` (a pidfd and `setns` flags), then answers each request byte on
 /// `ctl` with a new socket connected to `addr`, until the supervisor closes
@@ -138,31 +210,82 @@ fn serve(
     addr: &libc::sockaddr_un,
     len: libc::socklen_t,
 ) -> ! {
-    let no_core = libc::rlimit64 {
-        rlim_cur: 1,
-        rlim_max: 1,
+    /// The kernel's `struct sigaction`, the same on x86_64 and aarch64
+    /// (both have `sa_restorer`).
+    #[repr(C)]
+    struct KernelSigaction {
+        handler: libc::sighandler_t,
+        flags: libc::c_ulong,
+        restorer: usize,
+        mask: u64,
+    }
+    let ignore = KernelSigaction {
+        handler: libc::SIG_IGN,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    let mut core = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
     let (low, high) = (ctl.min(bus) as u32, ctl.max(bus) as u32);
 
     // SAFETY: raw syscalls on stack data and on descriptors this process
     // owns; nothing here allocates or takes a lock.
     unsafe {
-        // The forker thread lives as long as the supervisor. A core limit
-        // of 1 stops pipe handlers too, and the hard limit cannot be raised
-        // again without CAP_SYS_RESOURCE on the host.
+        // The dumping signals arrive blocked (see `Connector::start`); they
+        // are ignored first, which also discards any already pending, and
+        // unblocked last. Raw rt_sigaction, since libc's can take a lock
+        // that another supervisor thread held at the fork. A fault, which
+        // the sandbox cannot cause, still delivers its signal and meets the
+        // core limit: at most one byte, and exactly one (whenever the
+        // inherited hard limit allows it) also stops pipe handlers. A hard
+        // limit, once lowered, cannot be raised again without
+        // CAP_SYS_RESOURCE on the host.
+        for sig in DUMPING {
+            if libc::syscall(
+                libc::SYS_rt_sigaction,
+                sig,
+                &ignore as *const KernelSigaction,
+                std::ptr::null_mut::<KernelSigaction>(),
+                std::mem::size_of::<u64>(),
+            ) < 0
+            {
+                libc::_exit(1);
+            }
+        }
+        let get_core = libc::syscall(
+            libc::SYS_prlimit64,
+            0,
+            libc::RLIMIT_CORE,
+            std::ptr::null::<libc::rlimit64>(),
+            &mut core as *mut libc::rlimit64,
+        );
+        core = core_limit(core);
+
+        // The forker thread lives as long as the supervisor.
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) < 0
             || libc::prctl(libc::PR_SET_NAME, c"psbox-connector".as_ptr(), 0, 0, 0) < 0
+            || get_core < 0
             || libc::syscall(
                 libc::SYS_prlimit64,
                 0,
                 libc::RLIMIT_CORE,
-                &no_core as *const libc::rlimit64,
+                &core as *const libc::rlimit64,
                 std::ptr::null_mut::<libc::rlimit64>(),
             ) < 0
             || join.is_some_and(|(pidfd, flags)| libc::syscall(libc::SYS_setns, pidfd, flags) < 0)
             || (low > 0 && libc::syscall(libc::SYS_close_range, 0, low - 1, 0) < 0)
             || (high > low + 1 && libc::syscall(libc::SYS_close_range, low + 1, high - 1, 0) < 0)
             || libc::syscall(libc::SYS_close_range, high + 1, u32::MAX, 0) < 0
+            || libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_UNBLOCK,
+                &DUMPING_MASK as *const u64,
+                std::ptr::null_mut::<u64>(),
+                std::mem::size_of::<u64>(),
+            ) < 0
         {
             libc::_exit(1);
         }
@@ -260,6 +383,23 @@ mod tests {
     use crate::sys::fd::stream_listen;
 
     #[test]
+    fn core_limit_is_one_byte_unless_the_hard_limit_is_zero() {
+        let limit = |cur, max| {
+            let l = core_limit(libc::rlimit64 {
+                rlim_cur: cur,
+                rlim_max: max,
+            });
+            (l.rlim_cur, l.rlim_max)
+        };
+        let inf = libc::RLIM64_INFINITY;
+        assert_eq!(limit(inf, inf), (1, 1));
+        assert_eq!(limit(0, inf), (1, 1));
+        assert_eq!(limit(0, 5), (1, 1));
+        assert_eq!(limit(1, 1), (1, 1));
+        assert_eq!(limit(0, 0), (0, 0));
+    }
+
+    #[test]
     fn connects_to_the_bus_socket_through_its_descriptor() {
         let dir = std::env::temp_dir().join(format!("psbox-connector-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -271,12 +411,34 @@ mod tests {
         let bus = open_socket(&path).unwrap();
         let (addr, len) = sockaddr(Path::new(&format!("/proc/self/fd/{}", bus.as_raw_fd()))).unwrap();
         let (ctl, child_ctl) = Seqpacket::pair().unwrap();
+        let old = block_dumping().unwrap();
         // SAFETY: the child runs only `serve`, which issues raw syscalls.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
+            // A hard core limit of 0, as build containers often set, which
+            // the connector must not try to raise.
+            let zero = libc::rlimit64 {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: raw syscalls in the forked child, on a local. Exiting
+            // makes the test fail rather than pass without the limit.
+            unsafe {
+                if libc::syscall(
+                    libc::SYS_prlimit64,
+                    0,
+                    libc::RLIMIT_CORE,
+                    &zero,
+                    std::ptr::null_mut::<libc::rlimit64>(),
+                ) < 0
+                {
+                    libc::_exit(2);
+                }
+            }
             serve(child_ctl.as_raw_fd(), bus.as_raw_fd(), None, &addr, len);
         }
+        restore_mask(&old);
         drop(child_ctl);
         // SAFETY: pidfd_open on our own unreaped child.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -287,6 +449,28 @@ mod tests {
             // SAFETY: pidfd_open returned a new descriptor.
             pidfd: unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) },
         };
+
+        // Once it answers, the dumping signals are ignored and unblocked.
+        drop(connector.connect().unwrap().unwrap());
+        // SAFETY: null address output is allowed; the accepted fd is closed.
+        unsafe {
+            libc::close(libc::accept4(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            ))
+        };
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let mask = |field: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(field))
+                .map(|v| u64::from_str_radix(v.trim(), 16).unwrap())
+                .unwrap()
+        };
+        assert_eq!(mask("SigIgn:") & DUMPING_MASK, DUMPING_MASK);
+        assert_eq!(mask("SigBlk:") & DUMPING_MASK, 0);
 
         // The socket's path is gone; its descriptor still reaches it.
         std::fs::remove_file(&path).unwrap();

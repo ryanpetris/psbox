@@ -113,7 +113,8 @@ Verified on Linux 7.2 with GNOME, beyond the unit tests:
 | Realtime with `audio`: `MakeThreadRealtimeWithPID` and `MakeThreadHighPriorityWithPID` on sandbox processes; an id not in the sandbox refused by the host portal | Works (`SCHED_RR` and nice -10 on the host) |
 | The connector from inside the sandbox: ptrace, `pidfd_getfd`, and its `fd`, `maps`, `root`, and `environ` entries | Refused |
 | The connector's `mountinfo` and `net/tcp` from inside the sandbox | The sandbox's own |
-| The connector killed with `SIGQUIT`, or stopped with `SIGSTOP`, from inside the sandbox | No core dump; reaped, and replaced on the next call (after five seconds when stopped) |
+| Signals that dump core (`SIGQUIT`, `SIGSEGV`) sent to the connector from inside the sandbox | Ignored; core limit at most one byte |
+| The connector killed with `SIGKILL`, or stopped with `SIGSTOP`, from inside the sandbox | Reaped, and replaced on the next call (after five seconds when stopped) |
 | Portal methods from inside a sandbox: `Settings.ReadOne`, `OpenURI.SchemeSupported`, `NetworkMonitor.GetConnectivity`, a property read; an unlisted `Settings.Write` | Forwarded; the unlisted method refused and logged |
 | `psbox check` on Linux 7.2 | Kernel and user namespaces reported from the real kernel and a real namespace |
 

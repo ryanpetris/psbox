@@ -148,8 +148,10 @@ opened before the fork, so its `/proc` entries show only the sandbox's view.
 It keeps the supervisor's capabilities, so sandbox processes, which have
 none, cannot ptrace it or open its descriptors; the host portal, which runs
 as the owner of the supervisor's user namespace, can read its `/proc` entry.
-Its core dump limit is one byte, so signals from the sandbox cannot make it
-dump the supervisor's memory on the host. If it exits, does not answer
+It starts with the signals that dump core blocked, ignores them before
+unblocking them, and sets its core dump limit to the lower of its inherited
+hard limit and one byte, so signals from the sandbox cannot make it dump the
+supervisor's memory on the host. If it exits, does not answer
 within five seconds, or finds its socket refusing connections (the host bus
 made a new one), a new one is started for that client.
 
