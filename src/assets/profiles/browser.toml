@@ -1,0 +1,5 @@
+# Built-in profile for web browsers: camera for video calls, security keys
+# for passkeys, and a shared Downloads directory. A user profile named
+# "browser" replaces this one.
+devices = ["gpu", "audio", "camera", "security-key"]
+rw = ["~/Downloads/"]

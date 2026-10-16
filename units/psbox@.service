@@ -1,0 +1,9 @@
+[Unit]
+Description=psbox sandbox %i
+Requires=psbox@%i.socket
+After=psbox@%i.socket
+
+[Service]
+ExecStart=/usr/bin/psbox supervise %i
+Delegate=yes
+KillMode=mixed

@@ -1,282 +1,292 @@
 # Configuration
 
-psbox reads a directory of YAML documents. Default path:
-`$XDG_CONFIG_HOME/psbox/objects`. Every `*.yaml` file under that
-directory is loaded, including nested files, in sorted path order.
+## Locations
 
-Documents are `version: v1`. Unknown kinds and decode errors are
-skipped with a warning on stderr. A YAML syntax error stops reading
-the rest of that file after one warning. A missing objects directory
-loads as an empty collection.
-
-Names (applications, instances, desktop entries) match
-`^[A-Za-z0-9._][A-Za-z0-9._-]*$`. They must not start with `-` and must
-not contain `/` or `:`. The complete names `.` and `..` are rejected.
-
-## Kinds
-
-| `kind` | Role |
+| What | Path |
 | --- | --- |
-| `Application` | Named program and sandbox options |
-| `FreedesktopEntry` | Desktop file installed to `~/.local/share/applications` |
-| `FreedesktopAutostartEntry` | Desktop file installed to `~/.config/autostart` |
-| `Options` | Collection-wide `sandbox_root` |
+| Sandbox configs | `$XDG_CONFIG_HOME/psbox/sandboxes/<name>.toml` |
+| Profiles | `$XDG_CONFIG_HOME/psbox/profiles/<name>.toml` |
+| Sandbox root | `$PSBOX_ROOT`, default `~/Sandbox` |
+| Private home | `<root>/<name>` |
+| Other sandbox directories | `<root>/<name>.<type>`, such as `~/Sandbox/retroarch.bin` |
+| Supervisor sockets | `$XDG_RUNTIME_DIR/psbox/<key>.sock` |
 
-One file may contain several documents, separated by `---`.
+One TOML file per sandbox; the file name is the sandbox name. Sandbox names
+use letters, digits, `_`, and `-` only; a name never contains `.`, so every
+`<name>.<type>` directory unambiguously belongs to `<name>`. The name
+`sandbox` is reserved for unnamed sandboxes. Unknown keys are
+errors. `run`, `task`, `mount`, `umount`, `status`, and `stop` only accept
+configured sandboxes; `psbox sandbox` runs unnamed ones (see
+[cli.md](cli.md)). [examples/](../examples/) has configs for several
+applications.
 
-When a file contains exactly one `Application` and `metadata.name` is
-omitted, the name is the file stem. Desktop entries in that file
-inherit the application name when their own `metadata.name` or
-`spec.application` is omitted. An invalid file stem skips the unnamed
-application and entries that inherit its invalid name or application reference;
-independently named objects remain eligible to load.
-
-`metadata.type` is a closed application type. Unset keys take that
-type's defaults; explicit `spec.options` always win. Unknown types are
-skipped with a warning.
-
-| Type | Fills when unset |
-| --- | --- |
-| `browser` | `dbus: private`, `host-urls: false`, `downloads: true` |
-
-Duplicate application or desktop names: the last definition wins, with
-a warning.
-
-## Application
-
-```yaml
-version: v1
-kind: Application
-metadata:
-  name: firefox
-  type: browser
-spec:
-  exec: firefox
-  default-args:
-    - --new-tab
-  env:
-    MOZ_ENABLE_WAYLAND: "1"
-```
-
-### `spec.exec`
-
-Command tokens. A string is a single token. A list is several. If
-omitted, `exec` is the application name (looked up on `PATH` inside
-the sandbox).
-
-### `spec.default-args`
-
-Appended when the launch has no extra arguments. Extra CLI arguments
-replace them.
-
-### `spec.env`
-
-Merged onto the launching process environment at spawn time. Keys must
-be legal environment names (letter or `_`, then letters, digits, `_`).
-Values must not contain NUL.
-
-### `spec.bwrap-args`
-
-Extra `bwrap` tokens after the composed flags and before the command.
-Each item is a string or a list of strings. A two-token bind
-(`--bind`, `--ro-bind`, `--dev-bind`, and the `-try` forms) with no
-destination gets the source copied as the destination.
-
-`:root:` expands to the sandbox root. `:home:` and a leading `~`
-expand to the host home (not the private home).
-
-### `spec.options`
+## Keys
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `home` | `$PSBOX_ROOT/<sandbox>` | Private home path, `:tmpfs:`, or `:none:` |
-| `dev` | `private` | `true`/`host`, `private`, or `private-shm`; see device access below |
-| `audio` | `true` | Pulse/PipeWire and `/dev/snd` |
-| `video` | `true` | `/dev/video*` and `/dev/v4l` |
-| `dbus` | host | `true`/`host`, `private`, or `false`/`off` |
-| `display` | `true` | Wayland, X11, DRI |
-| `fontconfig` | `true` | `/var/cache/fontconfig` |
-| `isolation` | `instance` | `oneshot`, `instance`, or `instance:<name>` |
-| `host-urls` | `true` | Forward in-sandbox `http`/`https` to the host |
-| `cache` | `tmpfs` | `tmpfs` mounts `$HOME/.cache`; `home` keeps it in the private home |
-| `downloads` | `false` | Bind the host `Downloads` directory into `$HOME/Downloads` |
-| `sandbox` | unset | Name of the application that owns the sandbox |
+| `home` | `private` | `private` (`<root>/<name>`), `tmpfs`, `none`, or a host path |
+| `cache` | `tmpfs` | `tmpfs` hides `~/.cache`; `home` keeps it |
+| `devices` | `["gpu", "audio"]` | [Device classes](#devices) |
+| `env` | | Extra environment for every process |
+| `rw` / `ro` | | Host paths shared read-write or read-only at the same path |
+| `[mount.<name>]` | | `host`, `at`, `mode`, `optional` (see [Mounts](#mounts)) |
+| `[command.<name>]` | the sandbox name | `exec`, `env`, `app-id`, `desktop` |
+| `[autostart.<id>]` | | `command` or `hidden = true`, plus `from`, `entry`, `set`, `remove-args` |
+| `[task.<name>]` | | A oneshot task (see [Tasks](#instances-and-tasks)) |
+| `extends` | | [Profiles](#profiles) merged under this config |
+| `dbus` | `portal` | `portal`: a private session bus with the host gateway; `host`: the host session and system buses, unfiltered; `off`: no session bus |
+| `display` | `true` | Wayland (and Xwayland when `xwayland` is on) |
+| `xwayland` | `false` | A private Xwayland for X11 apps, started on the first X client |
+| `network` | `isolated` | `isolated`, `host`, or `none` (see [Network](#network)) |
+| `app-id` | | App id registered with the host portal (a desktop file id) |
+| `idle-timeout` | `60` | Seconds without workload before the sandbox stops |
 
-Boolean integration options (`audio`, `video`, `display`, `fontconfig`,
-and `host-urls`) that are omitted or `true` do not change the config hash.
-Setting `false` does. `cache: tmpfs` (the default) is omitted from the
-hash; `cache: home` is included.
+A command's `app-id` overrides the sandbox's for processes that command
+starts, including their children. A sandbox without commands has one named
+after the sandbox that runs the program of that name. `psbox run` without
+`--command` uses the command named like the sandbox, or the only one.
 
-`dev` and `dbus` accept YAML booleans or strings. Unquoted `True`/`TRUE`
-and `False`/`FALSE` normalize to `true` and `false`; each option then
-validates its supported values. Strings are case-sensitive and are not
-interpreted as booleans. YAML 1.1 words such as `yes`, `on`, and `y` are
-not supported values, whether quoted or unquoted.
+```toml
+home = "private"
+rw = ["~/Projects/"]
 
-### Device access
+[mount.ssh]
+host = "~/.ssh/"
+mode = "ro"
+optional = true
 
-`dev` accepts a single scalar value:
+[command.code]
+exec = ["code"]
+desktop = { id = "code-oss" }
 
-- `private` (default): a private `/dev`, including private shared memory and
-  pseudo-terminals, with the selected audio, video, input/hidraw, and graphics
-  devices bound in. Root-level devices such as `/dev/hidraw*` and `/dev/video*`
-  are enumerated at sandbox creation.
-- `true` or `host`: bind the entire host `/dev`, including `/dev/shm` and
-  `/dev/pts`. Newly created host device nodes appear in the running sandbox.
-- `private-shm`: bind host `/dev`, then cover `/dev/shm` with a private tmpfs
-  with mode `1777`. Host `/dev/pts` remains shared, and device hotplug remains
-  visible.
-
-For example:
-
-```yaml
-spec:
-  options:
-    dev: private-shm
+[command.code-url-handler]
+exec = ["code", "--open-url"]
+desktop = { id = "code-oss-url-handler" }
 ```
 
-Host device modes cannot be combined with `audio: false`, `video: false`, or
-`display: false`, because those settings include device exclusions.
-`false` is not a valid device mode.
+## Paths and tokens
 
-Host device modes expose every device that host permissions allow the user
-to access. They also expose other host terminal paths belonging to that user.
-`--new-session` detaches the sandbox from its inherited controlling terminal;
-it does not hide host terminal paths or prevent permitted reads, writes, or
-terminal-setting changes. Enabling `dev.tty.legacy_tiocsti` alone does not
-permit `TIOCSTI` input injection into arbitrary host terminals: Linux also
-requires the target to be the caller's controlling terminal or the caller
-to have `CAP_SYS_ADMIN` in the initial user namespace.
+Host paths and mount destinations may start with a token:
 
-`dev: true` and `dev: host` normalize to the same mode and config hash.
-Omitted `dev` and explicit `dev: private` hash identically. `host` and
-`private-shm` have distinct hashes.
+| Token | Expands to |
+| --- | --- |
+| `~`, `~/...` | The host home (the same path inside the sandbox) |
+| `@root`, `@root/...` | The sandbox root, such as `@root/steam` |
+| `@self`, `@self/...` | `<root>/<name>` |
+| `@self.<type>`, `@self.<type>/...` | `<root>/<name>.<type>`, such as `@self.bin` |
 
-### D-Bus access
+Other paths must be absolute and must not contain `..`.
 
-`dbus: private` binds neither the host session bus nor the system bus
-(`/run/dbus`). Instance isolation starts `dbus-daemon --session --nofork`
-inside the sandbox. Oneshot isolation wraps the workload with
-`dbus-launch`.
+A host path in `rw`, `ro`, or a mount's `host` that ends with `/` is a
+directory. When it is missing and its mount is not `optional`, psbox creates
+it: always inside the sandbox root (the supervisor does, as it starts or
+when a live config change adds the share), and elsewhere only when `run`,
+`task`, or `sandbox` is given `--create-dirs`. A `/` path that exists but is
+not a directory is an error. Paths without the `/` are never created.
 
-`dbus: false` also binds neither host bus, and starts no in-sandbox
-session bus.
+A host path may be a symlink: the sandbox gets what it points to. A symlink
+to a path that does not exist is reported by the startup check, and nothing
+is created through it. Inside places a sandbox can write to (its entry in
+the sandbox root, such as `~/Sandbox/firefox`, and its read-write shares),
+psbox does not follow symlinks in a host path, since an app could have
+planted one to point a mount elsewhere; the startup check reports such a
+link. The entry or share itself may be a symlink, for example to keep a
+sandbox's files on another disk.
 
-`cache: tmpfs` is the default whenever the sandbox has a real home
-bind. It is skipped when `home` is `:tmpfs:` or `:none:`. `cache:
-home` leaves `~/.cache` on the private home.
+## Mounts
 
-`downloads: true` binds the host `~/Downloads` directory. It is
-skipped when `home` is `:none:`. `downloads: true` is hashed;
-omitted/`false` is not.
+`rw` and `ro` share host paths at the same path. `[mount.<name>]` tables
+mount a host path elsewhere, or mask a path:
 
-`host-urls: false` is for browsers and other apps that should own
-`http`/`https` themselves. It drops the `xdg-open` `PATH` shim, does
-not claim those schemes in the sandbox `mimeapps.list`, and removes a
-leftover `psbox-open-url` handler from an earlier spawn. See
-[urls.md](urls.md). Oneshot isolation never forwards.
+| `mode` | What the sandbox gets at `at` |
+| --- | --- |
+| `ro` | The host path, read-only |
+| `rw` | The host path, read-write |
+| `overlay` | The host path with writes going to a private layer that is discarded with the sandbox |
+| `empty` | An empty tmpfs, hiding whatever is there (no `host`) |
 
-## Referrers
+`at` defaults to `host`. With `optional = true`, a missing host path skips
+the mount instead of stopping the sandbox.
 
-```yaml
-version: v1
-kind: Application
-metadata:
-  name: firefox-work
-spec:
-  exec: firefox
-  default-args: ["--profile", "work"]
-  options:
-    sandbox: firefox
+Mounts are applied parents first, after everything psbox mounts itself. A
+destination that does not exist is created inside whatever is mounted above
+it: under a read-write share of a directory you can write, the directory
+appears on the host; under a read-only mount (such as `/usr` or `/etc`), the
+sandbox does not start, and the [startup check](cli.md#the-startup-check)
+names the host path to create. Paths containing `:` cannot be bound.
+
+## Environment
+
+Every process gets `HOME`, `USER`, `LOGNAME`, `XDG_RUNTIME_DIR`, a `PATH` of
+`/usr/local/bin:/usr/bin`, the sandbox's `env`, its command's `env`, and
+only these variables from the client that launched it: `TERM`, `COLORTERM`,
+`LANG`, `LANGUAGE`, `LC_*`, `TZ`, `NO_COLOR`, `XDG_CURRENT_DESKTOP`,
+`XDG_SESSION_DESKTOP`, `DESKTOP_SESSION`, `XDG_ACTIVATION_TOKEN`,
+`DESKTOP_STARTUP_ID`.
+
+With a display, `WAYLAND_DISPLAY` and `XDG_SESSION_TYPE=wayland` are set,
+and `DISPLAY` when the sandbox has Xwayland. With `dbus = "portal"`, processes also get
+`DBUS_SESSION_BUS_ADDRESS` for the sandbox bus and `GIO_USE_PORTALS=1`,
+`GTK_USE_PORTAL=1`, `GDK_DEBUG=portals`, and
+`GNOTIFICATION_BACKEND=portal`, so GLib, GTK 3, GTK 4, and GNotification use
+portals.
+
+## Devices
+
+`devices` lists device classes. Omitted, it is `["gpu", "audio"]`; a listed
+value replaces that default.
+
+| Class | Matches |
+| --- | --- |
+| `gpu` | `drm` render nodes (`dri/renderD*`) |
+| `camera` | `video4linux` devices with `:capture:` in `ID_V4L_CAPABILITIES` |
+| `gamepad` | `input` nodes with `ID_INPUT_JOYSTICK=1`, excluding keyboards and devices tagged `power-switch`; and `hidraw` nodes whose HID device has such an input node |
+| `security-key` | `hidraw` nodes with `ID_SECURITY_TOKEN=1` (set by systemd's `60-fido-id.rules` from the HID report descriptor): the FIDO interface of a key, for passkeys and U2F, without its other interfaces such as an OTP keyboard |
+| `alsa` | `sound` nodes under `snd/`, for apps that bypass PipeWire |
+| `usb:<vid>:<pid>` | Every node whose `ID_VENDOR_ID` and `ID_MODEL_ID` match (four hex digits each) |
+| `audio` | Not a `/dev` class: the host `pipewire-0` and `pulse/native` sockets |
+
+Devices follow hotplug: a matching device that appears while the sandbox
+runs is published into its `/dev`, and removed when it goes away. `psbox
+devices` lists the devices the classes match; `psbox devices --all` lists
+every device with the IDs `usb:` needs.
+
+The `gamepad` exclusions exist because udev marks some keyboard interfaces
+as joysticks (such as a keyboard's "System Control" interface) and grants
+them `uaccess`. `audio` passes
+the host sockets through unfiltered: playback, capture, PipeWire camera
+nodes, and loading `pipewire-pulse` modules (see
+[isolation.md](isolation.md)).
+
+## Network
+
+| `network` | What the sandbox gets |
+| --- | --- |
+| `isolated` | Its own network namespace with outbound connections through `pasta`: no port forwarding in either direction, no route to the host's loopback, DNS relayed to the host's resolver |
+| `host` | The host network namespace (host abstract sockets stay unreachable) |
+| `none` | Its own network namespace with only loopback |
+
+A sandbox that does not set `network` gets `isolated` when `pasta` is on
+`PATH`, and otherwise the host network, with a warning from `run`,
+`sandbox`, and `task` (and in the sandbox's log): install pasta, or set
+`network = "host"`. A sandbox that sets `network = "isolated"` does not
+start without pasta. `list` and `status` show the mode in use, `host (no
+pasta)` for the fallback.
+
+Use `host` for apps that need the local network or incoming connections:
+LAN discovery (casting, Steam Remote Play), hosting, and logins
+that redirect to an app listening on `localhost`. Changing `network` needs a
+restart, and so does installing pasta for a sandbox on the fallback.
+
+## Display and Xwayland
+
+With `display = true` (the default) and a Wayland session, the host's
+Wayland socket is forwarded. X11 apps need `xwayland = true`: the sandbox
+then gets a private Xwayland on its own display number, started when the
+first X client connects (see [architecture.md](architecture.md#xwayland)).
+Apps that support Wayland do not need it; with no `DISPLAY`, GTK, Qt,
+Electron, and SDL choose Wayland themselves.
+
+## Profiles
+
+`extends = ["name", ...]` merges profiles from
+`$XDG_CONFIG_HOME/psbox/profiles/<name>.toml` (the same format; profiles may
+extend others) under the config, in order. Tables merge key by key; `rw`,
+`ro`, and `devices` accumulate; other values from the config replace the
+profile's.
+
+The built-in `browser` profile adds the `camera` and `security-key` classes
+and a shared `~/Downloads/`. A user profile named `browser` replaces it.
+
+## Instances and tasks
+
+`psbox run <sandbox> -i <name>` starts or joins a named instance: its own
+namespaces and processes, sharing the sandbox's home.
+
+`[task.<name>]` defines a oneshot task, run with `psbox task <sandbox>
+<task>` in its own supervisor; the command waits for it and returns its exit
+code. A task sees the sandbox's mounts, with the mounts named in `writable`
+read-write. It has no display, no session bus, and no devices unless it sets
+`dbus` or `devices`. `script` runs with `bash -c`.
+
+| Task key | Meaning |
+| --- | --- |
+| `exec` or `script` | The command line, or a `bash -c` script (exactly one) |
+| `home`, `cache` | Override the sandbox's |
+| `writable` | Names of `[mount.<name>]` entries mounted read-write |
+| `devices` | Device classes; none unless listed |
+| `dbus` | Session bus; `off` unless set |
+| `network` | Overrides the sandbox's (inherited otherwise, including whether it was set at all) |
+| `env` | Extra environment |
+
+```toml
+[mount.bin]
+host = "@self.bin/"
+at = "~/.bin"
+mode = "overlay"
+
+[task.update]
+home = "tmpfs"
+writable = ["bin"]
+script = '''
+set -euo pipefail
+cd ~/.bin
+...
+'''
 ```
 
-Launch identity is the **target** (`firefox`), so
-`psbox launch firefox-work` joins `firefox/default`. The referrer may set
-`exec`, `default-args`, and `env` only. Setting home, audio, video,
-dbus, display, fontconfig, isolation, `host-urls`, `cache`,
-`downloads`, `dev`, `metadata.type`, or `bwrap-args` on a referrer is a
-collection error: the referrer is omitted from lists and rejected at
-launch, install, and render.
+## Desktop and autostart entries
 
-`sandbox:` is one hop. A target that itself sets `sandbox:` is an
-error. A missing target is an error.
+`psbox install` writes `$XDG_DATA_HOME/applications/<id>.desktop` for every
+command with a `desktop` table, and `$XDG_CONFIG_HOME/autostart/<id>.desktop`
+for every `autostart` table, in every sandbox config:
 
-## Desktop entries
+```toml
+[command.code]
+exec = ["code"]
+desktop = { id = "code-oss", remove-args = ["--new-window"], set = { StartupWMClass = "code-oss" } }
 
-```yaml
-version: v1
-kind: FreedesktopEntry
-metadata:
-  name: firefox
-spec:
-  application: firefox
-  # value: |
-  #   [Desktop Entry]
-  #   ...
-  overrides:
-    - field: Name
-      pattern: ".*"
-      replacement: "Firefox (Sandbox)"
-  inject:
-    - section: "Desktop Entry"
-      value: "StartupWMClass=firefox"
+[autostart.steam-autostart]
+hidden = true              # hides the host's autostart entry with this id
 ```
 
-If `spec.value` is omitted, `psbox objects install` reads
-`$XDG_DATA_DIRS/applications/<name>.desktop` (autostart:
-`$XDG_CONFIG_DIRS/autostart/<name>.desktop`).
+| Key | Meaning |
+| --- | --- |
+| `id` | Desktop file id; defaults to the command's `app-id`, else the command name. Also the command's default `app-id` |
+| `from` | Host entry to copy (from `$XDG_DATA_DIRS/applications`, or `$XDG_CONFIG_DIRS/autostart` first for autostart); defaults to `id` |
+| `entry` | The whole entry inline, instead of copying |
+| `set` | Keys to set in `[Desktop Entry]` |
+| `remove-args` | Arguments dropped from every `Exec` line (field codes stay) |
 
-Rewrite rules:
+Every `Exec` (including desktop actions) becomes `psbox run <sandbox>
+--command <command> -- <args>`: the program is dropped and its arguments
+kept. An `Exec` that names a path or starts with `env` runs exactly as
+written, with `--exec`. `TryExec` is removed, `DBusActivatable=false` is set
+(activation would start the app on the host), and `Icon` values starting
+with `~` or `@` are expanded.
 
-- `Exec=` becomes `psbox launch <application> -- …` when the binary is a
-  bare name with no environment prefix. Paths and commands prefixed by `env`
-  use `psbox launch <application> --command -- …`, preserving assignments,
-  quoting, and desktop field codes
-- `TryExec=` is removed
-- `DBusActivatable=` in `[Desktop Entry]` is set to `false`
-- `Icon=` expands `:root:`, `:home:`, and `~`
+Files start with `# @generator psbox` and a `# @sandbox <name>` line naming
+the config they came from. `install` replaces such files and removes those
+no longer configured (including psbox files without an `@sandbox` line), and
+never touches other files. A sandbox whose config fails to load keeps its
+files, and so does an entry that cannot be built.
 
-Installed files start with `# @generator psbox`. `psbox objects install`
-updates those files and deletes generator-owned orphans that are no
-longer configured. It does not delete desktop files it did not write.
+GNOME matches X11 windows by their X class, which must appear as
+`StartupWMClass` in the entry for the window to group under it.
 
-## Collection options
+## Live changes
 
-```yaml
-version: v1
-kind: Options
-spec:
-  sandbox_root: ~/Sandbox
-```
+A running sandbox (not a task) watches its config file and the profiles
+directory. Binds and tmpfs mounts (`rw`, `ro`, and `ro`, `rw`, or `empty`
+mounts, and the audio sockets) are attached and detached live, and device
+classes are re-published; environment, commands, app ids, and the idle
+timeout apply to the next process. Mounts beneath a changed mount, including
+live mounts made by `psbox mount` or the file chooser, are detached and
+attached again with it. New mounts are prepared before
+anything is detached, so a missing source leaves the sandbox unchanged; a
+mount that still fails to apply marks the sandbox for a restart.
 
-`sandbox_root` sets `$PSBOX_ROOT` for the collection. A leading `~` is
-expanded using the host home. Later `Options` documents replace earlier
-ones.
-
-## Paths and environment
-
-| Variable | Default | Use |
-| --- | --- | --- |
-| `PSBOX_OBJECT_PATH` | `$XDG_CONFIG_HOME/psbox/objects` | Objects directory |
-| `PSBOX_ROOT` | `$HOME/Sandbox` | Default private-home parent |
-| `PSBOX_AGENT_BIN` | `/usr/bin/psboxa` | In-sandbox agent binary |
-| `PSBOX_LOG` | unset | CLI log presentation. Unset prints only the message. `structured` prints slog text. |
-| `XDG_CONFIG_HOME` | `~/.config` | Objects default, desktop install |
-| `XDG_DATA_HOME` | `~/.local/share` | Desktop install |
-| `XDG_RUNTIME_DIR` | `/run/user/<uid>` | Instance sockets, sandbox tmpfs |
-| `PATH` | `/usr/local/bin:/usr/bin` | Used when the spawn environment has no `PATH` |
-| `WAYLAND_DISPLAY` | `wayland-0` | Display socket bind |
-| `XAUTHORITY` | unset | X11 cookie bind |
-| `PIPEWIRE_CORE` | `pipewire-0` | PipeWire socket name |
-
-`--objects` on `psbox launch` and `psbox objects` overrides the objects
-path for that process. Combined with instance isolation it is a hard
-error when the path is not the process default: the running daemon
-already loaded its own objects.
-
-## Tokens
-
-In `home`, `bwrap-args`, and desktop `Icon`/`Exec` rewrite:
-
-- `:root:` is `PSBOX_ROOT`
-- `:home:` and `~/` are the **host** home
+Changes to `home`, `cache`, `dbus`, `xwayland`, `network`, or overlay
+mounts need a restart: nothing is applied live, the sandbox stops as soon
+as it is idle, and until then `psbox run` warns and `psbox status` shows the
+pending restart. A change that fails the startup check is not applied.

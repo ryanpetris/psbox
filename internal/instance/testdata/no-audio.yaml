@@ -1,5 +1,0 @@
-version: v1
-kind: Application
-spec:
-  options:
-    audio: false

@@ -1,119 +1,86 @@
-# Petris Sandbox build, test, and analysis targets.
-export CGO_ENABLED := 0
+# psbox build, check, and release targets. Run from the repository root.
 
-GO       ?= go
-GOFMT    ?= gofmt
-BINDIR   ?= bin
+CARGO ?= cargo
+PREFIX ?= /usr
+DESTDIR ?=
+USER_UNIT_DIR ?= $(or $(XDG_CONFIG_HOME),$(HOME)/.config)/systemd/user
+FUZZ_TIME ?= 60
 
-GO_TOOL_BINDIR ?= $(shell d="$$($(GO) env GOBIN)"; if [ -n "$$d" ]; then printf '%s' "$$d"; else printf '%s/bin' "$$($(GO) env GOPATH)"; fi)
-STATICCHECK ?= $(GO_TOOL_BINDIR)/staticcheck
-DEADCODE ?= $(GO_TOOL_BINDIR)/deadcode
-GORELEASER ?= $(GO_TOOL_BINDIR)/goreleaser
-COMPLETIONS_DIR ?= completions
+TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+FUZZ_TARGETS := config protocol dbus_message desktop_entry
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 
-PSBOX_VERSION ?= $(shell v="$$(git describe --tags --dirty --always --match 'v*' 2>/dev/null || printf dev)"; printf '%s' "$$v")
-GO_LDFLAGS ?= -X petris.dev/psbox/internal/version.Current=$(PSBOX_VERSION)
-
-CMDS := ./cmd/psbox ./cmd/psboxd ./cmd/psboxa
-
-.PHONY: all build
-.PHONY: test vet fmt coverage
-.PHONY: go/install go/test go/vet go/fmt go/coverage
-.PHONY: check check/all check/fmt check/staticcheck check/deadcode
-.PHONY: dev/tools dev/tools/staticcheck dev/tools/deadcode dev/tools/goreleaser
-.PHONY: release/completions release/check release/snapshot
-.PHONY: clean clean/bin clean/coverage clean/completions
+.PHONY: all build test fmt check check/fmt check/clippy check/deny fuzz \
+	release dist install dev/install clean
 
 all: build
 
 build:
-	$(GO) build ./...
-	mkdir -p $(BINDIR)
-	$(GO) build -trimpath -ldflags "$(GO_LDFLAGS)" -o $(BINDIR)/psbox ./cmd/psbox
-	$(GO) build -trimpath -ldflags "$(GO_LDFLAGS)" -o $(BINDIR)/psboxd ./cmd/psboxd
-	$(GO) build -trimpath -ldflags "$(GO_LDFLAGS)" -o $(BINDIR)/psboxa ./cmd/psboxa
+	$(CARGO) build
 
-go/install:
-	$(GO) install -trimpath -ldflags "$(GO_LDFLAGS)" $(CMDS)
+test:
+	$(CARGO) test
 
-test: go/test
+fmt:
+	$(CARGO) fmt
 
-vet: go/vet
-
-fmt: go/fmt
-
-coverage: go/coverage
-
-go/test:
-	$(GO) test ./...
-
-go/vet:
-	$(GO) vet ./...
-
-go/fmt:
-	find . -name '*.go' -type f -print0 | xargs -0 -r $(GOFMT) -w
-
-go/coverage:
-	mkdir -p dist
-	$(GO) test -covermode=atomic -coverprofile=dist/coverage.out ./...
-	$(GO) tool cover -func=dist/coverage.out > dist/coverage.txt
-	$(GO) tool cover -html=dist/coverage.out -o dist/coverage.html
-
-check: go/vet go/test
-
-check/all: check/fmt build go/vet go/test check/staticcheck check/deadcode
+# Everything a change must pass.
+check: check/fmt check/clippy test check/deny
 
 check/fmt:
-	files="$$(find . -name '*.go' -type f -print0 | xargs -0 -r $(GOFMT) -l)"; \
-	if [ -n "$$files" ]; then \
-		printf '%s\n' "$$files"; \
-		exit 1; \
-	fi
+	$(CARGO) fmt --check
 
-check/staticcheck: dev/tools/staticcheck
-	$(STATICCHECK) ./...
+# Clippy for both release targets, so architecture-specific code is checked.
+check/clippy:
+	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
 
-check/deadcode: dev/tools/deadcode
-	$(DEADCODE) ./...
+check/deny:
+	$(CARGO) deny check
 
-dev/tools: dev/tools/staticcheck dev/tools/deadcode dev/tools/goreleaser
+# Runs each fuzz target for FUZZ_TIME seconds (needs nightly and cargo-fuzz).
+fuzz:
+	cd fuzz && for t in $(FUZZ_TARGETS); do \
+		$(CARGO) +nightly fuzz run $$t -- -max_total_time=$(FUZZ_TIME) || exit 1; \
+	done
 
-dev/tools/staticcheck:
-	@if [ ! -x "$(STATICCHECK)" ]; then \
-		GOBIN="$(GO_TOOL_BINDIR)" $(GO) install honnef.co/go/tools/cmd/staticcheck@latest; \
-	fi
+# Static release binaries for amd64 and arm64.
+release:
+	for t in $(TARGETS); do $(CARGO) build --release --target $$t || exit 1; done
 
-dev/tools/deadcode:
-	@if [ ! -x "$(DEADCODE)" ]; then \
-		GOBIN="$(GO_TOOL_BINDIR)" $(GO) install golang.org/x/tools/cmd/deadcode@latest; \
-	fi
+# Release archives: the binary, the units, the license, and the README.
+dist: release
+	rm -rf dist && mkdir -p dist
+	for pair in x86_64-unknown-linux-musl:amd64 aarch64-unknown-linux-musl:arm64; do \
+		target=$${pair%%:*}; arch=$${pair##*:}; \
+		name=psbox_$(VERSION)_linux_$$arch; \
+		mkdir -p dist/$$name/units; \
+		cp target/$$target/release/psbox LICENSE README.md dist/$$name/; \
+		cp units/psbox@.service units/psbox@.socket dist/$$name/units/; \
+		tar -C dist -czf dist/$$name.tar.gz $$name || exit 1; \
+		rm -rf dist/$$name; \
+	done
+	cd dist && sha256sum *.tar.gz > checksums.txt
 
-dev/tools/goreleaser:
-	@if [ ! -x "$(GORELEASER)" ]; then \
-		GOBIN="$(GO_TOOL_BINDIR)" $(GO) install github.com/goreleaser/goreleaser/v2@latest; \
-	fi
+# Installs the release binary (from `cargo build --release`) and the user
+# units, for example `sudo make install` or `make install DESTDIR=pkg`.
+install:
+	@test -x target/release/psbox || { echo "run cargo build --release first" >&2; exit 1; }
+	install -Dm 0755 target/release/psbox $(DESTDIR)$(PREFIX)/bin/psbox
+	install -Dm 0644 units/psbox@.socket $(DESTDIR)$(PREFIX)/lib/systemd/user/psbox@.socket
+	sed 's|/usr/bin/psbox|$(PREFIX)/bin/psbox|' units/psbox@.service > psbox@.service.tmp
+	install -Dm 0644 psbox@.service.tmp $(DESTDIR)$(PREFIX)/lib/systemd/user/psbox@.service
+	rm -f psbox@.service.tmp
 
-release/completions:
-	mkdir -p $(COMPLETIONS_DIR)
-	$(GO) run ./cmd/psbox completion bash >$(COMPLETIONS_DIR)/psbox.bash
-	$(GO) run ./cmd/psbox completion zsh >$(COMPLETIONS_DIR)/_psbox
+# Installs the units for the debug build into the user unit directory, where
+# they override packaged units.
+dev/install:
+	$(CARGO) build
+	mkdir -p $(USER_UNIT_DIR)
+	install -m 0644 units/psbox@.socket $(USER_UNIT_DIR)/psbox@.socket
+	sed 's|/usr/bin/psbox|$(CURDIR)/target/debug/psbox|' units/psbox@.service > $(USER_UNIT_DIR)/psbox@.service
+	systemctl --user daemon-reload
 
-release/check: dev/tools/goreleaser
-	$(GORELEASER) check
-
-release/snapshot: dev/tools/goreleaser release/completions
-	$(GORELEASER) release --snapshot --clean --skip=publish
-
-clean: clean/bin clean/coverage clean/completions
-
-clean/bin:
-	rm -f $(BINDIR)/psbox $(BINDIR)/psboxd $(BINDIR)/psboxa
-	-rmdir $(BINDIR)
-
-clean/coverage:
-	rm -f dist/coverage.out dist/coverage.txt dist/coverage.html
-	-rmdir dist
-
-clean/completions:
-	rm -f $(COMPLETIONS_DIR)/psbox.bash $(COMPLETIONS_DIR)/_psbox
-	-rmdir $(COMPLETIONS_DIR)
+clean:
+	$(CARGO) clean
+	rm -rf dist fuzz/target

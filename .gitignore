@@ -6,15 +6,12 @@
 *~
 .DS_Store
 
-# Go build and test artifacts
-/bin/
+# Cargo build output
+/target/
 /dist/
-/vendor/
-/completions/
-*.test
-*.out
-coverage.out
-*.coverprofile
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
 
 # AI coding tool state and config directories
 .claude/

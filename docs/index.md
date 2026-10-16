@@ -1,6 +1,6 @@
 # Documentation
 
-User and operator documentation for Petris Sandbox (`psbox`). Definitions
+User and developer documentation for Petris Sandbox (`psbox`). Definitions
 in the [glossary](glossary.md) are canonical: if code and the glossary
 disagree, change the code.
 
@@ -9,15 +9,14 @@ setup. Then:
 
 | Page | Concern |
 | --- | --- |
-| [Install](install.md) | Binaries, systemd user units, first objects |
-| [Configuration](configuration.md) | Object YAML, paths, environment |
-| [CLI](cli.md) | `psbox launch`, `instance`, `objects`, `sandbox` |
-| [Isolation](isolation.md) | `instance` and `oneshot` |
-| [Architecture](architecture.md) | `psbox`, `psboxd`, `psboxa`, compose |
-| [Instances](instances.md) | Daemon, sockets, hashes, idle teardown |
-| [Host URLs](urls.md) | `xdg-open`, GIO, `http`/`https` allowlist |
-| [Release](release.md) | Tags, GoReleaser, archive layout |
-| [Dependencies](dependencies.md) | Go module licenses |
+| [Install](install.md) | Requirements, release archives, building from source, units, completions |
+| [Configuration](configuration.md) | Sandbox configs, paths and tokens, mounts, devices, network, profiles, tasks, desktop entries |
+| [CLI](cli.md) | Commands, output, the startup check, unnamed sandboxes |
+| [Isolation](isolation.md) | What a sandbox can and cannot reach |
+| [Architecture](architecture.md) | Supervisors, units, the sandbox root, live changes, devices, D-Bus, Xwayland, network |
+| [Development](development.md) | Checks, fuzzing, headless GUI tests, verification status |
+| [Release](release.md) | Static builds, archives, workflows, packaging |
+| [Dependencies](dependencies.md) | Crates and their licenses |
 | [Glossary](glossary.md) | Canonical terms |
 
-Linux only. Release binaries are `amd64` and `arm64` with `CGO_ENABLED=0`.
+Linux only. Release binaries are static `amd64` and `arm64` builds.

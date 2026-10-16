@@ -1,156 +1,165 @@
 # CLI
 
-The `psbox` binary is the host CLI. Incidental status and warnings go
-to stderr. stdout is for `--print` / `--print-bwrap`, foreground
-application output, and scripting commands (`objects list`,
-`objects render`). Log lines are the message only. Set
-`PSBOX_LOG=structured` for slog text.
-
-## `psbox launch`
-
-Launch is a required subcommand. `psbox firefox` is not a launch.
-
 ```sh
-psbox launch firefox
+psbox run <sandbox> [-i INSTANCE] [--command NAME] [--exec] [--create-dirs] [-- ARGS...]
+psbox task <sandbox> <task> [--create-dirs] [-- ARGS...]
+psbox sandbox (--home DIR | --home-tmpfs | --no-home) [OPTIONS] [--create-dirs] -- COMMAND...
+psbox list [--json]                     # sandboxes, what runs, their network, commands, and tasks
+psbox status <sandbox> [-i INSTANCE] [--json]   # processes, mounts, devices
+psbox mount <sandbox> [-i INSTANCE] <host-path> [--at PATH] [--ro]
+psbox umount <sandbox> [-i INSTANCE] <at>
+psbox stop <sandbox> [-i INSTANCE] | --all
+psbox install [--dry-run] [-v]          # desktop and autostart entries
+psbox devices [--all] [--json]          # devices the classes match
+psbox check [SANDBOX]                   # what this system provides and lacks, or whether a sandbox can start
+psbox completions bash|zsh
 ```
 
-```text
-psbox launch [flags] <application> [-- args]
-```
+Every command takes `--color auto|always|never`, `--help`, and the top level
+takes `--version`.
+
+## Running
+
+`psbox run <sandbox>` starts the sandbox when it is not running (through its
+socket unit) and runs a command in it; the command's stdin, stdout, and
+stderr are the caller's, signals are forwarded, and its exit status is
+returned. `--command` picks a `[command.<name>]`; without it, the command
+named like the sandbox, or the only one, runs. Arguments after `--` are
+appended to the command's `exec`. `--exec` treats them as the whole command
+line instead (the command still supplies its environment and app id). `-i`
+starts or joins a named instance.
+
+Commands start in the caller's working directory when the sandbox has it
+(as with `rw = ["~/Projects/"]` and a caller in `~/Projects/x`), else in the
+home, else in `/`.
+
+`psbox task <sandbox> <task>` runs a task in its own supervisor and waits
+for it. `--create-dirs` on `run`, `task`, and `sandbox` also creates missing
+directories marked with a trailing `/` outside the sandbox root, and
+confirms each one (see [configuration.md](configuration.md#paths-and-tokens)).
+Paths without the `/` are never created; the startup check says so when
+`--create-dirs` was given.
+
+`run`, `task`, and `sandbox` print nothing of their own (stdio belongs to
+the command), only warnings: a sandbox on the host-network fallback, or one
+still running an older config.
+
+## The startup check
+
+Before a sandbox starts, `run`, `task`, and `sandbox` check everything known
+to stop it, and list every problem at once, by section, instead of failing
+on the first:
+
+- every config validation error, by config entry (a TOML syntax error shows
+  its line);
+- shared host paths that do not exist, named by their `rw`, `ro`, or
+  `[mount.<name>]` entry, unless the mount is `optional` or psbox creates
+  the path; a missing path inside another missing path is listed under it;
+- shared host paths that are symlinks to paths that do not exist;
+- mount points that would have to be created inside a read-only mount;
+- settings this host cannot provide: `network = "isolated"` without pasta,
+  `dbus = "host"` without a `unix:path=` session bus, and `dbus-daemon`
+  missing for the private bus;
+- Landlock older than required.
+
+Issues that would not stop the sandbox, such as the host-network fallback,
+are listed with the report; on a launch that succeeds they are warnings. The
+supervisor repeats the check when it starts, and a live config change that
+fails it is not applied.
+
+## Running sandboxes
+
+`list` shows every configured sandbox: running instances and tasks, the
+network it gets on this host, its commands, and its tasks; a config that
+does not load shows its error on one line.
+
+`status` shows how long the sandbox has run, its init pid, process and
+client counts, network, and X display, then the processes started for
+clients, live mounts, and published devices.
+
+`mount` attaches a host path into a running sandbox (at the same path, or
+`--at`), read-write or `--ro`; `umount` detaches it. File-chooser mounts and
+config changes use the same mechanism.
+
+`stop` stops a sandbox and returns once systemd sees the service gone.
+`stop --all` stops every running sandbox (instances, tasks, and unnamed
+ones) through systemd, so it also stops sandboxes still running an older
+psbox. It also removes socket units left by unnamed sandboxes whose client
+was killed before connecting. `status`, `mount`, `umount`, and `stop` never start a sandbox.
+
+## Setup
+
+`install` writes desktop and autostart entries (see
+[configuration.md](configuration.md#desktop-and-autostart-entries)) and
+reports what it added, updated, and removed, by sandbox; `-v` also lists
+unchanged entries and `--dry-run` writes nothing. Without a `sandboxes`
+directory there are no sandboxes, so `install` removes every entry it wrote;
+a `sandboxes` path that cannot be read or is not a directory is an error,
+and nothing changes.
+
+`devices` lists the host devices that the `gpu`, `camera`, `gamepad`,
+`security-key`, and `alsa` classes match; `--all` lists every device, with
+the IDs `usb:<vid>:<pid>` needs.
+
+`check` lists Landlock, user namespaces, cgroup v2, the units, and
+`dbus-daemon` as required (`✗`, exit status 1 when one is missing), and
+`xwayland-satellite` and `pasta` as optional (`!`). `check <sandbox>` runs
+the [startup check](#the-startup-check) for the sandbox and each of its
+tasks without starting anything (exit status 1 when one cannot start);
+tasks with the same problems as the sandbox are named once.
+
+`completions bash|zsh` prints the completion script (see
+[install.md](install.md#shell-completions)).
+
+## Output
+
+Output is meant for people: borderless tables and lists on stdout, and `✓`
+confirmations, `✗` errors, and `!` warnings on stderr. A `→`
+line follows only when the fix is not obvious from the message. Problems
+that come in groups (the startup check, config errors, `install` warnings)
+are shown as sections with a table each. Clap's own usage errors keep
+clap's format.
+
+Colors follow the terminal and `NO_COLOR`; `--color always|never`
+overrides. On a terminal, tables are fitted to the window (`COLUMNS`
+overrides its width) by shortening one column; piped output is never
+shortened. Scripts should use `--json`, which `list`, `status`, and
+`devices` take.
+
+A sandbox whose replies do not parse is reported as running an older
+version of psbox; `psbox stop` restarts it on the current one.
+
+## Unnamed sandboxes
+
+`psbox sandbox` runs a command in a new sandbox that has no config file and
+ends when the command exits. Stdio is the caller's terminal and the exit
+status passes through. Exactly one home flag is required:
 
 | Flag | Meaning |
 | --- | --- |
-| `--objects PATH` | Objects directory |
-| `--print` | Print the oneshot `psbox sandbox …` command and exit |
-| `--print-bwrap` | Print `bwrap …` and exit |
-| `--isolation MODE` | `oneshot`, `instance`, or `instance:name` |
-| `--instance NAME` | Join or create that instance name |
-| `--command` | Treat the argument list as the full command |
-
-`--isolation` and `--instance` are mutually exclusive.
-`--print` and `--print-bwrap` are mutually exclusive.
-
-`--print` and `--print-bwrap` always format the oneshot compose
-(workload after `--`, `dbus-launch` when `dbus: private`). They never
-print `psboxa`, unit names, or `systemctl`.
-
-Extra arguments after the application name are passed to the workload.
-They replace `default-args`. `--command` replaces `exec` as well:
+| `--home DIR` | Bind `DIR` read-write as the home (`~`, `@root`, absolute, or relative to the current directory) |
+| `--home-tmpfs` | An empty in-memory home |
+| `--no-home` | No home |
+| `--cache tmpfs\|home` | As the `cache` key |
+| `--devices LIST` | Comma-separated classes replacing `gpu,audio`; `none` for no devices |
+| `--dbus portal\|host\|off` | As the `dbus` key |
+| `--network isolated\|host\|none` | As the `network` key |
+| `--no-display` | No Wayland and no Xwayland |
+| `--xwayland` | Xwayland for X11 apps, as the `xwayland` key |
+| `--bind SRC[:DST]` | Share `SRC` read-write at the same path or at `DST`; repeatable; a trailing `/` marks a directory |
+| `--ro-bind SRC[:DST]` | The same, read-only |
+| `--env K=V` | An environment variable; repeatable |
 
 ```sh
-psbox launch firefox https://example.com
-psbox launch firefox --command -- env MOZ_LOG=1 firefox
+psbox sandbox --home-tmpfs --network none --no-display --bind . -- ./some-tool
+psbox sandbox --home ~/work/client --bind ~/Downloads/ --dbus host -- bash
 ```
 
-Flags may appear after the application name. `--` still ends flag
-parsing for the workload.
-
-`--objects` with instance isolation is an error when `PATH` is not the
-process default objects directory.
-
-The process exit status is the workload exit status.
-
-## `psbox instance`
-
-List and stop instantiated `psboxd@` user units. The list comes from
-the systemd user manager, not from object YAML.
-
-```text
-psbox instance list [-q]
-psbox instance stop <name>
-psbox instance stop --all
-```
-
-`list` writes a table to stdout with `IDENTITY`, `SERVICE`, `SOCKET`,
-`PID` (`psboxd` `MainPID`), `SINCE` (service start), `RESTARTS`, and
-`ACCEPTED` (socket accepts). Those extra columns come from systemd
-unit properties. `-q` prints identities only, one per line, for
-scripts. The default instance name is omitted: `firefox/default`
-is shown as `firefox`. Other names stay `firefox/work`. Completion
-uses the same form.
-
-`stop` stops the service and then the socket. `<name>` is a listed
-identity (`firefox` or `firefox/work`), the full `sandbox/default`
-form, or a listed escaped `%i`. Unknown names are an error.
-
-`stop --all` stops every listed identity. It is not an error if none
-exist. List and stop time out each user-manager D-Bus call and retry
-a timed-out or disconnected call up to three times.
-
-## `psbox objects`
-
-```text
-psbox objects [--objects PATH] install
-psbox objects [--objects PATH] cleanup
-psbox objects [--objects PATH] list {applications|desktop|autostart} [-q]
-psbox objects [--objects PATH] render <application>
-```
-
-| Command | stdout | Notes |
-| --- | --- | --- |
-| `install` | (none) | Writes desktop files; progress on stderr |
-| `cleanup` | (none) | Deletes `# @generator psbox` files |
-| `list applications` | one name per line | Omits broken referrers |
-| `list desktop` | `APPLICATION` / `ENTRY` table unless `-q` | |
-| `list autostart` | `APPLICATION` / `ENTRY` table unless `-q` | |
-| `render <application>` | rewritten desktop and autostart text | Does not write files |
-
-`install` skips entries whose template file is missing and lists those
-paths on stderr through the CLI logger (`PSBOX_LOG=structured` applies).
-Other configured entries are still installed. Other rendering failures return
-the actual error and stop installation before orphan cleanup, preserving
-existing launchers that could not be rendered. Install and cleanup progress
-also use the CLI logger.
-
-Failures writing required print, list, or render output fail the command,
-including failures flushing a table.
-
-## `psbox sandbox`
-
-Low-level compose. Requires a home choice and a command after `--`.
-
-```text
-psbox sandbox [flags] -- <command>
-```
-
-| Flag | Meaning |
-| --- | --- |
-| `--home DIR` | Bind this directory as `$HOME` |
-| `--home-tmpfs` | Empty tmpfs home |
-| `--no-home` | No home bind |
-| `--dev MODE` | `private` (default), `true`/`host`, or `private-shm` |
-| `--no-audio` | No audio devices or sockets |
-| `--no-video` | No video devices |
-| `--no-dbus` | No system or session bus |
-| `--no-session-dbus` | System bus only |
-| `--no-fontconfig` | No fontconfig cache |
-| `--no-udev` | No `/run/udev` |
-| `--no-evdev` | No `/dev/input` or hidraw |
-| `--no-display` | No Wayland/X11/DRI |
-| `--cache MODE` | `tmpfs` (default) or `home` |
-| `--downloads` | Bind host `Downloads` into `$HOME/Downloads` |
-| `--print` | Print the `bwrap` argv |
-
-`--home`, `--home-tmpfs`, and `--no-home` are mutually exclusive.
-`--no-dbus` and `--no-session-dbus` are mutually exclusive.
-
-`--dev true` and `--dev host` bind the entire host `/dev`, including shared
-memory and pseudo-terminals. `--dev private-shm` also binds host `/dev`, but
-covers `/dev/shm` with a private tmpfs; host pseudo-terminals remain shared.
-Both host modes expose newly connected devices, subject to host permissions.
-They conflict with `--no-audio`, `--no-video`, `--no-evdev`, and
-`--no-display`. `--dev false` is invalid. Application launches select the
-same behavior through `spec.options.dev`.
-
-`psbox launch` must not exec `psbox sandbox`. Both call the same
-in-process compose.
-
-## Completions
-
-```sh
-psbox completion bash
-psbox completion zsh
-```
-
-Release archives include generated files. Application-name completion
-runs `psbox objects list applications --quiet`.
+Each run is its own supervisor under a random `sandbox.<16 hex digits>` key.
+The client writes the settings to `$XDG_RUNTIME_DIR/psbox/<key>.toml` and
+starts `psbox@<key>.socket`; the supervisor reads and removes the file. The
+socket unit is stopped when the command has exited, by the client and by
+the supervisor as it exits. A supervisor whose client leaves without asking
+for a command stops after 10 seconds. Unnamed sandboxes are not listed and
+cannot be addressed by `status`, `mount`, or `stop` (but `stop --all` stops
+them).

@@ -1,4 +1,0 @@
-version: v1
-kind: Options
-spec:
-  sandbox_root: /tmp/psbox-test-root

@@ -1,0 +1,8 @@
+# The client is X11-only, and Remote Play needs the local network.
+xwayland = true
+network = "host"
+cache = "home"
+devices = ["gpu", "audio", "gamepad"]
+
+[command.steam]
+exec = ["steam"]

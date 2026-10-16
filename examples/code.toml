@@ -1,0 +1,20 @@
+# Visual Studio Code with the directories you work in. The URL handler is a
+# second command in the same sandbox, so links from the browser open there.
+rw = ["~/Projects/"]
+
+[mount.ssh]
+host = "~/.ssh/"
+mode = "ro"
+optional = true
+
+[mount.etc-ssh]
+at = "/etc/ssh"
+mode = "empty"
+
+[command.code]
+exec = ["code"]
+desktop = { id = "code-oss" }
+
+[command.code-url-handler]
+exec = ["code", "--open-url"]
+desktop = { id = "code-oss-url-handler" }

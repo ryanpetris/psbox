@@ -1,0 +1,8 @@
+[Unit]
+Description=psbox sandbox %i (socket)
+
+[Socket]
+ListenSequentialPacket=%t/psbox/%i.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes

@@ -3,124 +3,154 @@
 These definitions are canonical for code, configuration, CLI output, and
 documentation.
 
-## Application
-
-A named `kind: Application` object. It has an `exec`, optional
-`default-args`, `env`, `bwrap-args`, and `options`. The name is
-`metadata.name` or, when a file contains exactly one application, the
-file stem. `metadata.type` may fill unset options (see
-[configuration.md](configuration.md)).
-
 ## Sandbox
 
-The application that owns the private home and the composed `bwrap`
-flags. For a referrer (`options.sandbox: other`), the sandbox is
-`other`, not the referrer. Instance identity keys on the sandbox name.
+A configured environment for one application or group of applications: a
+private home, the host paths and devices it may use, its bus, display, and
+network, and its commands. Each sandbox is defined by one sandbox config.
 
-## Referrer
+## Sandbox config
 
-An application that sets `options.sandbox` to another application. It
-supplies `exec`, `default-args`, and `env`. It must not set home, audio,
-video, dbus, display, fontconfig, isolation, `host-urls`, `cache`,
-`downloads`, `dev`, `metadata.type`, or `bwrap-args`.
+The TOML file `$XDG_CONFIG_HOME/psbox/sandboxes/<name>.toml`. The file name
+is the sandbox name.
 
-## Isolation
+## Sandbox name
 
-How a launch enters a sandbox. Values are `oneshot`, `instance`, or
-`instance:<name>`. Omitted isolation is `instance` with instance name
-`default`.
+Letters, digits, `_`, and `-`, never `.`, so that every `<name>.<type>`
+directory in the sandbox root belongs to exactly one sandbox.
 
-## Oneshot
+## Sandbox root
 
-Isolation that `exec`s `bwrap` with the workload as the initial command.
-There is no `psboxd`, no `psboxa`, and no host URL forward. The sandbox
-ends when that process tree ends.
-
-## Instance isolation
-
-Isolation that joins or creates a long-lived named instance. `psboxd`
-owns the listen socket. `bwrap` runs `psboxa`. Later launches attach
-over the instance protocol.
-
-## Instance
-
-One named long-lived sandbox of one sandbox application. The default
-name is `default`. Identity is `<sandbox>/<instance>`, for example
-`firefox/default`. Concurrent names of the same sandbox share the
-private home.
-
-## Object
-
-One YAML document under the objects directory. Kinds are `Application`,
-`FreedesktopEntry`, `FreedesktopAutostartEntry`, and `Options`.
-
-## Objects directory
-
-The directory `psbox` loads. Default `$XDG_CONFIG_HOME/psbox/objects`.
-Override with `PSBOX_OBJECT_PATH` or `--objects`. `--objects` cannot be
-used with instance isolation when it differs from the process default.
+`$PSBOX_ROOT`, default `~/Sandbox`: where private homes (`<root>/<name>`)
+and other sandbox directories (`<root>/<name>.<type>`, such as
+`~/Sandbox/retroarch.bin`) live. `@root` and `@self` refer to it.
 
 ## Private home
 
-The directory bound to `$HOME` inside the sandbox. Default
-`$PSBOX_ROOT/<sandbox>` (`~/Sandbox/<sandbox>`). `:tmpfs:` is an empty
-tmpfs. `:none:` binds no home.
+The directory bound at `$HOME` inside the sandbox: `<root>/<name>` by
+default, or a host path. `home = "tmpfs"` gives an empty in-memory home and
+`home = "none"` no home.
+
+## Sandbox root filesystem
+
+The root a sandbox's processes see, built from the plan on a tmpfs and
+read-only once built. Not to be confused with the sandbox root directory.
+
+## Command
+
+A `[command.<name>]` entry: what `psbox run` starts in the sandbox (`exec`),
+with its environment, app id, and desktop entry.
+
+## Instance
+
+One running copy of a sandbox: its own supervisor, namespaces, and
+processes. The default instance is named after the sandbox; named instances
+(`psbox run <sandbox> -i <name>`) share the sandbox's home.
+
+## Task
+
+A `[task.<name>]` entry: a oneshot command run with `psbox task` in its own
+instance, with the sandbox's mounts, and stopped as soon as it is done.
+
+## Unnamed sandbox
+
+A sandbox without a config, made by `psbox sandbox` from its flags, that
+ends when its command exits.
+
+## Supervisor
+
+`psbox supervise <key>`, started by systemd socket activation: the process
+that owns one instance's namespaces and cgroups, builds its root, spawns its
+processes, applies live changes, publishes devices, and runs its gateway.
+
+## Key
+
+The name of one supervisor, used for its socket, its units
+(`psbox@<key>.socket` and `psbox@<key>.service`), and its logs: `<sandbox>`,
+`<sandbox>.instance-<name>`, `<sandbox>.task-<task>`, or
+`sandbox.<16 hex digits>` for an unnamed sandbox.
+
+## Plan
+
+What a sandbox config resolves to on this host: the mounts, environment,
+commands, device classes, bus, display, and network. The client and the
+supervisor build the same plan from the same config.
+
+## Startup check
+
+The check of a plan against the host before a sandbox starts, which reports
+every problem that would stop it at once.
+
+## Share
+
+A host path made visible in the sandbox: an `rw` or `ro` entry, or a `ro`,
+`rw`, or `overlay` mount.
+
+## Mount
+
+A `[mount.<name>]` entry, or anything psbox mounts in the sandbox root
+filesystem. Mount modes are `ro`, `rw`, `overlay`, and `empty`.
+
+## Live mount
+
+A mount attached to or detached from a running sandbox: by `psbox mount`,
+by the file chooser, or by a config change.
+
+## Device class
+
+A named set of host devices a sandbox may use, such as `gpu`, `camera`,
+`gamepad`, `security-key`, `alsa`, `usb:<vid>:<pid>`, or the `audio`
+sockets.
+
+## Published device
+
+A device node of a granted class made visible in a running sandbox's `/dev`,
+added and removed as the device comes and goes.
+
+## Profile
+
+A config fragment merged under a sandbox config with `extends`: a user
+profile in `$XDG_CONFIG_HOME/psbox/profiles/`, or the built-in `browser`
+profile.
+
+## Private session bus
+
+The `dbus-daemon` a sandbox with `dbus = "portal"` runs for its own
+processes.
+
+## Gateway
+
+The part of the supervisor that serves the portals and notifications on the
+private session bus and forwards what the policy allows to the host.
+
+## App id
+
+The desktop file id a process is registered with at the host portal: the
+command's `app-id`, else the sandbox's.
 
 ## Workload
 
-An application process started by a spawn, plus any descendants that
-are not infrastructure. The private session `dbus-daemon` is
-infrastructure, as are processes it activated (including after they
-reparent to PID 1). Those do not keep an idle instance alive by
-themselves.
+The processes started for clients and their children, in the `workload/`
+cgroup. The sandbox is idle when the workload is empty and no client is
+connected.
 
-## Device mode
+## Infra
 
-The `dev` option selects the device filesystem. `private` is the default:
-a private `/dev` with selective device binds, private shared memory, and
-private pseudo-terminals. `true`/`host` exposes host `/dev` in full.
-`private-shm` exposes host `/dev` with private shared memory at `/dev/shm`;
-host pseudo-terminals remain shared.
+The processes that serve the workload: init, the private session bus and
+the services it activates, and Xwayland, in the `infra/` cgroup.
 
-## `psbox`
+## Network fallback
 
-The host CLI. Applications start with `psbox launch <application>`.
+Using the host network for a sandbox that does not set `network`, because
+`pasta` is not installed.
 
-## `psboxd`
+## Restart pending
 
-The per-instance host daemon. systemd user socket activation starts
-`psboxd@<escaped>.service`. It composes `bwrap`, talks to `psboxa`, and
-runs host `xdg-open` for allowlisted URIs.
+A config change that cannot be applied live; the sandbox restarts as soon
+as it is idle.
 
-## `psboxa`
+## Desktop entry
 
-The in-sandbox agent (PID 2 under `bwrap` in instance isolation). It
-spawns the workload, reaps it, may start a private session bus, and
-forwards `http`/`https` to `psboxd`. Invoked as `xdg-open` or
-`psboxa xdg-open`, it is the host-URL helper.
-
-## Host URL forward
-
-The instance-only path that sends `http` and `https` from the sandbox
-to host `xdg-open`. Other schemes stay inside. `options.host-urls:
-false` disables it.
-
-## Config hash
-
-A blake2b-512 digest of the sandbox options that affect the instance
-root: home, non-default audio/video/display/fontconfig, non-host dbus,
-`host-urls: false`, `cache: home`, `downloads: true`, non-private `dev`,
-and `bwrap-args`.
-Isolation, `exec`, `default-args`, `env`, and `metadata.type` are not
-included; type defaults are hashed as the options they fill.
-
-## Running hash
-
-A blake2b-512 digest of the config hash plus non-default compose
-environment (`WAYLAND_DISPLAY`, `XAUTHORITY`, `PIPEWIRE_CORE`,
-`PSBOX_ROOT`, `PSBOX_OBJECT_PATH`).
-
-## Launch (verb)
-
-The CLI action that starts an application in whichever isolation that
-application uses. It is not an isolation mode.
+A `.desktop` file `psbox install` writes for a command with a `desktop`
+table, or for an `autostart` table, which starts the command through `psbox
+run`.
