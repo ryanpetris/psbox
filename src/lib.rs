@@ -41,7 +41,7 @@ use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
 #[derive(Parser)]
 #[command(
     name = "psbox",
-    version,
+    version = option_env!("PSBOX_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
     about = "Run applications in private-home sandboxes",
     styles = STYLES,
     after_help = EXAMPLES,

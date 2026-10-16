@@ -8,7 +8,9 @@ FUZZ_TIME ?= 60
 
 TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 FUZZ_TARGETS := config protocol dbus_message desktop_entry
-VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+# The version psbox reports, MAJOR.MINOR.PATCH without a `v`: 0.0.0 for
+# development builds, set from the tag for releases.
+export PSBOX_VERSION ?= 0.0.0
 
 .PHONY: all build test fmt check check/fmt check/clippy check/deny fuzz \
 	release dist install dev/install clean
@@ -46,6 +48,8 @@ fuzz:
 
 # Static release binaries for amd64 and arm64.
 release:
+	@echo "$(PSBOX_VERSION)" | grep -Eqx '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' || \
+		{ echo "PSBOX_VERSION must be MAJOR.MINOR.PATCH without a v prefix" >&2; exit 1; }
 	for t in $(TARGETS); do $(CARGO) build --release --target $$t || exit 1; done
 
 # Release archives: the binary, the units, the license, and the README.
@@ -53,7 +57,7 @@ dist: release
 	rm -rf dist && mkdir -p dist
 	for pair in x86_64-unknown-linux-musl:amd64 aarch64-unknown-linux-musl:arm64; do \
 		target=$${pair%%:*}; arch=$${pair##*:}; \
-		name=psbox_$(VERSION)_linux_$$arch; \
+		name=psbox_$(PSBOX_VERSION)_linux_$$arch; \
 		mkdir -p dist/$$name/units; \
 		cp target/$$target/release/psbox LICENSE README.md dist/$$name/; \
 		cp units/psbox@.service units/psbox@.socket dist/$$name/units/; \

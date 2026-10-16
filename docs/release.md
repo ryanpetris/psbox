@@ -13,7 +13,13 @@ make release        # target/<triple>/release/psbox
 make dist           # dist/psbox_<version>_linux_<arch>.tar.gz and dist/checksums.txt
 ```
 
-The version is `version` in `Cargo.toml`, and `psbox --version` prints it.
+The version comes from `PSBOX_VERSION` (`MAJOR.MINOR.PATCH`, no `v`),
+which defaults to `0.0.0` for development builds; `Cargo.toml` stays at
+`0.0.0`. `psbox --version` prints it. To build a release locally:
+
+```sh
+make dist PSBOX_VERSION=1.2.3
+```
 
 ## Archives
 
@@ -45,8 +51,9 @@ make install DESTDIR="$pkgdir" PREFIX=/usr
 - `.github/workflows/ci.yml` runs `make check` and `make release` on pull
   requests and pushes to `master` or `main`.
 - `.github/workflows/release.yml` runs on a `v*` tag: it checks that the tag
-  is `v` plus the `Cargo.toml` version, runs `make dist`, and publishes the
-  archives and checksums as a GitHub release with generated notes.
+  is `v` plus `MAJOR.MINOR.PATCH`, sets `PSBOX_VERSION` from it, runs
+  `make dist`, and publishes the archives and checksums as a GitHub release
+  with generated notes.
 
-To release, set `version` in `Cargo.toml`, commit, and push a tag
-`v<version>`.
+To release, push a tag `v<version>`, such as `v1.2.3`. Nothing in the
+repository changes.
