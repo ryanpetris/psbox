@@ -23,11 +23,11 @@ use crate::portal::Policy;
 use crate::protocol::{self, LiveMount, Process, PublishedDevice, Request, Response, Status};
 use crate::root;
 use crate::spawn::{self, Exit, SpawnJob};
-use crate::spec::{DeviceClass, MountMode, Network, Spec, Tokens};
+use crate::spec::{DeviceClass, MountMode, Network, Spec, Tokens, Xwayland};
 use crate::sys::cgroup::Cgroups;
 use crate::sys::fd::{Seqpacket, poll_readable};
 use crate::sys::mount::{MOUNT_ATTR_NODEV, MOUNT_ATTR_NOSUID, MOUNT_ATTR_RDONLY, PointKind};
-use crate::sys::{cvt_int, landlock, mount, ns, path_cstr, process, seccomp};
+use crate::sys::{self, cvt_int, landlock, mount, ns, path_cstr, process, seccomp};
 use crate::systemd::{self, Systemd};
 use crate::x11;
 
@@ -157,8 +157,8 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         eprintln!("psbox[{name}]: pasta is not installed; using the host network instead of isolated networking");
     }
     let display = match plan.xwayland {
-        true => Some(x11::free_display().context("choose an X display")?),
-        false => None,
+        Xwayland::Off => None,
+        _ => Some(x11::free_display().context("choose an X display")?),
     };
 
     if let Some(dir) = &plan.host_home_dir {
@@ -561,10 +561,29 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Duplicates of the supervisor's stdio, for a child in the sandbox.
+    fn stdio() -> io::Result<[OwnedFd; 3]> {
+        Ok([
+            io::stdin().as_fd().try_clone_to_owned()?,
+            io::stdout().as_fd().try_clone_to_owned()?,
+            io::stderr().as_fd().try_clone_to_owned()?,
+        ])
+    }
+
     /// Listens on the sandbox's X socket and starts `xwayland-satellite`
     /// (in `infra`) whenever a client connects while it is not running.
+    /// With `xwayland = "builtin"`, satellite reaches the compositor through
+    /// `psbox decorations`, which draws its windows' title bars (see
+    /// [`Self::connect_decorations`]).
     fn start_xwayland(self: &Arc<Self>, display: u32) -> Result<()> {
-        let listener = x11::listen(self.root()?.as_fd(), display)?;
+        let decorate = self.plan().xwayland == Xwayland::Builtin;
+        let root = self.root()?;
+        let listener = x11::listen(root.as_fd(), display)?;
+        let wayland = x11::decorations_socket(display);
+        let wayland_listener = match decorate {
+            true => Some(x11::listen_at(root.as_fd(), &wayland)?),
+            false => None,
+        };
         let s = self.clone();
         std::thread::Builder::new().name("xwayland".into()).spawn(move || {
             loop {
@@ -572,36 +591,84 @@ impl Supervisor {
                     return;
                 }
                 let started = (|| -> Result<spawn::Child> {
-                    let stdio = [
-                        std::io::stdin().as_fd().try_clone_to_owned()?,
-                        std::io::stdout().as_fd().try_clone_to_owned()?,
-                        std::io::stderr().as_fd().try_clone_to_owned()?,
-                    ];
-                    let fd = listener.try_clone()?;
+                    let mut env = s.plan().env.clone();
+                    if decorate {
+                        env.insert("WAYLAND_DISPLAY".into(), wayland.to_string_lossy().into_owned());
+                    }
                     s.spawn(
                         x11::satellite_argv(display),
-                        s.plan().env.clone(),
+                        env,
                         PathBuf::from("/"),
-                        stdio,
-                        vec![fd],
+                        Self::stdio()?,
+                        vec![listener.try_clone()?],
                         &s.cg.infra,
                     )
                 })();
-                match started {
-                    Ok(child) => {
-                        eprintln!("psbox[{}]: started xwayland-satellite (pid {})", s.key(), child.pid);
-                        let exit = spawn::wait(child.pidfd.as_fd());
-                        eprintln!("psbox[{}]: xwayland-satellite exited: {exit:?}", s.key());
-                    }
+                let child = match started {
+                    Ok(child) => child,
                     Err(e) => {
                         eprintln!("psbox[{}]: cannot start xwayland-satellite: {e:#}", s.key());
                         // Do not spin on a pending connection nobody will serve.
                         std::thread::sleep(Duration::from_secs(5));
+                        continue;
                     }
+                };
+                eprintln!("psbox[{}]: started xwayland-satellite (pid {})", s.key(), child.pid);
+                let decorations = match &wayland_listener {
+                    Some(l) => match s.connect_decorations(l.as_fd(), &child) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("psbox[{}]: cannot start decorations: {e:#}", s.key());
+                            let _ = ns::pidfd_send_signal(child.pidfd.as_fd(), libc::SIGKILL);
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let exit = spawn::wait(child.pidfd.as_fd());
+                eprintln!("psbox[{}]: xwayland-satellite exited: {exit:?}", s.key());
+                if let Some(d) = decorations {
+                    // It ends by itself once satellite's connection closes;
+                    // this covers one that is stuck.
+                    let _ = ns::pidfd_send_signal(d.pidfd.as_fd(), libc::SIGKILL);
+                    let _ = spawn::wait(d.pidfd.as_fd());
                 }
             }
         })?;
         Ok(())
+    }
+
+    /// Waits for `satellite` to connect to its Wayland socket and starts
+    /// `psbox decorations` (in `infra`) with that connection; `None` if
+    /// satellite exits first. Satellite starts Xwayland with its own
+    /// environment and descriptors before it connects, so the connection
+    /// cannot be handed to it ready-made (`WAYLAND_SOCKET`): Xwayland would
+    /// take it. Connections from anything else in the sandbox are closed.
+    fn connect_decorations(&self, listener: BorrowedFd<'_>, satellite: &spawn::Child) -> Result<Option<spawn::Child>> {
+        let conn = loop {
+            let ready = poll_readable(&[listener, satellite.pidfd.as_fd()], -1)?;
+            if ready[1] {
+                return Ok(None);
+            }
+            let conn = sys::fd::accept_stream(listener)?;
+            if sys::fd::peer_pid(conn.as_fd())? == satellite.pid {
+                break conn;
+            }
+        };
+        let child = self.spawn(
+            vec![
+                format!("{}/bin/psbox", crate::plan::PSBOX_DIR),
+                "decorations".into(),
+                self.key(),
+            ],
+            self.plan().env.clone(),
+            PathBuf::from("/"),
+            Self::stdio()?,
+            vec![conn],
+            &self.cg.infra,
+        )?;
+        eprintln!("psbox[{}]: started decorations (pid {})", self.key(), child.pid);
+        Ok(Some(child))
     }
 
     /// Starts `pasta` attached to the sandbox's network namespace: outbound

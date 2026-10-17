@@ -19,7 +19,7 @@ and read-only once built:
 | `~` | The private home (`<root>/<name>`), a host path, a tmpfs, or nothing |
 | `~/.cache` | A tmpfs unless `cache = "home"` |
 | `/run/udev`, `/var/cache/fontconfig` | The host's, read-only, for device and font metadata |
-| `/run/psbox` | With a session bus, unless `[open-urls]` keeps every link inside, the link handler: the psbox executable and the files that make it the default for links, read-only (see [Links](configuration.md#links)) |
+| `/run/psbox` | The psbox executable, read-only, for the link handler and for `xwayland = "builtin"`; with a session bus, unless `[open-urls]` keeps every link inside, the files that make the link handler the default for links (see [Links](configuration.md#links)) |
 | Shares and mounts | Only what the config lists, read-only or read-write as configured |
 
 Nothing else of the host's filesystem is visible: not your home, not other
@@ -128,7 +128,10 @@ host.
 
 The sandbox gets the host's Wayland socket, so apps draw through the
 compositor like any Wayland client. There is no access to a host X server:
-X11 apps get a private Xwayland per sandbox (`xwayland = true`).
+X11 apps get a private Xwayland per sandbox (`xwayland`).
+`xwayland-satellite`, and with `builtin` the proxy that draws title bars,
+run inside the sandbox and reach the compositor as the sandbox's own
+Wayland clients.
 
 ## Not isolated
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::bus::BusPaths;
-use crate::spec::{Cache, Dbus, DeviceClass, Home, MountMode, Network, Spec, Tokens};
+use crate::spec::{Cache, Dbus, DeviceClass, Home, MountMode, Network, Spec, Tokens, Xwayland};
 
 /// Host facts the plan depends on.
 #[derive(Debug, Clone)]
@@ -408,8 +408,8 @@ pub struct Plan {
     /// Host bus names the gateway forwards calls to (`dbus-talk`); empty
     /// without a private bus.
     pub dbus_talk: Vec<String>,
-    /// Serve X11 clients with an on-demand Xwayland.
-    pub xwayland: bool,
+    /// How X11 clients are served; `off` without a Wayland socket.
+    pub xwayland: Xwayland,
     /// The schemes whose links open in the host's default app: those
     /// `open-urls` sends to the host, with a session bus.
     pub open_urls: Vec<String>,
@@ -435,10 +435,11 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin";
 /// The address pasta answers DNS on inside an isolated sandbox.
 pub const PASTA_DNS: &str = "169.254.1.1";
 
-/// Holds the sandbox's link handler, in sandboxes with a session bus:
-/// `bin/psbox` (psbox itself, for `psbox open-uri`), `config` first in
-/// `XDG_CONFIG_DIRS`, and `share` first in `XDG_DATA_DIRS`.
-pub const OPEN_URLS_DIR: &str = "/run/psbox";
+/// Holds what psbox puts in the sandbox for itself: `bin/psbox` (psbox,
+/// for `psbox open-uri` and `psbox decorations`), and the link handler, in
+/// sandboxes with a session bus: `config` first in `XDG_CONFIG_DIRS`, and
+/// `share` first in `XDG_DATA_DIRS`.
+pub const PSBOX_DIR: &str = "/run/psbox";
 
 /// The link handler's `mimeapps.list` and desktop entry, claiming `schemes`.
 fn link_handler(schemes: &[String]) -> (String, String) {
@@ -795,10 +796,11 @@ pub fn diff(old: &Plan, new: &Plan) -> Change {
     // changes too; report them once.
     if c.restart.iter().any(|r| r == "xwayland") {
         let x11 = format!("mount at {}", crate::x11::SOCKET_DIR);
-        c.restart.retain(|r| *r != x11);
+        let bin = format!("mount at {PSBOX_DIR}/bin/");
+        c.restart.retain(|r| *r != x11 && !r.starts_with(&bin));
     }
     if c.restart.iter().any(|r| r == "open-urls" || r == "dbus") {
-        let handler = format!("mount at {OPEN_URLS_DIR}/");
+        let handler = format!("mount at {PSBOX_DIR}/");
         c.restart.retain(|r| !r.starts_with(&handler));
     }
     if c.restart.iter().any(|r| r == "network") {
@@ -926,7 +928,10 @@ impl Plan {
 
         let mut env = BTreeMap::new();
         let wayland_socket = host.wayland_socket.as_ref().filter(|_| display);
-        let xwayland = spec.xwayland && wayland_socket.is_some();
+        let xwayland = match wayland_socket {
+            Some(_) => spec.xwayland,
+            None => Xwayland::Off,
+        };
         if let Some(sock) = wayland_socket {
             let file = sock.file_name().context("Wayland socket has no file name")?;
             mounts.push(Mount::Bind {
@@ -1098,27 +1103,29 @@ impl Plan {
             Dbus::Portal | Dbus::Host => spec.open_urls.host_schemes().into_iter().map(String::from).collect(),
         };
         let handler = !open_urls.is_empty();
-        if handler {
-            let (mimeapps, entry) = link_handler(&open_urls);
+        if handler || xwayland == Xwayland::Builtin {
             mounts.push(Mount::Bind {
                 src: host.exe.clone(),
-                dst: format!("{OPEN_URLS_DIR}/bin/psbox").into(),
+                dst: format!("{PSBOX_DIR}/bin/psbox").into(),
                 ro: true,
                 optional: false,
             });
+        }
+        if handler {
+            let (mimeapps, entry) = link_handler(&open_urls);
             mounts.push(Mount::File {
-                dst: format!("{OPEN_URLS_DIR}/config/mimeapps.list").into(),
+                dst: format!("{PSBOX_DIR}/config/mimeapps.list").into(),
                 content: mimeapps,
             });
             mounts.push(Mount::File {
-                dst: format!("{OPEN_URLS_DIR}/share/applications/psbox-open-uri.desktop").into(),
+                dst: format!("{PSBOX_DIR}/share/applications/psbox-open-uri.desktop").into(),
                 content: entry,
             });
         }
         // Parents before children, after everything psbox mounts itself.
         shares.sort_by_key(|m| m.dst().components().count());
         mounts.extend(shares);
-        if xwayland {
+        if xwayland != Xwayland::Off {
             // The X socket directory is the sandbox's own even when `/tmp`
             // is a share, so the socket never lands in the host's.
             mounts.push(Mount::Tmpfs {
@@ -1149,10 +1156,10 @@ impl Plan {
         // host to the OpenURI portal instead, and so to the host's default
         // app.
         if handler {
-            env.insert("XDG_CONFIG_DIRS".into(), format!("{OPEN_URLS_DIR}/config:/etc/xdg"));
+            env.insert("XDG_CONFIG_DIRS".into(), format!("{PSBOX_DIR}/config:/etc/xdg"));
             env.insert(
                 "XDG_DATA_DIRS".into(),
-                format!("{OPEN_URLS_DIR}/share:/usr/local/share:/usr/share"),
+                format!("{PSBOX_DIR}/share:/usr/local/share:/usr/share"),
             );
         }
         env.extend(spec.env.clone());
@@ -1323,6 +1330,20 @@ impl Plan {
             Err(e) => problems.push(Problem::System {
                 message: format!("Landlock is unavailable ({e})"),
             }),
+        }
+        let programs: &[&str] = match self.xwayland {
+            Xwayland::Off => &[],
+            Xwayland::Builtin | Xwayland::Satellite => &["xwayland-satellite", "Xwayland"],
+        };
+        for program in programs.iter().filter(|p| find_in_path(p).is_none()) {
+            problems.push(Problem::Setting {
+                setting: match unnamed {
+                    true => format!("--xwayland={}", self.xwayland),
+                    false => format!("xwayland = \"{}\"", self.xwayland),
+                },
+                needs: (*program).into(),
+                detail: "not installed".into(),
+            });
         }
         if self.bus.is_some() && find_in_path("dbus-daemon").is_none() {
             problems.push(Problem::Setting {
@@ -1498,14 +1519,20 @@ mod tests {
         let off = Plan::build(&main("app"), &Spec::parse("dbus = \"off\"").unwrap(), &host()).unwrap();
         assert!(off.bus.is_none());
         assert!(!off.env.contains_key("DBUS_SESSION_BUS_ADDRESS"));
-        assert!(!plan.xwayland);
-        let x = Spec::parse("xwayland = true").unwrap();
-        assert!(Plan::build(&main("app"), &x, &host()).unwrap().xwayland);
+        assert_eq!(plan.xwayland, Xwayland::Off);
+        let x = Spec::parse("xwayland = \"builtin\"").unwrap();
+        assert_eq!(
+            Plan::build(&main("app"), &x, &host()).unwrap().xwayland,
+            Xwayland::Builtin
+        );
         let headless = HostEnv {
             wayland_socket: None,
             ..host()
         };
-        assert!(!Plan::build(&main("app"), &x, &headless).unwrap().xwayland);
+        assert_eq!(
+            Plan::build(&main("app"), &x, &headless).unwrap().xwayland,
+            Xwayland::Off
+        );
         assert_eq!(plan.node_classes, vec![DeviceClass::Gpu]);
         assert_eq!(plan.default_command(), Some("app"));
     }
@@ -1638,7 +1665,7 @@ mod tests {
             optional: false
         }));
         assert!(plan.mounts.iter().any(|m| m.dst() == Path::new("/run/dbus")));
-        assert!(!plan.xwayland && !plan.env.contains_key("WAYLAND_DISPLAY"));
+        assert!(plan.xwayland == Xwayland::Off && !plan.env.contains_key("WAYLAND_DISPLAY"));
 
         let elsewhere = HostEnv {
             session_bus: unix_path("unix:abstract=/x;unix:guid=1,path=/tmp/test%20bus"),
@@ -1658,7 +1685,12 @@ mod tests {
         let p = Plan::build(&main("app"), &Spec::parse("dbus = \"host\"").unwrap(), &no_bus).unwrap();
         assert!(matches!(&p.problems[..], [Problem::Setting { setting, .. }] if setting == "dbus = \"host\""));
 
-        let portal = Plan::build(&main("app"), &Spec::parse("xwayland = true").unwrap(), &host()).unwrap();
+        let portal = Plan::build(
+            &main("app"),
+            &Spec::parse("xwayland = \"xwayland-satellite\"").unwrap(),
+            &host(),
+        )
+        .unwrap();
         assert_eq!(
             diff(&portal, &plan).restart,
             vec!["dbus".to_string(), "xwayland".to_string()]
@@ -1677,7 +1709,7 @@ mod tests {
         };
         let plan = Plan::build(&id, &spec, &host()).unwrap();
         assert_eq!(plan.key, "retroarch.task-update");
-        assert!(plan.bus.is_none() && !plan.xwayland);
+        assert!(plan.bus.is_none() && plan.xwayland == Xwayland::Off);
         assert!(!plan.env.contains_key("WAYLAND_DISPLAY") && !plan.env.contains_key("DISPLAY"));
         assert!(
             !plan
@@ -1762,6 +1794,23 @@ mod tests {
     }
 
     #[test]
+    fn xwayland_modes() {
+        let build = |text: &str| Plan::build(&main("app"), &Spec::parse(text).unwrap(), &host()).unwrap();
+        let bin = |p: &Plan| p.mounts.iter().any(|m| m.dst() == Path::new("/run/psbox/bin/psbox"));
+        let x11 = |p: &Plan| p.mounts.iter().any(|m| m.dst() == Path::new(crate::x11::SOCKET_DIR));
+
+        // `builtin` runs psbox's own decorations inside the sandbox, so it
+        // needs psbox there even without a link handler.
+        let builtin = build("dbus = \"off\"\nxwayland = \"builtin\"");
+        assert!(bin(&builtin) && x11(&builtin));
+        let satellite = build("dbus = \"off\"\nxwayland = \"xwayland-satellite\"");
+        assert!(!bin(&satellite) && x11(&satellite) && satellite.problems.is_empty());
+        let off = build("dbus = \"off\"");
+        assert!(!bin(&off) && !x11(&off));
+        assert_eq!(diff(&builtin, &satellite).restart, ["xwayland"]);
+    }
+
+    #[test]
     fn links_open_on_the_host_through_the_sandboxs_own_handler() {
         let build = |text: &str| Plan::build(&main("app"), &Spec::parse(text).unwrap(), &host()).unwrap();
         let file = |p: &Plan, name: &str| {
@@ -1788,7 +1837,7 @@ mod tests {
             optional: false,
         }));
         let entry = file(&plan, "psbox-open-uri.desktop").unwrap();
-        assert!(entry.contains(&format!("Exec={OPEN_URLS_DIR}/bin/psbox open-uri -- %u\n")));
+        assert!(entry.contains(&format!("Exec={PSBOX_DIR}/bin/psbox open-uri -- %u\n")));
         assert!(entry.contains("MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/mailto;\n"));
         assert_eq!(plan.env["XDG_CONFIG_DIRS"], "/run/psbox/config:/etc/xdg");
         assert_eq!(
@@ -1835,7 +1884,7 @@ mod tests {
         ] {
             let p = build(text);
             assert!(p.open_urls.is_empty(), "{text}");
-            assert!(!p.mounts.iter().any(|m| m.dst().starts_with(OPEN_URLS_DIR)), "{text}");
+            assert!(!p.mounts.iter().any(|m| m.dst().starts_with(PSBOX_DIR)), "{text}");
             assert!(!p.env.contains_key("XDG_DATA_DIRS"), "{text}");
         }
 
@@ -1878,7 +1927,10 @@ mod tests {
         assert_eq!(c.restart, vec!["home"]);
         assert!(c.attach.is_empty() && c.detach.is_empty());
 
-        let c = diff(&base, &build("rw = [\"~/Downloads\"]\ndbus = \"off\"\nxwayland = true"));
+        let c = diff(
+            &base,
+            &build("rw = [\"~/Downloads\"]\ndbus = \"off\"\nxwayland = \"builtin\""),
+        );
         assert_eq!(c.restart, vec!["dbus", "xwayland"]);
 
         let c = diff(
@@ -1908,7 +1960,7 @@ mod tests {
 
         let tmp = |src: &str| {
             build(&format!(
-                "xwayland = true\n[mount.tmp]\nhost = \"{src}\"\nat = \"/tmp\"\nmode = \"rw\"\n"
+                "xwayland = \"builtin\"\n[mount.tmp]\nhost = \"{src}\"\nat = \"/tmp\"\nmode = \"rw\"\n"
             ))
         };
         assert_eq!(

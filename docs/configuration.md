@@ -38,7 +38,7 @@ applications.
 | `dbus-talk` | `[]` | Host session bus names the sandbox may call through the gateway (see [Host bus names](#host-bus-names)) |
 | `[open-urls]` | `host` for each | `http`, `https`, `mailto`: `host` opens those links in the host's default app, `sandbox` inside the sandbox (see [Links](#links)) |
 | `display` | `true` | Wayland (and Xwayland when `xwayland` is on) |
-| `xwayland` | `false` | A private Xwayland for X11 apps, started on the first X client |
+| `xwayland` | `off` | A private Xwayland for X11 apps: `builtin` or `xwayland-satellite` (see [Display and Xwayland](#display-and-xwayland)) |
 | `network` | `isolated` | `isolated`, `host`, or `none` (see [Network](#network)) |
 | `app-id` | | App id registered with the host portal (a desktop file id) |
 | `idle-timeout` | `60` | Seconds without workload before the sandbox stops |
@@ -191,11 +191,32 @@ restart, and so does installing pasta for a sandbox on the fallback.
 ## Display and Xwayland
 
 With `display = true` (the default) and a Wayland session, the host's
-Wayland socket is forwarded. X11 apps need `xwayland = true`: the sandbox
-then gets a private Xwayland on its own display number, started when the
-first X client connects (see [architecture.md](architecture.md#xwayland)).
-Apps that support Wayland do not need it; with no `DISPLAY`, GTK, Qt,
-Electron, and SDL choose Wayland themselves.
+Wayland socket is forwarded. Apps that support Wayland need nothing more;
+with no `DISPLAY`, GTK, Qt, Electron, and SDL choose Wayland themselves.
+
+X11 apps need `xwayland`: the sandbox then gets a private Xwayland on its
+own display number, never the host's X server. `xwayland-satellite`,
+started on the first X client, runs it and turns each X11 window into a
+Wayland window on the host (see [architecture.md](architecture.md#xwayland)):
+
+| `xwayland` | X11 window title bars |
+| --- | --- |
+| `off` (default) | No X server |
+| `builtin` | Drawn by psbox: an Adwaita title bar with minimize, maximize, and close buttons, and resize borders |
+| `xwayland-satellite` | Satellite's own. On GNOME that is a title and a close button, with no resize borders |
+
+Both need `xwayland-satellite` and `Xwayland`; a sandbox without them does
+not start, and the startup check names what is missing.
+
+psbox draws title bars only where the compositor draws none for
+satellite, as on GNOME; elsewhere the compositor draws them, as with
+`xwayland-satellite`. Under `builtin`, satellite sees only the compositor
+globals it needs for X11 windows, so it does not pass the old `wl_drm`
+interface on to Xwayland (current Mesa uses `zwp_linux_dmabuf_v1`).
+They follow the X11 window's wish: a window that draws its own decorations
+gets none. The title bar's light or dark style comes from the settings
+portal when satellite starts, its font from GNOME's `titlebar-font`
+setting (as the sandbox sees it).
 
 ## Host bus names
 

@@ -1,5 +1,6 @@
-//! Unix sockets: `SOCK_SEQPACKET` with descriptor passing, and stream
-//! connections for D-Bus.
+//! Unix sockets: `SOCK_SEQPACKET` with descriptor passing, stream
+//! connections for D-Bus, and nonblocking streams with descriptor passing
+//! for Wayland.
 
 use std::io;
 use std::mem;
@@ -262,5 +263,151 @@ pub fn poll_readable(fds: &[BorrowedFd<'_>], timeout_ms: i32) -> io::Result<Vec<
             return Err(e);
         }
         return Ok(pfds.iter().map(|p| p.revents != 0).collect());
+    }
+}
+
+/// Accepts a connection on a listening stream socket.
+pub fn accept_stream(listener: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    // SAFETY: null address output is allowed.
+    let fd = cvt_int(unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    })?;
+    // SAFETY: fd was just returned.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The pid of a connected socket's peer, from `SO_PEERCRED`, in the
+/// caller's pid namespace.
+pub fn peer_pid(fd: BorrowedFd<'_>) -> io::Result<libc::pid_t> {
+    // SAFETY: ucred is plain old data.
+    let mut cred: libc::ucred = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: cred/len describe a valid output buffer.
+    cvt_int(unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    })?;
+    Ok(cred.pid)
+}
+
+/// The most descriptors one Wayland `sendmsg` carries, which is also what
+/// Wayland libraries accept in one read.
+pub const STREAM_MAX_FDS: usize = 28;
+
+/// Sends what a stream socket takes of `data` without blocking, with `fds`
+/// (at most [`STREAM_MAX_FDS`]) attached to the first byte. Returns how many
+/// bytes went out; `WouldBlock` when none did.
+pub fn send_stream(fd: BorrowedFd<'_>, data: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<usize> {
+    if fds.len() > STREAM_MAX_FDS || data.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad descriptor batch"));
+    }
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut _,
+        iov_len: data.len(),
+    };
+    // SAFETY: msghdr is plain old data.
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    let mut cmsg_buf = [0u64; 32];
+    if !fds.is_empty() {
+        let bytes = mem::size_of_val(fds) as u32;
+        // SAFETY: CMSG_SPACE is a pure computation.
+        let space = unsafe { libc::CMSG_SPACE(bytes) } as usize;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        // SAFETY: msg_control points at a buffer of at least `space` bytes
+        // (28 descriptors need 128).
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(bytes) as _;
+            let dst = libc::CMSG_DATA(cmsg) as *mut RawFd;
+            for (i, fd) in fds.iter().enumerate() {
+                dst.add(i).write_unaligned(fd.as_raw_fd());
+            }
+        }
+    }
+    // SAFETY: msg is fully initialized.
+    let n = unsafe { libc::sendmsg(fd.as_raw_fd(), &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+/// Receives what a stream socket has, up to `buf.len()` bytes, without
+/// blocking, appending the descriptors that came with it to `fds`. `Ok(0)`
+/// is the end of the stream; `WouldBlock` means nothing is waiting.
+pub fn recv_stream(fd: BorrowedFd<'_>, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: msghdr is plain old data.
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    let mut cmsg_buf = [0u64; 32];
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+    msg.msg_controllen = mem::size_of_val(&cmsg_buf) as _;
+    // SAFETY: msg points at valid buffers.
+    let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: walking the control buffer the kernel just filled.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg) as *const RawFd;
+                let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / mem::size_of::<RawFd>();
+                for i in 0..count {
+                    fds.push(OwnedFd::from_raw_fd(data.add(i).read_unaligned()));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "too many descriptors"));
+    }
+    Ok(n as usize)
+}
+
+/// Waits until one of `fds` has one of the `poll` events asked for with it.
+/// Returns the events that happened, per descriptor.
+pub fn poll_events(fds: &[(BorrowedFd<'_>, libc::c_short)], timeout_ms: i32) -> io::Result<Vec<libc::c_short>> {
+    let mut pfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|(fd, events)| libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: *events,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        // SAFETY: pfds is a valid array.
+        let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        return Ok(pfds.iter().map(|p| p.revents).collect());
     }
 }

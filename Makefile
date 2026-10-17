@@ -7,7 +7,7 @@ USER_UNIT_DIR ?= $(or $(XDG_CONFIG_HOME),$(HOME)/.config)/systemd/user
 FUZZ_TIME ?= 60
 
 TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-FUZZ_TARGETS := config protocol dbus_message desktop_entry
+FUZZ_TARGETS := config protocol dbus_message desktop_entry wayland_message
 # The version psbox reports, MAJOR.MINOR.PATCH without a `v`: 0.0.0 for
 # development builds, set from the tag for releases.
 export PSBOX_VERSION ?= 0.0.0

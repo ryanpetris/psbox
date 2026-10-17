@@ -43,10 +43,10 @@ pub struct Spec {
     /// Wayland, and Xwayland when `xwayland` is on.
     #[serde(default = "default_true")]
     pub display: bool,
-    /// Run X11 apps on a private Xwayland server, started when the first X
-    /// client connects.
+    /// How X11 apps run: `off` (default), or on a private Xwayland with
+    /// psbox's title bars (`builtin`) or satellite's.
     #[serde(default)]
-    pub xwayland: bool,
+    pub xwayland: Xwayland,
     /// App id registered with the host portal for this sandbox's processes
     /// (a desktop file id such as `org.gnome.Calculator`).
     pub app_id: Option<String>,
@@ -98,6 +98,32 @@ impl fmt::Display for Network {
             Network::Host => "host",
             Network::Isolated => "isolated",
             Network::None => "none",
+        })
+    }
+}
+
+/// `xwayland`: X11 apps run on a private Xwayland that
+/// `xwayland-satellite` serves, turning each X11 window into a Wayland
+/// window on the host; `off` is no X server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Xwayland {
+    #[default]
+    Off,
+    /// With psbox drawing the title bars of X11 windows when the
+    /// compositor does not (`psbox decorations`).
+    Builtin,
+    /// Satellite on its own, with its own title bars.
+    #[serde(rename = "xwayland-satellite")]
+    Satellite,
+}
+
+impl fmt::Display for Xwayland {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Xwayland::Off => "off",
+            Xwayland::Builtin => "builtin",
+            Xwayland::Satellite => "xwayland-satellite",
         })
     }
 }
@@ -608,7 +634,7 @@ impl Spec {
             spec.network = t.network;
         }
         spec.display = false;
-        spec.xwayland = false;
+        spec.xwayland = Xwayland::Off;
         spec.env.extend(t.env.clone());
         spec.command = BTreeMap::from([(
             task.to_string(),
@@ -1037,8 +1063,17 @@ mod tests {
         assert_eq!(s.command["code-url-handler"].exec, vec!["code-url-handler"]);
         assert_eq!(s.idle_timeout, 60);
         assert_eq!(s.dbus, Dbus::Portal);
-        assert!(!s.xwayland && s.network.is_none());
-        assert!(Spec::parse("xwayland = true").unwrap().xwayland);
+        assert!(s.xwayland == Xwayland::Off && s.network.is_none());
+        for (value, x) in [
+            ("off", Xwayland::Off),
+            ("builtin", Xwayland::Builtin),
+            ("xwayland-satellite", Xwayland::Satellite),
+        ] {
+            let parsed = Spec::parse(&format!("xwayland = \"{value}\"")).unwrap().xwayland;
+            assert_eq!((parsed, parsed.to_string()), (x, value.to_string()));
+        }
+        assert!(Spec::parse("xwayland = true").is_err());
+        assert!(Spec::parse("xwayland = \"satellite\"").is_err());
         assert_eq!(
             s.command["code-url-handler"].app_id.as_deref(),
             Some("code-url-handler")
@@ -1111,7 +1146,7 @@ mod tests {
         assert_eq!(t.mount["bin"].mode, MountMode::Rw);
         assert_eq!(t.devices, Some(vec![]));
         assert_eq!(t.dbus, Dbus::Off);
-        assert!(!t.xwayland);
+        assert_eq!(t.xwayland, Xwayland::Off);
         assert_eq!(t.idle_timeout, 0);
         assert_eq!(t.command["update"].exec[..2], ["bash".to_string(), "-c".to_string()]);
         assert!(s.for_task("nope").is_err());

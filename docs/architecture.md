@@ -11,7 +11,7 @@ psbox run <name>  --seqpacket + SCM_RIGHTS-->  psbox@<key>.service (socket-activ
                                                supervisor: owns user + mount namespaces and the cgroup subtree
                                                  |- forker thread  (joined to the sandbox PID namespace)
                                                  |- infra/     init (PID 1), the private dbus-daemon and the services it activates,
-                                                 |            the connector, xwayland-satellite and Xwayland (started on the first X client)
+                                                 |            the connector, xwayland-satellite and Xwayland, psbox decorations
                                                  '- workload/  apps, cloned straight into this cgroup
 ```
 
@@ -195,13 +195,44 @@ scope means a host bus at an abstract address cannot be reached.
 
 ## Xwayland
 
-With `xwayland = true` (and a Wayland socket), the supervisor picks a display
+With `xwayland` on (and a Wayland socket), the supervisor picks a display
 number `N`, creates the sandbox's X socket itself as a filesystem socket at
 `/tmp/.X11-unix/XN` (on a tmpfs of its own, even when `/tmp` is a share),
 and sets `DISPLAY=:N` for everything it starts. The first connection starts
 `xwayland-satellite :N -listenfd 3 -nolisten local` in the `infra` cgroup;
 it runs a rootless Xwayland and turns each X11 window into a Wayland window
 on the host compositor. If it exits, the next X client starts it again.
+
+With `builtin`, satellite's `WAYLAND_DISPLAY` is
+`/tmp/.X11-unix/psbox-wayland-N` instead of the host's socket, on the X
+socket's own tmpfs, so it is never in a share. The supervisor accepts
+satellite's connection there, closing any from another
+process (by `SO_PEERCRED`), and starts `psbox decorations` in `infra` with
+it, from the psbox bound at `/run/psbox/bin/psbox`. A ready-made socket
+(`WAYLAND_SOCKET`) would not do: satellite starts Xwayland with its own
+environment and descriptors before it connects, and Xwayland would take
+the socket. When satellite exits, `psbox decorations` is stopped with it.
+
+`psbox decorations` connects to the host compositor and passes satellite's
+requests and events through, translating object ids between the two
+connections. It offers satellite only the globals satellite uses, and when
+the compositor has no `zxdg_decoration_manager_v1` (GNOME), its own. A
+window that asks for server-side decorations gets a frame from
+sctk-adwaita: subsurfaces of the window's surface on the proxy's own
+connection, drawn before each commit of the window, with the window
+geometry extended to take in the title bar. The proxy keeps the rest
+consistent: configured sizes, size limits, and `configure_bounds` leave out
+the title bar; popups are placed relative to the X11 window below it; and
+pointer, touch, tablet, and drag events over a frame do not reach
+satellite. The proxy's own seat drives the frames: its pointer moves,
+resizes, maximizes, minimizes, and shows the window menu through the
+window's `xdg_toplevel`, and the close button sends satellite the
+toplevel's `close`. sctk-adwaita runs `dbus-send` (the color scheme, once
+per proxy, and the button layout, from the settings portal, with a
+100 ms timeout), `gsettings` (the title bar font), and `fc-match` inside
+the sandbox, the last three for each new frame, and the proxy waits for
+them; without them it falls back to a light theme, the default layout, and
+its built-in font.
 
 X clients (libxcb, and Xlib through it) try the abstract socket
 `@/tmp/.X11-unix/XN` before the file and fall back to the file only when
@@ -237,4 +268,5 @@ see the host's `/run/systemd/resolve` for name lookups.
 | `sys/` | Namespaces, the mount API, Landlock, seccomp, cgroups, inotify, file descriptors |
 | `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `dbus/` | The private bus, the gateway and its connector, the portal policy, and the D-Bus wire format |
 | `devices.rs`, `x11.rs`, `desktop.rs`, `install.rs`, `systemd.rs`, `protocol.rs` | Device classes, Xwayland, desktop entries, the user manager, and the client protocol |
+| `decorations/` | `psbox decorations`: the Wayland proxy between satellite and the compositor, and the title bars it draws |
 | `fuzz.rs` | Entry points for the fuzz targets (built only for them) |

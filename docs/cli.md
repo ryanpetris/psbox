@@ -109,7 +109,7 @@ the IDs `usb:<vid>:<pid>` needs.
 one, with a mount namespace inside, in a short-lived child process), cgroup
 v2, the units, and `dbus-daemon` as required (`✗`, exit status 1 when one
 is missing), and
-`xwayland-satellite` and `pasta` as optional (`!`). `check <sandbox>` runs
+`xwayland-satellite`, `Xwayland`, and `pasta` as optional (`!`). `check <sandbox>` runs
 the [startup check](#the-startup-check) for the sandbox and each of its
 tasks without starting anything (exit status 1 when one cannot start);
 tasks with the same problems as the sandbox are named once.
@@ -153,7 +153,7 @@ status passes through. Exactly one home flag is required:
 | `--open-urls SCHEME=host\|sandbox` | Where `http`, `https`, or `mailto` links open, as the `[open-urls]` table; repeatable |
 | `--network isolated\|host\|none` | As the `network` key |
 | `--no-display` | No Wayland and no Xwayland |
-| `--xwayland` | Xwayland for X11 apps, as the `xwayland` key |
+| `--xwayland[=MODE]` | Xwayland for X11 apps, as the `xwayland` key: `builtin` (without a value) or `xwayland-satellite` |
 | `--bind SRC[:DST]` | Share `SRC` read-write at the same path or at `DST`; repeatable; a trailing `/` marks a directory |
 | `--ro-bind SRC[:DST]` | The same, read-only |
 | `--env K=V` | An environment variable; repeatable |

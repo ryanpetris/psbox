@@ -11,7 +11,7 @@
 | A systemd user session | Socket-activated supervisor units |
 | `dbus-daemon` | The private session bus (`dbus = "portal"`, the default) |
 | `pasta` (package `passt`), optional | Isolated networking; without it, sandboxes that do not set `network` use the host network |
-| `xwayland-satellite`, optional | X11 apps (`xwayland = true`) |
+| `xwayland-satellite` and `Xwayland`, optional | X11 apps (`xwayland`) |
 
 `psbox check` reports each of these.
 

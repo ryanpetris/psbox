@@ -883,7 +883,8 @@ pub fn check() -> Result<i32> {
 
     for (tool, level, needed) in [
         ("dbus-daemon", Level::Fail, "dbus = \"portal\" (the default)"),
-        ("xwayland-satellite", Level::Warn, "X11 apps (xwayland = true)"),
+        ("xwayland-satellite", Level::Warn, "X11 apps (xwayland)"),
+        ("Xwayland", Level::Warn, "X11 apps (xwayland)"),
     ] {
         items.push(match find_in_path(tool) {
             Some(p) => (Level::Ok, tool, ui::tilde(p)),
@@ -926,7 +927,7 @@ pub fn check() -> Result<i32> {
 }
 
 /// `psbox open-uri`, the link handler inside sandboxes (see
-/// [`crate::plan::OPEN_URLS_DIR`]): asks the OpenURI portal on the session
+/// [`crate::plan::PSBOX_DIR`]): asks the OpenURI portal on the session
 /// bus to open `uri` in the host's default app. The activation token the
 /// app that opened the link was given goes along, so the window that shows
 /// the link can come to the front. It waits for the portal's response: the

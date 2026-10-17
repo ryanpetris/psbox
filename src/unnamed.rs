@@ -53,9 +53,17 @@ pub struct Options {
     /// No Wayland and no Xwayland.
     #[arg(long, conflicts_with = "xwayland")]
     no_display: bool,
-    /// Serve X11 apps with a private Xwayland.
-    #[arg(long)]
-    xwayland: bool,
+    /// Serve X11 apps with a private Xwayland: `builtin` (the default), with
+    /// psbox's title bars, or `xwayland-satellite`, with satellite's.
+    #[arg(
+        long,
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "builtin",
+        value_parser = ["builtin", "xwayland-satellite"]
+    )]
+    xwayland: Option<String>,
     /// Share a host path read-write, at the same path or at DST.
     #[arg(long, value_name = "SRC[:DST]", value_hint = clap::ValueHint::AnyPath)]
     bind: Vec<String>,
@@ -127,7 +135,9 @@ impl Options {
             t.insert("devices".into(), classes.into());
         }
         t.insert("display".into(), (!self.no_display).into());
-        t.insert("xwayland".into(), self.xwayland.into());
+        if let Some(bridge) = &self.xwayland {
+            t.insert("xwayland".into(), bridge.clone().into());
+        }
 
         let mut env = toml::Table::new();
         for kv in &self.env {
@@ -182,7 +192,7 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{Dbus, Home, MountMode, Network};
+    use crate::spec::{Dbus, Home, MountMode, Network, Xwayland};
 
     fn host() -> HostEnv {
         HostEnv {
@@ -224,13 +234,13 @@ mod tests {
         assert_eq!(s.home, Home::Path("/work/client".into()));
         assert_eq!(s.device_classes().len(), 2);
         assert_eq!(s.dbus, Dbus::Host);
-        assert!(!s.display && !s.xwayland && s.network.is_none());
+        assert!(!s.display && s.xwayland == Xwayland::Off && s.network.is_none());
         let x = Options {
             home: HomeArgs {
                 home_tmpfs: true,
                 ..Default::default()
             },
-            xwayland: true,
+            xwayland: Some("builtin".into()),
             network: Some("host".into()),
             open_urls: vec!["https=sandbox".into(), "mailto=host".into()],
             ..Default::default()
@@ -251,9 +261,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(talk.dbus_talk, ["org.a.b", "org.c.d"]);
-        assert!(xs.display && xs.xwayland && xs.network == Some(Network::Host));
+        assert!(xs.display && xs.xwayland == Xwayland::Builtin && xs.network == Some(Network::Host));
         assert_eq!(s.open_urls.host_schemes(), ["http", "https", "mailto"]);
         assert_eq!(xs.open_urls.host_schemes(), ["http", "mailto"]);
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            options: Options,
+        }
+        use clap::Parser;
+        let mode = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["psbox", "--home-tmpfs"].iter().chain(args)).unwrap();
+            spec(&cli.options).unwrap().xwayland
+        };
+        assert_eq!(mode(&[]), Xwayland::Off);
+        assert_eq!(mode(&["--xwayland"]), Xwayland::Builtin);
+        assert_eq!(mode(&["--xwayland=xwayland-satellite"]), Xwayland::Satellite);
+        assert!(Cli::try_parse_from(["psbox", "--home-tmpfs", "--xwayland=satellite"]).is_err());
         for bad in [
             &["ftp=host"][..],
             &["https"],

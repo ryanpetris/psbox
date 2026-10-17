@@ -82,3 +82,29 @@ pub fn desktop_entry(data: &[u8]) {
         }
     }
 }
+
+/// Requests from xwayland-satellite, as `psbox decorations` reads them:
+/// parsed by the signatures of interfaces that between them take every
+/// argument type, and written back.
+pub fn wayland_message(data: &[u8]) {
+    use wayland_client::Proxy;
+    use wayland_client::protocol::{wl_registry, wl_shm, wl_surface};
+    use wayland_protocols::xdg::shell::client::{xdg_positioner, xdg_toplevel};
+
+    let interfaces = [
+        wl_registry::WlRegistry::interface(),
+        wl_surface::WlSurface::interface(),
+        wl_shm::WlShm::interface(),
+        xdg_positioner::XdgPositioner::interface(),
+        xdg_toplevel::XdgToplevel::interface(),
+    ];
+    let mut rest = data;
+    let mut fds = std::collections::VecDeque::new();
+    while let Ok(Some((msg, size))) = crate::decorations::wire::parse(rest, &mut fds, |sender, opcode| {
+        let iface = interfaces[sender as usize % interfaces.len()];
+        Some(iface.requests.get(usize::from(opcode))?.signature)
+    }) {
+        let _ = crate::decorations::wire::write(msg, &mut Vec::new(), &mut Vec::new());
+        rest = &rest[size..];
+    }
+}

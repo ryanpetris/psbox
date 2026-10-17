@@ -74,6 +74,24 @@ pub fn listen(root: BorrowedFd<'_>, display: u32) -> Result<OwnedFd> {
     stream_listen(&fd_path(dir.as_fd()).join(name)).with_context(|| format!("listen on {}", path.display()))
 }
 
+/// The Wayland socket xwayland-satellite connects to with `xwayland =
+/// "builtin"`, in place of the host's. It is in the X socket directory, which
+/// is always the sandbox's own tmpfs, so it never lands in a host share.
+pub fn decorations_socket(display: u32) -> PathBuf {
+    Path::new(SOCKET_DIR).join(format!("psbox-wayland-{display}"))
+}
+
+/// Creates and listens on a socket at `path` inside the sandbox, through
+/// `root`, in a directory that exists. Nothing on the way is followed if it
+/// is a symlink.
+pub fn listen_at(root: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        anyhow::bail!("{} is not a socket path", path.display());
+    };
+    let dir = open_dir_in(root, in_root(parent)).with_context(|| format!("open {}", parent.display()))?;
+    stream_listen(&fd_path(dir.as_fd()).join(name)).with_context(|| format!("listen on {}", path.display()))
+}
+
 /// The command that serves `display` on the socket passed as descriptor 3.
 pub fn satellite_argv(display: u32) -> Vec<String> {
     vec![
@@ -123,6 +141,10 @@ mod tests {
         assert_eq!(
             satellite_argv(28787),
             ["xwayland-satellite", ":28787", "-listenfd", "3", "-nolisten", "local"]
+        );
+        assert_eq!(
+            decorations_socket(28787),
+            Path::new("/tmp/.X11-unix/psbox-wayland-28787")
         );
         assert_eq!(socket(28787), Path::new("/tmp/.X11-unix/X28787"));
     }

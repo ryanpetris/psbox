@@ -36,6 +36,7 @@ the parsers that read input psbox does not control:
 | `protocol` | A request or response on a supervisor socket |
 | `dbus_message` | A D-Bus message from a sandbox client: parsed, its arguments decoded, checked against the portal policy, and encoded again |
 | `desktop_entry` | A host desktop entry, rewritten as `install` does |
+| `wayland_message` | A Wayland request from xwayland-satellite, parsed as `psbox decorations` does and written back |
 
 The targets call `psbox::fuzz`, which is compiled only with `--cfg fuzzing`
 (set by cargo-fuzz). With a nightly toolchain and `cargo-fuzz`:
@@ -105,6 +106,8 @@ Verified on Linux 7.2 with GNOME, beyond the unit tests:
 | Tasks and named instances | Work; tasks stop when done and return the exit code |
 | Desktop entries copied and inline, launched with `gio launch` | Grouped under their entries in GNOME |
 | Xwayland on demand: `glxgears`, `xdpyinfo`, GTK apps with `GDK_BACKEND=x11`, with the host network while the host's Xwayland holds `:0` and `:1` | Work on display `:28787`; no abstract sockets |
+| `xwayland = "builtin"` on headless GNOME Shell (pointer input through Mutter's RemoteDesktop API): `xev` gets an Adwaita title bar; its maximize, restore, minimize, and close buttons, a drag on the title bar, and a drag on the right edge each work, with the X11 window resized to match | Work |
+| `builtin` with VLC on Qt's X11 backend: its menu bar's menus open directly below their items; a GTK app with `GDK_BACKEND=x11` keeps its own header bar, with no frame added | Work |
 | Static builds for amd64 and arm64 (arm64 run under qemu) | Work |
 | Overlay refresh after an update task: a running instance sees the new version on a fresh overlay, while a process whose working directory is in the old overlay keeps the old files | Works |
 | `profiles/` created, removed, and created again while a sandbox runs | Reloads each time |

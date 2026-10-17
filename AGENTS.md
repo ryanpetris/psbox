@@ -113,6 +113,7 @@ is reported.
 | Kernel interfaces | `sys/` (namespaces, mount API, Landlock, seccomp, cgroups, inotify, fds, processes) |
 | D-Bus | `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `dbus/` (wire format and connections) |
 | Devices, Xwayland, desktop entries, systemd | `devices.rs`, `x11.rs`, `desktop.rs`, `install.rs`, `systemd.rs` |
+| X11 title bars (`psbox decorations`) | `decorations/` (Wayland proxy, wire format, frames) |
 | Fuzz entry points | `fuzz.rs`, `fuzz/fuzz_targets/` |
 
 Other top-level directories: `units/` (the `psbox@` user units),
@@ -152,8 +153,9 @@ toolchain unless the user explicitly approves changing that property.
 Archives, workflows, and packaging are in [docs/release.md](docs/release.md).
 
 Changes to a parser of input psbox does not control (config, client
-protocol, D-Bus messages, desktop entries) should be fuzzed: `make fuzz`
-(nightly and `cargo-fuzz`; see [docs/development.md](docs/development.md)).
+protocol, D-Bus messages, desktop entries, Wayland messages) should be
+fuzzed: `make fuzz` (nightly and `cargo-fuzz`; see
+[docs/development.md](docs/development.md)).
 A crash becomes a regression test beside the code it broke.
 
 For local testing with real sandboxes, `make dev/install` points the user
@@ -183,7 +185,8 @@ Before adding or updating a crate:
 
 If a license is missing or ambiguous, stop before accepting the dependency.
 This policy does not apply to the external programs psbox runs
-(`dbus-daemon`, `pasta`, `xwayland-satellite`). Do not vendor crates.
+(`dbus-daemon`, `pasta`, `Xwayland`, `xwayland-satellite`). Do not vendor
+crates.
 
 ## Rust design and style
 

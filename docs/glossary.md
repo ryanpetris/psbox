@@ -137,6 +137,12 @@ The default app for links inside a sandbox with a session bus, unless
 which sends the `http`, `https`, and `mailto` links `[open-urls]` does not
 keep in the sandbox to the host's default app through the OpenURI portal.
 
+## Decorations
+
+`psbox decorations`, which under `xwayland = "builtin"` sits between
+`xwayland-satellite` and the compositor and draws the title bars of X11
+windows when the compositor does not.
+
 ## App id
 
 The desktop file id a process is registered with at the host portal: the
@@ -151,7 +157,8 @@ connected.
 ## Infra
 
 The processes that serve the workload: init, the private session bus and
-the services it activates, and Xwayland, in the `infra/` cgroup.
+the services it activates, and `xwayland-satellite`, Xwayland, and
+decorations, in the `infra/` cgroup.
 
 ## Network fallback
 

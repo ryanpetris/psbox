@@ -10,6 +10,7 @@ mod cli;
 mod client;
 mod connector;
 mod dbus;
+mod decorations;
 mod desktop;
 mod devices;
 mod forker;
@@ -129,7 +130,7 @@ enum Cmd {
   psbox sandbox --home ~/work/client --bind ~/Downloads -- bash")]
     Sandbox {
         #[command(flatten)]
-        options: unnamed::Options,
+        options: Box<unnamed::Options>,
         /// Also create missing directories marked with a trailing `/`
         /// outside the sandbox root.
         #[arg(long)]
@@ -233,6 +234,14 @@ enum Cmd {
     /// (the link handler inside sandboxes).
     #[command(hide = true)]
     OpenUri { uri: String },
+    /// Pass xwayland-satellite's Wayland connection (descriptor 3) through
+    /// to the compositor, drawing title bars for its windows (`xwayland =
+    /// "builtin"`).
+    #[command(hide = true)]
+    Decorations {
+        /// The supervisor key, for log lines.
+        key: String,
+    },
     /// Run a supervisor (started by its systemd socket unit).
     #[command(hide = true)]
     Supervise {
@@ -377,6 +386,7 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
             Shell::Zsh => &clap_complete::env::Zsh,
         }),
         Cmd::OpenUri { uri } => cli::open_uri(&uri),
+        Cmd::Decorations { key } => decorations::run(&key),
         Cmd::Supervise { key } => {
             supervisor::run(&plan::Identity::from_key(&key)?)?;
             Ok(0)
