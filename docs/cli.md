@@ -154,6 +154,7 @@ status passes through. Exactly one home flag is required:
 | `--network isolated\|host\|none` | As the `network` key |
 | `--no-display` | No Wayland and no Xwayland |
 | `--xwayland[=MODE]` | Xwayland for X11 apps, as the `xwayland` key: `builtin` (without a value) or `xwayland-satellite` |
+| `--xwayland-scale MODE` | `native`, `round-up`, or `compositor`, as the `xwayland-scale` key (with `--xwayland`, which is `builtin`) |
 | `--bind SRC[:DST]` | Share `SRC` read-write at the same path or at `DST`; repeatable; a trailing `/` marks a directory |
 | `--ro-bind SRC[:DST]` | The same, read-only |
 | `--env K=V` | An environment variable; repeatable |

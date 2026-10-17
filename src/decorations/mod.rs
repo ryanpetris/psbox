@@ -14,6 +14,7 @@
 mod frame;
 mod interfaces;
 mod proxy;
+mod scale;
 pub mod wire;
 
 use std::io;
@@ -34,11 +35,12 @@ use wayland_client::globals::registry_queue_init;
 
 use self::frame::{Kit, State};
 use self::proxy::{Proxy, lock};
+use crate::spec::XwaylandScale;
 use crate::sys::fd::poll_events;
 
 /// Runs until satellite closes its connection, or the compositor's ends.
-pub fn run(key: &str) -> Result<i32> {
-    match serve(key) {
+pub fn run(key: &str, scale: XwaylandScale) -> Result<i32> {
+    match serve(key, scale) {
         Ok(()) => Ok(0),
         Err(e) => {
             eprintln!("psbox[{key}]: decorations: {e:#}");
@@ -47,7 +49,7 @@ pub fn run(key: &str) -> Result<i32> {
     }
 }
 
-fn serve(key: &str) -> Result<()> {
+fn serve(key: &str, scale: XwaylandScale) -> Result<()> {
     // SAFETY: the supervisor passes satellite's connection as descriptor 3,
     // and nothing else in this process uses it.
     let bridge = unsafe { OwnedFd::from_raw_fd(3) };
@@ -64,6 +66,21 @@ fn serve(key: &str) -> Result<()> {
     let subcompositor = Arc::new(
         SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh).context("bind wl_subcompositor")?,
     );
+    // The mode satellite is told is the logical size at a scale, which
+    // takes xdg-output.
+    let has_xdg_output = globals
+        .contents()
+        .with_list(|list| list.iter().any(|g| g.interface == "zxdg_output_manager_v1"));
+    let scale = match scale {
+        XwaylandScale::Native => scale,
+        _ if has_xdg_output => scale,
+        _ => {
+            eprintln!(
+                "psbox[{key}]: decorations: the compositor has no zxdg_output_manager_v1, which xwayland-scale = \"{scale}\" needs; X11 apps scale as with \"native\""
+            );
+            XwaylandScale::Native
+        }
+    };
     let decorate = !globals
         .contents()
         .with_list(|list| list.iter().any(|g| g.interface == "zxdg_decoration_manager_v1"));
@@ -79,7 +96,7 @@ fn serve(key: &str) -> Result<()> {
         }),
         false => None,
     };
-    let bridge = Proxy::new(conn.backend(), wire::Socket::new(bridge), decorate, kit, key);
+    let bridge = Proxy::new(conn.backend(), wire::Socket::new(bridge), decorate, kit, scale, key);
     let mut state = State {
         bridge: bridge.clone(),
         registry: RegistryState::new(&globals),
@@ -90,6 +107,11 @@ fn serve(key: &str) -> Result<()> {
         pointer: None,
         focus: None,
     };
+    // The outputs' modes and logical sizes (from xdg-output, which needs a
+    // second round trip), before the bridge's first request is read.
+    for _ in 0..2 {
+        queue.roundtrip(&mut state).context("list the compositor's outputs")?;
+    }
 
     loop {
         queue

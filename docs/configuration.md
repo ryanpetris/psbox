@@ -39,6 +39,7 @@ applications.
 | `[open-urls]` | `host` for each | `http`, `https`, `mailto`: `host` opens those links in the host's default app, `sandbox` inside the sandbox (see [Links](#links)) |
 | `display` | `true` | Wayland (and Xwayland when `xwayland` is on) |
 | `xwayland` | `off` | A private Xwayland for X11 apps: `builtin` or `xwayland-satellite` (see [Display and Xwayland](#display-and-xwayland)) |
+| `xwayland-scale` | `native` | How X11 apps meet a scaled display, with `xwayland = "builtin"`: `native`, `round-up`, or `compositor` (see [X11 apps on a scaled display](#x11-apps-on-a-scaled-display)) |
 | `network` | `isolated` | `isolated`, `host`, or `none` (see [Network](#network)) |
 | `app-id` | | App id registered with the host portal (a desktop file id) |
 | `idle-timeout` | `60` | Seconds without workload before the sandbox stops |
@@ -217,6 +218,23 @@ They follow the X11 window's wish: a window that draws its own decorations
 gets none. The title bar's light or dark style comes from the settings
 portal when satellite starts, its font from GNOME's `titlebar-font`
 setting (as the sandbox sees it).
+
+### X11 apps on a scaled display
+
+X11 apps draw in X pixels, and satellite decides how many screen pixels
+one is. `xwayland-scale` chooses, for `xwayland = "builtin"` (psbox's
+title bar proxy changes the scale satellite sees, so other `xwayland`
+values take only the default):
+
+| `xwayland-scale` | Apps draw at | On a 150% display |
+| --- | --- | --- |
+| `native` (default) | The display's real pixels, told its scale through `Xft.dpi` and, rounded down, GTK's window scale | Sharp. Apps that scale by `Xft.dpi` are the right size; apps that use only the whole-number scale (REAPER's toolkit) draw at 100% and look small, and GTK scales its text but not its graphics; apps that round 1.5 up themselves (Qt 5) look large |
+| `round-up` | The next whole scale (2 at 150%), which the compositor shrinks to the display's | Apps that scale themselves are the right size and nearly sharp, at the cost of drawing more pixels; apps that do not scale at all look smaller than with `native` |
+| `compositor` | 1, which the compositor enlarges | Every app is the right size, and blurry |
+
+At a whole-number scale, `round-up` is the same as `native`. One X server
+serves every display, so on displays at different scales X11 apps get one
+scale for all of them (the smallest, as satellite chooses it).
 
 ## Host bus names
 
@@ -397,6 +415,6 @@ anything is detached, so a missing source leaves the sandbox unchanged; a
 mount that still fails to apply marks the sandbox for a restart.
 
 Changes to `home`, `cache`, `dbus`, `dbus-talk`, `open-urls`, `xwayland`,
-`network`, or overlay mounts need a restart: nothing is applied live, the sandbox stops as soon
+`xwayland-scale`, `network`, or overlay mounts need a restart: nothing is applied live, the sandbox stops as soon
 as it is idle, and until then `psbox run` warns and `psbox status` shows the
 pending restart. A change that fails the startup check is not applied.

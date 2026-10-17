@@ -660,6 +660,7 @@ impl Supervisor {
                 format!("{}/bin/psbox", crate::plan::PSBOX_DIR),
                 "decorations".into(),
                 self.key(),
+                format!("--scale={}", self.plan().xwayland_scale),
             ],
             self.plan().env.clone(),
             PathBuf::from("/"),

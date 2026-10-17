@@ -50,6 +50,10 @@ pub fn decoration_manager() -> &'static Interface {
     zxdg_decoration_manager_v1::ZxdgDecorationManagerV1::interface()
 }
 
+pub fn xdg_output() -> &'static Interface {
+    wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::ZxdgOutputV1::interface()
+}
+
 pub fn toplevel_decoration() -> &'static Interface {
     zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1::interface()
 }

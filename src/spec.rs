@@ -47,6 +47,10 @@ pub struct Spec {
     /// psbox's title bars (`builtin`) or satellite's.
     #[serde(default)]
     pub xwayland: Xwayland,
+    /// How X11 apps are scaled on a scaled display, with
+    /// `xwayland = "builtin"`.
+    #[serde(default)]
+    pub xwayland_scale: XwaylandScale,
     /// App id registered with the host portal for this sandbox's processes
     /// (a desktop file id such as `org.gnome.Calculator`).
     pub app_id: Option<String>,
@@ -125,6 +129,46 @@ impl fmt::Display for Xwayland {
             Xwayland::Builtin => "builtin",
             Xwayland::Satellite => "xwayland-satellite",
         })
+    }
+}
+
+/// `xwayland-scale`: how X11 apps meet a scaled display. psbox's
+/// decorations proxy changes the scale xwayland-satellite sees, so it needs
+/// `xwayland = "builtin"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XwaylandScale {
+    /// Apps draw at the display's real pixels, told its scale, and scale
+    /// themselves.
+    #[default]
+    Native,
+    /// Apps are told the next whole scale and draw at it; the compositor
+    /// shrinks the result to the display's scale.
+    RoundUp,
+    /// Apps draw unscaled; the compositor enlarges the result.
+    Compositor,
+}
+
+impl fmt::Display for XwaylandScale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            XwaylandScale::Native => "native",
+            XwaylandScale::RoundUp => "round-up",
+            XwaylandScale::Compositor => "compositor",
+        })
+    }
+}
+
+impl FromStr for XwaylandScale {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "native" => Ok(XwaylandScale::Native),
+            "round-up" => Ok(XwaylandScale::RoundUp),
+            "compositor" => Ok(XwaylandScale::Compositor),
+            _ => bail!("expected native, round-up, or compositor"),
+        }
     }
 }
 
@@ -635,6 +679,7 @@ impl Spec {
         }
         spec.display = false;
         spec.xwayland = Xwayland::Off;
+        spec.xwayland_scale = XwaylandScale::Native;
         spec.env.extend(t.env.clone());
         spec.command = BTreeMap::from([(
             task.to_string(),
@@ -702,6 +747,14 @@ impl Spec {
         }
         if let Some(id) = &self.app_id {
             check("app-id".into(), validate_app_id(id));
+        }
+        if self.xwayland_scale != XwaylandScale::Native && self.xwayland != Xwayland::Builtin {
+            check(
+                "xwayland-scale".into(),
+                Err(anyhow!(
+                    "needs xwayland = \"builtin\", whose title bar proxy does the scaling"
+                )),
+            );
         }
         if !self.dbus_talk.is_empty() && self.dbus != Dbus::Portal {
             check(
@@ -1072,6 +1125,23 @@ mod tests {
             let parsed = Spec::parse(&format!("xwayland = \"{value}\"")).unwrap().xwayland;
             assert_eq!((parsed, parsed.to_string()), (x, value.to_string()));
         }
+        for (value, scale) in [
+            ("native", XwaylandScale::Native),
+            ("round-up", XwaylandScale::RoundUp),
+            ("compositor", XwaylandScale::Compositor),
+        ] {
+            let parsed = Spec::parse(&format!("xwayland = \"builtin\"\nxwayland-scale = \"{value}\""))
+                .unwrap()
+                .xwayland_scale;
+            assert_eq!((parsed, parsed.to_string()), (scale, value.to_string()));
+            assert_eq!(value.parse::<XwaylandScale>().unwrap(), scale);
+        }
+        // Only the decorations proxy can change the scale satellite sees.
+        for xwayland in ["off", "xwayland-satellite"] {
+            let text = format!("xwayland = \"{xwayland}\"\nxwayland-scale = \"round-up\"");
+            assert!(Spec::parse(&text).is_err(), "{xwayland}");
+        }
+        Spec::parse("xwayland = \"xwayland-satellite\"\nxwayland-scale = \"native\"").unwrap();
         assert!(Spec::parse("xwayland = true").is_err());
         assert!(Spec::parse("xwayland = \"satellite\"").is_err());
         assert_eq!(

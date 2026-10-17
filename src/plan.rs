@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::bus::BusPaths;
-use crate::spec::{Cache, Dbus, DeviceClass, Home, MountMode, Network, Spec, Tokens, Xwayland};
+use crate::spec::{Cache, Dbus, DeviceClass, Home, MountMode, Network, Spec, Tokens, Xwayland, XwaylandScale};
 
 /// Host facts the plan depends on.
 #[derive(Debug, Clone)]
@@ -410,6 +410,8 @@ pub struct Plan {
     pub dbus_talk: Vec<String>,
     /// How X11 clients are served; `off` without a Wayland socket.
     pub xwayland: Xwayland,
+    /// How X11 apps meet a scaled display, with `xwayland = "builtin"`.
+    pub xwayland_scale: XwaylandScale,
     /// The schemes whose links open in the host's default app: those
     /// `open-urls` sends to the host, with a session bus.
     pub open_urls: Vec<String>,
@@ -746,6 +748,9 @@ pub fn diff(old: &Plan, new: &Plan) -> Change {
     }
     if old.xwayland != new.xwayland {
         c.restart.push("xwayland".into());
+    }
+    if old.xwayland_scale != new.xwayland_scale && old.xwayland == new.xwayland {
+        c.restart.push("xwayland-scale".into());
     }
     if old.network != new.network {
         c.restart.push("network".into());
@@ -1217,6 +1222,10 @@ impl Plan {
             },
             bus,
             xwayland,
+            xwayland_scale: match xwayland {
+                Xwayland::Builtin => spec.xwayland_scale,
+                _ => XwaylandScale::Native,
+            },
             open_urls,
             network,
             network_fallback,
@@ -1808,6 +1817,9 @@ mod tests {
         let off = build("dbus = \"off\"");
         assert!(!bin(&off) && !x11(&off));
         assert_eq!(diff(&builtin, &satellite).restart, ["xwayland"]);
+        let round_up = build("dbus = \"off\"\nxwayland = \"builtin\"\nxwayland-scale = \"round-up\"");
+        assert_eq!(round_up.xwayland_scale, XwaylandScale::RoundUp);
+        assert_eq!(diff(&builtin, &round_up).restart, ["xwayland-scale"]);
     }
 
     #[test]

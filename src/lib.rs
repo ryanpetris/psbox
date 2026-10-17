@@ -241,6 +241,9 @@ enum Cmd {
     Decorations {
         /// The supervisor key, for log lines.
         key: String,
+        /// How satellite's X11 apps meet a scaled display.
+        #[arg(long)]
+        scale: spec::XwaylandScale,
     },
     /// Run a supervisor (started by its systemd socket unit).
     #[command(hide = true)]
@@ -386,7 +389,7 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
             Shell::Zsh => &clap_complete::env::Zsh,
         }),
         Cmd::OpenUri { uri } => cli::open_uri(&uri),
-        Cmd::Decorations { key } => decorations::run(&key),
+        Cmd::Decorations { key, scale } => decorations::run(&key, scale),
         Cmd::Supervise { key } => {
             supervisor::run(&plan::Identity::from_key(&key)?)?;
             Ok(0)

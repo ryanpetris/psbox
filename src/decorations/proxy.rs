@@ -19,10 +19,13 @@ use wayland_backend::protocol::{AllowNull, Argument, ArgumentType, Interface, Me
 use wayland_backend::smallvec::SmallVec;
 use wayland_client::Proxy as _;
 use wayland_client::protocol::wl_display::WlDisplay;
+use wayland_client::protocol::wl_output::WlOutput;
 
 use super::frame::{Frame, Kit};
 use super::interfaces;
+use super::scale::{self, OutputGeometry};
 use super::wire::{self, Arg, Message, SERVER_ID_START};
+use crate::spec::XwaylandScale;
 
 /// The bridge's `wl_display`.
 const DISPLAY: u32 = 1;
@@ -74,8 +77,10 @@ enum Role {
     Viewport {
         surface: u32,
     },
-    Output {
-        scale: i32,
+    Output(Output),
+    /// A `zxdg_output_v1`, for this `wl_output`.
+    XdgOutput {
+        output: u32,
     },
     XdgSurface {
         surface: u32,
@@ -96,6 +101,24 @@ enum Role {
     Registry {
         globals: HashMap<u32, (&'static Interface, u32)>,
     },
+}
+
+/// What the compositor said about a `wl_output` of the bridge's, for the
+/// mode the bridge is told (see [`super::scale`]).
+#[derive(Default)]
+struct Output {
+    /// The output's global name.
+    global: u32,
+    /// The compositor's `wl_output.scale` (from version 2).
+    scale: Option<i32>,
+    /// Turned a quarter, from `wl_output.geometry`.
+    rotated: bool,
+    /// From the bridge's `zxdg_output_v1` for it.
+    logical: Option<(i32, i32)>,
+    /// The current mode (flags, size, refresh), held until `done`.
+    mode: Option<(u32, (i32, i32), i32)>,
+    /// The mode the bridge was last told.
+    told: Option<(u32, (i32, i32), i32)>,
 }
 
 /// A `wl_surface`'s size state, double-buffered as the protocol has it.
@@ -183,7 +206,7 @@ impl Role {
                 scale: 1,
                 ..Default::default()
             }),
-            "wl_output" => Role::Output { scale: 1 },
+            "wl_output" => Role::Output(Output::default()),
             "zwp_linux_buffer_params_v1" => Role::BufferParams { size: None },
             "xdg_positioner" => Role::Positioner {
                 anchor: None,
@@ -209,6 +232,10 @@ pub struct Proxy {
     pub frames: HashMap<u32, Frame>,
     /// What frames are made with, when the proxy draws them.
     kit: Option<Kit>,
+    /// The scale the bridge is told, and the outputs it is worked out from,
+    /// by global name.
+    scale: XwaylandScale,
+    outputs: HashMap<u32, OutputGeometry>,
     /// An error from forwarding an event, which ends the proxy.
     pub failed: Option<anyhow::Error>,
     key: String,
@@ -280,6 +307,7 @@ impl Proxy {
         bridge: wire::Socket,
         decorate: bool,
         kit: Option<Kit>,
+        scale: XwaylandScale,
         key: &str,
     ) -> Arc<Mutex<Proxy>> {
         Arc::new_cyclic(|this| {
@@ -300,6 +328,8 @@ impl Proxy {
                 decorate,
                 frames: HashMap::new(),
                 kit,
+                scale,
+                outputs: HashMap::new(),
                 failed: None,
                 key: key.into(),
                 this: this.clone(),
@@ -510,7 +540,10 @@ impl Proxy {
                 iface: global,
                 version,
                 kind: Kind::Upstream(up),
-                role: Role::for_interface(global.name),
+                role: match Role::for_interface(global.name) {
+                    Role::Output(output) => Role::Output(Output { global: name, ..output }),
+                    role => role,
+                },
             },
         );
         Ok(())
@@ -736,6 +769,7 @@ impl Proxy {
             ("zwp_linux_buffer_params_v1", "create_immed") => After::Buffer(int(args, 1), int(args, 2)),
             ("wp_viewporter", "get_viewport") => After::Viewport(uint(args, 1)),
             ("xdg_wm_base", "get_xdg_surface") => After::XdgSurface(uint(args, 1)),
+            ("zxdg_output_manager_v1", "get_xdg_output") => After::XdgOutput(uint(args, 1)),
             ("xdg_surface", "get_toplevel") => After::Toplevel,
             ("xdg_surface", "get_popup") => After::Popup {
                 parent: uint(args, 1),
@@ -759,6 +793,7 @@ impl Proxy {
             }
             After::Buffer(width, height) => Role::Buffer { width, height },
             After::Viewport(surface) => Role::Viewport { surface },
+            After::XdgOutput(output) => Role::XdgOutput { output },
             After::XdgSurface(surface) => Role::XdgSurface {
                 surface,
                 toplevel: None,
@@ -1019,21 +1054,69 @@ impl Proxy {
                 args[1] = Argument::Int(int(args, 1).saturating_sub(self.header(parent)));
             }
             ("wl_surface", "enter" | "leave" | "preferred_buffer_scale") => {
-                let value = uint(args, 0);
+                let (output, preferred) = (uint(args, 0), int(args, 0));
                 if let Some(Role::Surface(s)) = self.role_mut(bridge) {
                     match event {
-                        "enter" => s.outputs.push(value),
-                        "leave" => s.outputs.retain(|o| *o != value),
-                        _ => s.preferred_scale = Some(value as i32),
+                        "enter" => s.outputs.push(output),
+                        "leave" => s.outputs.retain(|o| *o != output),
+                        _ => s.preferred_scale = Some(preferred.max(1)),
                     }
                 }
                 self.rescale(|surface| surface == bridge);
+                if event == "preferred_buffer_scale" {
+                    args[0] = Argument::Int(scale::whole(self.scale, int(args, 0)));
+                }
+            }
+            ("wp_fractional_scale_v1", "preferred_scale") => {
+                args[0] = Argument::Uint(scale::preferred(self.scale, uint(args, 0)));
+            }
+            ("wl_output", "geometry") => {
+                // 90 and 270 degrees, flipped or not.
+                let rotated = matches!(int(args, 7), 1 | 3 | 5 | 7);
+                if let Some(Role::Output(o)) = self.role_mut(bridge) {
+                    o.rotated = rotated;
+                }
+            }
+            ("wl_output", "mode") if self.scale != XwaylandScale::Native => {
+                let (flags, size, refresh) = (uint(args, 0), (int(args, 1), int(args, 2)), int(args, 3));
+                // Only the current mode sizes the X screen. It is told at
+                // `done`, when the scale and logical size that go with it
+                // have arrived too (`done` is in version 2 and later).
+                if flags & 1 != 0 {
+                    let version = self.objects.get(&bridge).map_or(1, |o| o.version);
+                    if let Some(Role::Output(o)) = self.role_mut(bridge) {
+                        o.mode = Some((flags, size, refresh));
+                    }
+                    if version >= 2 {
+                        return false;
+                    }
+                    let told = self.told_mode(bridge).unwrap_or(size);
+                    args[1] = Argument::Int(told.0);
+                    args[2] = Argument::Int(told.1);
+                }
+            }
+            ("wl_output", "done") if self.scale != XwaylandScale::Native => self.tell_mode(bridge, false),
+            // Below version 3, a logical size change ends with the
+            // xdg-output's own `done` instead of the output's.
+            ("zxdg_output_v1", "done") if self.scale != XwaylandScale::Native => {
+                if let Some(&Role::XdgOutput { output }) = self.objects.get(&bridge).map(|o| &o.role) {
+                    self.tell_mode(output, true);
+                }
+            }
+            ("zxdg_output_v1", "logical_size") => {
+                let size = (int(args, 0), int(args, 1));
+                if let Some(&Role::XdgOutput { output }) = self.objects.get(&bridge).map(|o| &o.role)
+                    && let Some(Role::Output(o)) = self.role_mut(output)
+                {
+                    o.logical = Some(size);
+                }
             }
             ("wl_output", "scale") => {
                 let scale = int(args, 0);
-                if let Some(Role::Output { scale: s }) = self.role_mut(bridge) {
-                    *s = scale.max(1);
+                if let Some(Role::Output(o)) = self.role_mut(bridge) {
+                    o.scale = Some(scale.max(1));
                 }
+                args[0] = Argument::Int(scale::whole(self.scale, scale));
                 let outputs: Vec<u32> = self
                     .objects
                     .iter()
@@ -1096,7 +1179,7 @@ impl Proxy {
             s.outputs
                 .iter()
                 .filter_map(|o| match self.objects.get(o)?.role {
-                    Role::Output { scale } => Some(scale),
+                    Role::Output(ref o) => Some(o.scale.unwrap_or(1)),
                     _ => None,
                 })
                 .max()
@@ -1215,6 +1298,81 @@ impl Proxy {
         }
     }
 
+    /// Takes what the proxy's own connection knows about an output: the
+    /// logical size until the bridge's own `zxdg_output_v1` reports it.
+    pub fn set_output(&mut self, global: u32, geometry: Option<OutputGeometry>) {
+        match geometry {
+            Some(g) => self.outputs.insert(global, g),
+            None => self.outputs.remove(&global),
+        };
+    }
+
+    /// The mode the bridge should be told for one of its outputs, once the
+    /// compositor has given its current mode.
+    fn told_mode(&self, output: u32) -> Option<(i32, i32)> {
+        let Some(Role::Output(o)) = self.objects.get(&output).map(|o| &o.role) else {
+            return None;
+        };
+        let (_, size, _) = o.mode?;
+        let fallback = self.outputs.get(&o.global);
+        let logical = o.logical.or(fallback.map(|g| g.logical));
+        let rotated = match (o.logical, fallback) {
+            (None, Some(g)) => g.rotated,
+            _ => o.rotated,
+        };
+        Some(scale::mode(self.scale, size, logical, rotated, o.scale))
+    }
+
+    /// At an output's `done`: tells the bridge its current mode when that
+    /// is new or changed, with a `logical_size` on each of its
+    /// `zxdg_output_v1`s for the output, which is what satellite passes on
+    /// to Xwayland, sized from the mode it was told.
+    /// With `done`, the change ends there too, with the output's `done`.
+    fn tell_mode(&mut self, output: u32, done: bool) {
+        let Some(told) = self.told_mode(output) else {
+            return;
+        };
+        let Some(Role::Output(o)) = self.role_mut(output) else {
+            return;
+        };
+        let Some((flags, _, refresh)) = o.mode else {
+            return;
+        };
+        let changed = o.told != Some((flags, told, refresh));
+        o.told = Some((flags, told, refresh));
+        let rotated = o.rotated;
+        if !changed {
+            return;
+        }
+        let version = self.objects.get(&output).map_or(1, |o| o.version);
+        let events = WlOutput::interface().events;
+        let mode = vec![
+            Argument::Uint(flags),
+            Argument::Int(told.0),
+            Argument::Int(told.1),
+            Argument::Int(refresh),
+        ];
+        self.send(output, opcode(events, "mode"), mode);
+        let xdg: Vec<(u32, u32)> = self
+            .objects
+            .iter()
+            .filter(|(_, x)| matches!(x.role, Role::XdgOutput { output: of } if of == output))
+            .map(|(id, x)| (*id, x.version))
+            .collect();
+        let logical = if rotated { (told.1, told.0) } else { told };
+        for (id, version) in xdg {
+            let events = interfaces::xdg_output().events;
+            let size = vec![Argument::Int(logical.0), Argument::Int(logical.1)];
+            self.send(id, opcode(events, "logical_size"), size);
+            if version < 3 {
+                self.send(id, opcode(events, "done"), Vec::new());
+            }
+        }
+        if done && version >= 2 {
+            self.send(output, opcode(events, "done"), Vec::new());
+        }
+    }
+
     /// Carries out what a click on a title bar asks for.
     pub fn frame_action(
         &mut self,
@@ -1244,6 +1402,7 @@ enum After {
     Nothing,
     Buffer(i32, i32),
     Viewport(u32),
+    XdgOutput(u32),
     XdgSurface(u32),
     Toplevel,
     Popup { parent: u32, positioner: u32, offset: i32 },
@@ -1278,11 +1437,22 @@ mod tests {
 
     impl Harness {
         fn new() -> Harness {
+            Harness::scaled(XwaylandScale::Native)
+        }
+
+        fn scaled(scale: XwaylandScale) -> Harness {
             let (client, compositor) = UnixStream::pair().unwrap();
             let backend = Backend::connect(client).unwrap();
             let (ours, bridge) = UnixStream::pair().unwrap();
             bridge.set_nonblocking(true).unwrap();
-            let proxy = Proxy::new(backend.clone(), wire::Socket::new(ours.into()), true, None, "test");
+            let proxy = Proxy::new(
+                backend.clone(),
+                wire::Socket::new(ours.into()),
+                true,
+                None,
+                scale,
+                "test",
+            );
             Harness {
                 proxy,
                 backend,
@@ -1456,6 +1626,267 @@ mod tests {
         assert!(h.request(4, attach, attach_args(5)).is_err());
         // A decoration for something that is not a toplevel.
         assert!(h.request(5, 1, vec![Argument::NewId(6), Argument::Object(4)]).is_err());
+    }
+
+    fn registry() -> &'static Interface {
+        wayland_client::protocol::wl_registry::WlRegistry::interface()
+    }
+
+    fn ints(m: &Message) -> Vec<i32> {
+        m.args
+            .iter()
+            .filter_map(|a| match a {
+                Argument::Int(v) => Some(*v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A bridge bound to the compositor's 150% output (global 5) as object
+    /// 3, at `version`, with the logical size known to the proxy's own
+    /// connection.
+    fn panel(scale: XwaylandScale, version: u32) -> Harness {
+        let h = Harness::scaled(scale);
+        let logical = OutputGeometry {
+            logical: (1920, 1280),
+            rotated: false,
+        };
+        lock(&h.proxy).set_output(5, Some(logical));
+        bind_panel(h, version)
+    }
+
+    fn bind_panel(mut h: Harness, version: u32) -> Harness {
+        h.request(DISPLAY, 1, vec![Argument::NewId(2)]).unwrap();
+        h.event(2, 0, vec![Argument::Uint(5), string("wl_output"), Argument::Uint(4)]);
+        let bind = vec![
+            Argument::Uint(5),
+            string("wl_output"),
+            Argument::Uint(version),
+            Argument::NewId(3),
+        ];
+        h.request(2, 0, bind).unwrap();
+        h
+    }
+
+    /// The compositor's description of the panel: geometry, current mode,
+    /// scale, and (from version 2) done.
+    fn describe_panel(h: &mut Harness, done: bool) {
+        let geometry = vec![
+            Argument::Int(0),
+            Argument::Int(0),
+            Argument::Int(300),
+            Argument::Int(200),
+            Argument::Int(0),
+            string("m"),
+            string("m"),
+            Argument::Int(0),
+        ];
+        h.event(3, 0, geometry);
+        let mode = vec![
+            Argument::Uint(1),
+            Argument::Int(2880),
+            Argument::Int(1920),
+            Argument::Int(60000),
+        ];
+        h.event(3, 1, mode);
+        h.event(3, 3, vec![Argument::Int(2)]);
+        if done {
+            h.event(3, 2, vec![]);
+        }
+    }
+
+    #[test]
+    fn round_up_tells_the_bridge_a_larger_screen() {
+        let mut h = panel(XwaylandScale::RoundUp, 4);
+        describe_panel(&mut h, true);
+        let output = WlOutput::interface();
+        let xdg = interfaces::xdg_output();
+        let told: Vec<(u32, u16, Vec<i32>)> = h
+            .bridge_events(&[(2, registry()), (3, output)])
+            .iter()
+            .filter(|m| m.sender == 3 && m.opcode != 0)
+            .map(|m| (m.sender, m.opcode, ints(m)))
+            .collect();
+        // The scale as it is, then at done the mode at that scale.
+        assert_eq!(told, [(3, 3, vec![2]), (3, 1, vec![3840, 2560, 60000]), (3, 2, vec![])]);
+
+        // The bridge's own xdg-output for the panel reports 200%: the bridge
+        // gets the mode that follows, and a logical size for satellite to
+        // pass on, before done.
+        h.event(
+            2,
+            0,
+            vec![Argument::Uint(6), string("zxdg_output_manager_v1"), Argument::Uint(3)],
+        );
+        let bind = vec![
+            Argument::Uint(6),
+            string("zxdg_output_manager_v1"),
+            Argument::Uint(3),
+            Argument::NewId(4),
+        ];
+        h.request(2, 0, bind).unwrap();
+        h.request(4, 1, vec![Argument::NewId(5), Argument::Object(3)]).unwrap();
+        h.event(5, 1, vec![Argument::Int(1440), Argument::Int(960)]);
+        h.event(3, 2, vec![]);
+        let told: Vec<(u32, u16, Vec<i32>)> = h
+            .bridge_events(&[(2, registry()), (3, output), (5, xdg)])
+            .iter()
+            .filter(|m| m.sender != 2)
+            .map(|m| (m.sender, m.opcode, ints(m)))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (5, 1, vec![1440, 960]),
+                (3, 1, vec![2880, 1920, 60000]),
+                (5, 1, vec![2880, 1920]),
+                (3, 2, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn round_up_follows_refresh_and_old_xdg_outputs() {
+        let mut h = panel(XwaylandScale::RoundUp, 4);
+        describe_panel(&mut h, true);
+        let output = WlOutput::interface();
+        let xdg = interfaces::xdg_output();
+        h.bridge_events(&[(2, registry()), (3, output)]);
+
+        // A new refresh rate at the same size.
+        let mode = vec![
+            Argument::Uint(1),
+            Argument::Int(2880),
+            Argument::Int(1920),
+            Argument::Int(120000),
+        ];
+        h.event(3, 1, mode);
+        h.event(3, 2, vec![]);
+        let told: Vec<(u16, Vec<i32>)> = h
+            .bridge_events(&[(2, registry()), (3, output)])
+            .iter()
+            .filter(|m| m.sender == 3)
+            .map(|m| (m.opcode, ints(m)))
+            .collect();
+        assert_eq!(told, [(1, vec![3840, 2560, 120000]), (2, vec![])]);
+
+        // An xdg-output below version 3 ends a logical size change with its
+        // own done.
+        h.event(
+            2,
+            0,
+            vec![Argument::Uint(6), string("zxdg_output_manager_v1"), Argument::Uint(2)],
+        );
+        let bind = vec![
+            Argument::Uint(6),
+            string("zxdg_output_manager_v1"),
+            Argument::Uint(2),
+            Argument::NewId(4),
+        ];
+        h.request(2, 0, bind).unwrap();
+        h.request(4, 1, vec![Argument::NewId(5), Argument::Object(3)]).unwrap();
+        h.event(5, 1, vec![Argument::Int(1440), Argument::Int(960)]);
+        h.event(5, 2, vec![]);
+        let told: Vec<(u32, u16, Vec<i32>)> = h
+            .bridge_events(&[(2, registry()), (3, output), (5, xdg)])
+            .iter()
+            .filter(|m| m.sender != 2)
+            .map(|m| (m.sender, m.opcode, ints(m)))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (5, 1, vec![1440, 960]),
+                (3, 1, vec![2880, 1920, 120000]),
+                (5, 1, vec![2880, 1920]),
+                (5, 2, vec![]),
+                (3, 2, vec![]),
+                (5, 2, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_output_is_corrected_once_its_logical_size_arrives() {
+        // An output the proxy's own connection has not described yet.
+        let mut h = bind_panel(Harness::scaled(XwaylandScale::RoundUp), 4);
+        describe_panel(&mut h, true);
+        let output = WlOutput::interface();
+        let modes = |h: &mut Harness| -> Vec<Vec<i32>> {
+            h.bridge_events(&[(2, registry()), (3, output), (5, interfaces::xdg_output())])
+                .iter()
+                .filter(|m| m.sender == 3 && m.opcode == 1)
+                .map(ints)
+                .collect()
+        };
+        assert_eq!(modes(&mut h), [vec![2880, 1920, 60000]]);
+        h.event(
+            2,
+            0,
+            vec![Argument::Uint(6), string("zxdg_output_manager_v1"), Argument::Uint(3)],
+        );
+        let bind = vec![
+            Argument::Uint(6),
+            string("zxdg_output_manager_v1"),
+            Argument::Uint(3),
+            Argument::NewId(4),
+        ];
+        h.request(2, 0, bind).unwrap();
+        h.request(4, 1, vec![Argument::NewId(5), Argument::Object(3)]).unwrap();
+        h.event(5, 1, vec![Argument::Int(1920), Argument::Int(1280)]);
+        h.event(3, 2, vec![]);
+        assert_eq!(modes(&mut h), [vec![3840, 2560, 60000]]);
+    }
+
+    #[test]
+    fn compositor_scaling_tells_the_bridge_scale_1() {
+        let mut h = panel(XwaylandScale::Compositor, 4);
+        describe_panel(&mut h, true);
+        let told: Vec<(u16, Vec<i32>)> = h
+            .bridge_events(&[(2, registry()), (3, WlOutput::interface())])
+            .iter()
+            .filter(|m| m.sender == 3 && m.opcode != 0)
+            .map(|m| (m.opcode, ints(m)))
+            .collect();
+        assert_eq!(told, [(3, vec![1]), (1, vec![1920, 1280, 60000]), (2, vec![])]);
+
+        // A surface's preferred scale too, while title bars keep the real one.
+        h.event(
+            2,
+            0,
+            vec![Argument::Uint(7), string("wl_compositor"), Argument::Uint(6)],
+        );
+        let bind = vec![
+            Argument::Uint(7),
+            string("wl_compositor"),
+            Argument::Uint(6),
+            Argument::NewId(6),
+        ];
+        h.request(2, 0, bind).unwrap();
+        h.request(6, 0, vec![Argument::NewId(7)]).unwrap();
+        h.event(5, 2, vec![Argument::Int(2)]);
+        let surface = wl_surface::WlSurface::interface();
+        let told: Vec<(u16, Vec<i32>)> = h
+            .bridge_events(&[(2, registry()), (7, surface)])
+            .iter()
+            .filter(|m| m.sender == 7)
+            .map(|m| (m.opcode, ints(m)))
+            .collect();
+        assert_eq!(told, [(2, vec![1])]);
+        assert_eq!(lock(&h.proxy).surface_scale(7), 2);
+    }
+
+    #[test]
+    fn version_1_outputs_are_told_at_once() {
+        let mut h = panel(XwaylandScale::RoundUp, 1);
+        describe_panel(&mut h, false);
+        let modes: Vec<Vec<i32>> = h
+            .bridge_events(&[(2, registry()), (3, WlOutput::interface())])
+            .iter()
+            .filter(|m| m.sender == 3 && m.opcode == 1)
+            .map(ints)
+            .collect();
+        assert_eq!(modes, [vec![3840, 2560, 60000]]);
     }
 
     #[test]

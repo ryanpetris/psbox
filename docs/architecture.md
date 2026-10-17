@@ -234,6 +234,25 @@ the sandbox, the last three for each new frame, and the proxy waits for
 them; without them it falls back to a light theme, the default layout, and
 its built-in font.
 
+For `xwayland-scale`, the proxy rewrites the scale satellite sees, per
+output. Satellite sizes the X screen from an output's current mode and
+works at `wl_output.scale`, overridden by a window's
+`wp_fractional_scale_v1.preferred_scale`. With `round-up`, the preferred
+scale is rounded up to a whole one and the mode becomes the output's
+logical size times that scale (2880x1920 at 150% becomes 3840x2560); with
+`compositor`, both scales become 1 (and `wl_surface.preferred_buffer_scale`
+too) and the mode becomes the logical size. The whole scale is the
+compositor's `wl_output.scale`, and a mode that already is the logical size
+times it stays as it is. The proxy holds the current mode until the
+output's `done` (or, below xdg-output version 3, the end of a logical size
+change), so it goes out with the scale and logical size of the same change,
+and with it a `zxdg_output_v1.logical_size`, which is what satellite passes
+on to Xwayland. The logical size is the one satellite's own
+`zxdg_output_v1` reports, and until it has one, the one the proxy's own
+connection reports (read before satellite's first request, and kept up to
+date). A compositor without `zxdg_output_manager_v1` gets `native`, with a
+line in the log. Title bars are drawn at the real scale.
+
 X clients (libxcb, and Xlib through it) try the abstract socket
 `@/tmp/.X11-unix/XN` before the file and fall back to the file only when
 that name does not exist. With `network = "host"` the sandbox shares the

@@ -64,6 +64,10 @@ pub struct Options {
         value_parser = ["builtin", "xwayland-satellite"]
     )]
     xwayland: Option<String>,
+    /// How X11 apps meet a scaled display, with `--xwayland`: `native` (the
+    /// default), `round-up`, or `compositor`.
+    #[arg(long, value_name = "MODE", value_parser = ["native", "round-up", "compositor"])]
+    xwayland_scale: Option<String>,
     /// Share a host path read-write, at the same path or at DST.
     #[arg(long, value_name = "SRC[:DST]", value_hint = clap::ValueHint::AnyPath)]
     bind: Vec<String>,
@@ -135,8 +139,10 @@ impl Options {
             t.insert("devices".into(), classes.into());
         }
         t.insert("display".into(), (!self.no_display).into());
-        if let Some(bridge) = &self.xwayland {
-            t.insert("xwayland".into(), bridge.clone().into());
+        for (key, value) in [("xwayland", &self.xwayland), ("xwayland-scale", &self.xwayland_scale)] {
+            if let Some(v) = value {
+                t.insert(key.into(), v.clone().into());
+            }
         }
 
         let mut env = toml::Table::new();
@@ -192,7 +198,7 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{Dbus, Home, MountMode, Network, Xwayland};
+    use crate::spec::{Dbus, Home, MountMode, Network, Xwayland, XwaylandScale};
 
     fn host() -> HostEnv {
         HostEnv {
@@ -278,6 +284,15 @@ mod tests {
         assert_eq!(mode(&["--xwayland"]), Xwayland::Builtin);
         assert_eq!(mode(&["--xwayland=xwayland-satellite"]), Xwayland::Satellite);
         assert!(Cli::try_parse_from(["psbox", "--home-tmpfs", "--xwayland=satellite"]).is_err());
+        let scale = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["psbox", "--home-tmpfs"].iter().chain(args)).unwrap();
+            spec(&cli.options).map(|s| s.xwayland_scale)
+        };
+        assert_eq!(
+            scale(&["--xwayland", "--xwayland-scale", "round-up"]).unwrap(),
+            XwaylandScale::RoundUp
+        );
+        assert!(scale(&["--xwayland=xwayland-satellite", "--xwayland-scale", "compositor"]).is_err());
         for bad in [
             &["ftp=host"][..],
             &["https"],

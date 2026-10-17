@@ -28,6 +28,7 @@ use wayland_client::{Connection, Proxy, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel};
 
 use super::proxy::{Proxy as Bridge, lock};
+use super::scale::OutputGeometry;
 
 /// What every frame is made with.
 pub struct Kit {
@@ -411,11 +412,38 @@ impl OutputHandler for State {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.take_output(&output);
+    }
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.take_output(&output);
+    }
 
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        if let Some(info) = self.output_state.info(&output) {
+            lock(&self.bridge).set_output(info.id, None);
+        }
+    }
+}
+
+impl State {
+    /// Passes an output's logical size on to the proxy, for the scale the
+    /// bridge is told.
+    fn take_output(&mut self, output: &wl_output::WlOutput) {
+        let Some(info) = self.output_state.info(output) else {
+            return;
+        };
+        use wl_output::Transform;
+        let geometry = info.logical_size.map(|logical| OutputGeometry {
+            logical,
+            rotated: matches!(
+                info.transform,
+                Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+            ),
+        });
+        lock(&self.bridge).set_output(info.id, geometry);
+    }
 }
 
 impl ShmHandler for State {
