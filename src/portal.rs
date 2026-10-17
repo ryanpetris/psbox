@@ -17,6 +17,7 @@ pub const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 pub const NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
 pub const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 pub const REGISTRY_IFACE: &str = "org.freedesktop.host.portal.Registry";
+pub const OPEN_URI_IFACE: &str = "org.freedesktop.portal.OpenURI";
 
 /// Names the gateway owns on the sandbox bus.
 pub const GATEWAY_NAMES: [&str; 2] = [PORTAL_NAME, NOTIFICATIONS_NAME];

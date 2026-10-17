@@ -1,6 +1,6 @@
-# A browser. The built-in profile adds the camera, security keys, and a
-# shared ~/Downloads/; the host network lets it cast and reach services on
-# localhost.
+# A browser. The built-in profile adds the camera, security keys, a shared
+# ~/Downloads/, and keeps web links in the browser; the host network lets
+# it cast and reach services on localhost.
 extends = ["browser"]
 network = "host"
 

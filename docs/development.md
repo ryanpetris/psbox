@@ -115,6 +115,10 @@ Verified on Linux 7.2 with GNOME, beyond the unit tests:
 | The connector's `mountinfo` and `net/tcp` from inside the sandbox | The sandbox's own |
 | Signals that dump core (`SIGQUIT`, `SIGSEGV`) sent to the connector from inside the sandbox | Ignored; core limit at most one byte |
 | The connector killed with `SIGKILL`, or stopped with `SIGSTOP`, from inside the sandbox | Reaped, and replaced on the next call (after five seconds when stopped) |
+| Links from a sandbox with the default `[open-urls]`: `gio mime` and `xdg-mime` (GNOME and no desktop) report the sandbox's handler, and `xdg-open https://...` opens the link in the default browser's sandbox through `psbox run`, with the caller's activation token in the portal call; a `file://` link refused | Works |
+| Links with `https` kept in the sandbox (`--open-urls https=sandbox`): the host's browser entry stays the `https` default; `mailto` still goes to the sandbox's handler | Works |
+| An OpenURI request that shows the app chooser (`ask`), from a `gdbus call` that exits right away | The request stays open on the host until answered or the sandbox stops |
+| `psbox open-uri` with `dbus = "portal"` and `dbus = "host"`: waits for the portal's `Response`, exit status 0 when the link opened and 1 otherwise | Works |
 | Portal methods from inside a sandbox: `Settings.ReadOne`, `OpenURI.SchemeSupported`, `NetworkMonitor.GetConnectivity`, a property read; an unlisted `Settings.Write` | Forwarded; the unlisted method refused and logged |
 | `psbox check` on Linux 7.2 | Kernel and user namespaces reported from the real kernel and a real namespace |
 

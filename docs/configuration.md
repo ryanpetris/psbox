@@ -36,6 +36,7 @@ applications.
 | `extends` | | [Profiles](#profiles) merged under this config |
 | `dbus` | `portal` | `portal`: a private session bus with the host gateway; `host`: the host session and system buses, unfiltered; `off`: no session bus |
 | `dbus-talk` | `[]` | Host session bus names the sandbox may call through the gateway (see [Host bus names](#host-bus-names)) |
+| `[open-urls]` | `host` for each | `http`, `https`, `mailto`: `host` opens those links in the host's default app, `sandbox` inside the sandbox (see [Links](#links)) |
 | `display` | `true` | Wayland (and Xwayland when `xwayland` is on) |
 | `xwayland` | `false` | A private Xwayland for X11 apps, started on the first X client |
 | `network` | `isolated` | `isolated`, `host`, or `none` (see [Network](#network)) |
@@ -137,7 +138,8 @@ and `DISPLAY` when the sandbox has Xwayland. With `dbus = "portal"`, processes a
 `DBUS_SESSION_BUS_ADDRESS` for the sandbox bus and `GIO_USE_PORTALS=1`,
 `GTK_USE_PORTAL=1`, `GDK_DEBUG=portals`, and
 `GNOTIFICATION_BACKEND=portal`, so GLib, GTK 3, GTK 4, and GNotification use
-portals.
+portals. With a link handler, `XDG_CONFIG_DIRS` and `XDG_DATA_DIRS` put it
+first (see [Links](#links)).
 
 ## Devices
 
@@ -219,6 +221,46 @@ inside can take it or have it activated, and host service files for listed
 names are left out of the bus's activatable services. A task with
 `dbus = "portal"` gets the sandbox's list.
 
+## Links
+
+In a sandbox with a session bus, `http`, `https`, and `mailto` links an app
+opens go to the host's default app through the OpenURI portal. When that
+app is itself a sandbox installed with `psbox install` (a browser or a mail
+client, say), the link opens in that sandbox. Without this, GLib and
+`xdg-open` would start the host's browser or mail client inside the
+sandbox, from its desktop entry in `/usr`.
+
+`[open-urls]` keeps a scheme's links inside the sandbox instead, for the
+app that handles them itself:
+
+```toml
+[open-urls]
+mailto = "sandbox"   # a mail client; http and https still go to the host
+```
+
+Each of `http`, `https`, and `mailto` is `host` (the default) or `sandbox`;
+profiles merge the table key by key, and the built-in `browser` profile
+keeps `http` and `https`. An app whose own links went to the host would
+also report that it is not the default app for them. The table chooses the
+sandbox's default handler for each scheme; it does not restrict the portal.
+An app that calls `OpenURI` itself, as GTK 4 apps do here, still opens the
+link with the host's default app, which for a sandboxed default app is that
+sandbox.
+
+The sandbox gets a link handler of its own in `/run/psbox`: a
+`mimeapps.list` naming it the default for the schemes that go to the host,
+its desktop entry, which runs `psbox open-uri` (psbox itself, read-only),
+and `XDG_CONFIG_DIRS` and `XDG_DATA_DIRS` that find them before the
+host's. The activation token of the app that opened the link goes along, so
+the window that shows the link can come to the front. GLib and GTK apps use the
+handler, as does `xdg-open` on GNOME and outside a desktop session, which
+Electron and Chromium apps run. On KDE and Xfce, `xdg-open` goes by those
+desktops' own browser settings before `mimeapps.list`. A default the
+sandbox's own `~/.config/mimeapps.list` sets takes precedence. So do
+`XDG_CONFIG_DIRS` and `XDG_DATA_DIRS` in `env`; to add a directory, keep
+`/run/psbox/config` or `/run/psbox/share` first. With every scheme kept
+inside, there is no handler.
+
 ## Profiles
 
 `extends = ["name", ...]` merges profiles from
@@ -228,7 +270,9 @@ extend others) under the config, in order. Tables merge key by key; `rw`,
 replace the profile's.
 
 The built-in `browser` profile adds the `camera` and `security-key` classes
-and a shared `~/Downloads/`. A user profile named `browser` replaces it.
+and a shared `~/Downloads/`, and keeps `http` and `https` links in the
+browser (`[open-urls]` `http` and `https` set to `sandbox`). A user profile
+named `browser` replaces it.
 
 ## Instances and tasks
 
@@ -331,7 +375,7 @@ attached again with it. New mounts are prepared before
 anything is detached, so a missing source leaves the sandbox unchanged; a
 mount that still fails to apply marks the sandbox for a restart.
 
-Changes to `home`, `cache`, `dbus`, `dbus-talk`, `xwayland`, `network`, or
-overlay mounts need a restart: nothing is applied live, the sandbox stops as soon
+Changes to `home`, `cache`, `dbus`, `dbus-talk`, `open-urls`, `xwayland`,
+`network`, or overlay mounts need a restart: nothing is applied live, the sandbox stops as soon
 as it is idle, and until then `psbox run` warns and `psbox status` shows the
 pending restart. A change that fails the startup check is not applied.

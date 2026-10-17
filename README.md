@@ -44,7 +44,10 @@ desktop = {}
 ```
 
 The private home is `~/Sandbox/firefox`. The built-in `browser` profile
-adds the camera, security keys, and a shared `~/Downloads`.
+adds the camera, security keys, and a shared `~/Downloads`, and lets the
+browser handle its own web links. Links other sandboxes open go to the
+host's default browser, so they reach this sandbox once it is installed as
+that.
 
 ### 3. Install launchers and run
 

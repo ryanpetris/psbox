@@ -150,6 +150,7 @@ status passes through. Exactly one home flag is required:
 | `--devices LIST` | Comma-separated classes replacing `gpu,audio`; `none` for no devices |
 | `--dbus portal\|host\|off` | As the `dbus` key |
 | `--dbus-talk NAME` | A host bus name the sandbox may call, as the `dbus-talk` key; repeatable |
+| `--open-urls SCHEME=host\|sandbox` | Where `http`, `https`, or `mailto` links open, as the `[open-urls]` table; repeatable |
 | `--network isolated\|host\|none` | As the `network` key |
 | `--no-display` | No Wayland and no Xwayland |
 | `--xwayland` | Xwayland for X11 apps, as the `xwayland` key |

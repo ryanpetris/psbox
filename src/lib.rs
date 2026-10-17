@@ -229,6 +229,10 @@ enum Cmd {
   bash: echo 'source <(psbox completions bash)' >> ~/.bashrc
   zsh:  echo 'source <(psbox completions zsh)' >> ~/.zshrc")]
     Completions { shell: Shell },
+    /// Open a link in the host's default app through the OpenURI portal
+    /// (the link handler inside sandboxes).
+    #[command(hide = true)]
+    OpenUri { uri: String },
     /// Run a supervisor (started by its systemd socket unit).
     #[command(hide = true)]
     Supervise {
@@ -372,6 +376,7 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
             Shell::Bash => &clap_complete::env::Bash,
             Shell::Zsh => &clap_complete::env::Zsh,
         }),
+        Cmd::OpenUri { uri } => cli::open_uri(&uri),
         Cmd::Supervise { key } => {
             supervisor::run(&plan::Identity::from_key(&key)?)?;
             Ok(0)

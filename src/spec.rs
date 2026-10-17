@@ -32,6 +32,9 @@ pub struct Spec {
     /// to that host service, unfiltered.
     #[serde(default)]
     pub dbus_talk: Vec<String>,
+    /// Where links the sandbox opens go, by scheme.
+    #[serde(default)]
+    pub open_urls: OpenUrls,
     /// `isolated` (own network namespace with outbound connections through
     /// `pasta`), `host`, or `none` (loopback only). Unset means `isolated`
     /// when pasta is installed and `host` otherwise (see
@@ -106,6 +109,41 @@ pub enum Dbus {
     Portal,
     Host,
     Off,
+}
+
+/// `[open-urls]`: the sandbox's default handler for each scheme the OpenURI
+/// portal accepts. `host` (the default) sends links to the host's default
+/// app through the portal; `sandbox` leaves them to whatever handles them
+/// inside the sandbox (a browser keeps `http` and `https`, a mail client
+/// `mailto`). Apps that call the portal themselves are not affected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenUrls {
+    #[serde(default)]
+    pub http: OpenIn,
+    #[serde(default)]
+    pub https: OpenIn,
+    #[serde(default)]
+    pub mailto: OpenIn,
+}
+
+impl OpenUrls {
+    /// The schemes whose links go to the host.
+    pub fn host_schemes(&self) -> Vec<&'static str> {
+        [("http", self.http), ("https", self.https), ("mailto", self.mailto)]
+            .into_iter()
+            .filter(|(_, at)| *at == OpenIn::Host)
+            .map(|(scheme, _)| scheme)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenIn {
+    #[default]
+    Host,
+    Sandbox,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

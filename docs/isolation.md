@@ -19,6 +19,7 @@ and read-only once built:
 | `~` | The private home (`<root>/<name>`), a host path, a tmpfs, or nothing |
 | `~/.cache` | A tmpfs unless `cache = "home"` |
 | `/run/udev`, `/var/cache/fontconfig` | The host's, read-only, for device and font metadata |
+| `/run/psbox` | With a session bus, unless `[open-urls]` keeps every link inside, the link handler: the psbox executable and the files that make it the default for links, read-only (see [Links](configuration.md#links)) |
 | Shares and mounts | Only what the config lists, read-only or read-write as configured |
 
 Nothing else of the host's filesystem is visible: not your home, not other
@@ -92,6 +93,10 @@ names the config lists in `dbus-talk` (see below):
 | Camera | Only with the `camera` device class |
 | Realtime | Only with the `audio` device class, and only `MakeThreadRealtimeWithPID` and `MakeThreadHighPriorityWithPID` for threads of the sandbox's own processes (the host portal looks the ids up in the sandbox's PID namespace, so no other process can be named) |
 | Anything else (Background, DynamicLauncher, RemoteDesktop, Location, Wallpaper, Usb, Documents, ...) | Refused with `AccessDenied` and logged |
+
+The sandbox's own link handler sends `http`, `https`, and `mailto` links,
+except those `[open-urls]` keeps in the sandbox, through `OpenURI.OpenURI`
+to the host's default app (see [Links](configuration.md#links)).
 
 `org.freedesktop.Notifications` is forwarded (`Notify`, `CloseNotification`,
 `GetCapabilities`, and `GetServerInformation`) with the `image-path` and

@@ -925,6 +925,71 @@ pub fn check() -> Result<i32> {
     })
 }
 
+/// `psbox open-uri`, the link handler inside sandboxes (see
+/// [`crate::plan::OPEN_URLS_DIR`]): asks the OpenURI portal on the session
+/// bus to open `uri` in the host's default app. The activation token the
+/// app that opened the link was given goes along, so the window that shows
+/// the link can come to the front. It waits for the portal's response: the
+/// host portal cancels a request whose caller disconnects, which would close
+/// the app chooser it shows when no default app is set.
+pub fn open_uri(uri: &str) -> Result<i32> {
+    use crate::dbus::message::Message;
+    use crate::dbus::{Conn, Value};
+    use crate::portal::{OPEN_URI_IFACE, PORTAL_NAME, PORTAL_PATH};
+
+    let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .map_err(|_| anyhow::anyhow!("can't open {uri}: there is no session bus"))?;
+    let bus = Conn::connect(&address).map_err(|e| anyhow::anyhow!("can't open {uri}: session bus: {e}"))?;
+    let mut options = Value::Dict("s".into(), "v".into(), Vec::new());
+    if let Ok(token) = std::env::var("XDG_ACTIVATION_TOKEN")
+        && !token.is_empty()
+    {
+        options.dict_set("activation_token", Value::Str(token));
+    }
+    let failed = |e: std::io::Error| anyhow::anyhow!("can't open {uri}: {e}");
+    // Subscribed before calling, so neither the response nor the portal
+    // leaving can fall in between.
+    for rule in [
+        format!("type='signal',sender='{PORTAL_NAME}',interface='org.freedesktop.portal.Request',member='Response'"),
+        format!("type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='{PORTAL_NAME}'"),
+    ] {
+        bus.bus_call("AddMatch", &[Value::Str(rule)]).map_err(failed)?;
+    }
+    let call = Message::method_call(
+        PORTAL_NAME,
+        PORTAL_PATH,
+        OPEN_URI_IFACE,
+        "OpenURI",
+        &[Value::Str(String::new()), Value::Str(uri.into()), options],
+    );
+    let reply = bus.call(&call).map_err(failed)?;
+    let handle = reply
+        .args()
+        .ok()
+        .and_then(|a| a.first().and_then(|v| v.as_str().map(str::to_string)))
+        .ok_or_else(|| anyhow::anyhow!("can't open {uri}: the portal returned no request"))?;
+    loop {
+        let (msg, _) = bus.recv().map_err(failed)?;
+        if msg.is("org.freedesktop.portal.Request", "Response") && msg.path.as_deref() == Some(handle.as_str()) {
+            return match msg.args().ok().and_then(|a| a.first().and_then(Value::as_u32)) {
+                Some(0) => Ok(0),
+                Some(1) => bail!("{uri} was not opened: cancelled"),
+                _ => bail!("{uri} was not opened"),
+            };
+        }
+        // A portal being activated shows up here too, with a new owner.
+        let gone = msg.is(crate::dbus::conn::BUS_NAME, "NameOwnerChanged")
+            && msg
+                .args()
+                .ok()
+                .and_then(|a| a.get(2).and_then(|v| v.as_str().map(str::is_empty)))
+                == Some(true);
+        if gone {
+            bail!("can't open {uri}: the portal went away");
+        }
+    }
+}
+
 /// Prints the script that registers psbox's completions with `shell`.
 /// Completion calls back into this binary, so the script is best sourced
 /// fresh at shell startup rather than saved.
@@ -960,6 +1025,7 @@ mod tests {
             config_dir: "/home/u/.config/psbox".into(),
             root: "/home/u/Sandbox".into(),
             pasta: true,
+            exe: "/usr/bin/psbox".into(),
         };
         let spec = Spec::parse(
             "[mount.bin]\nhost = \"@self.bin/\"\nat = \"~/.bin\"\nmode = \"overlay\"\n\

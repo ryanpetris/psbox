@@ -42,6 +42,10 @@ pub struct Options {
     /// `portal` bus); repeat for more.
     #[arg(long, value_name = "NAME")]
     dbus_talk: Vec<String>,
+    /// Where links of a scheme (`http`, `https`, `mailto`) open: `host`
+    /// (default) or `sandbox`; repeat for more.
+    #[arg(long, value_name = "SCHEME=WHERE")]
+    open_urls: Vec<String>,
     /// `isolated` (outbound only, through pasta; the default when pasta is
     /// installed, otherwise `host`), `host`, or `none`.
     #[arg(long, value_name = "MODE", value_parser = ["host", "isolated", "none"])]
@@ -103,6 +107,18 @@ impl Options {
             let names: Vec<toml::Value> = self.dbus_talk.iter().map(|n| n.clone().into()).collect();
             t.insert("dbus-talk".into(), names.into());
         }
+        let mut open_urls = toml::Table::new();
+        for v in &self.open_urls {
+            match v.split_once('=') {
+                Some((scheme @ ("http" | "https" | "mailto"), at @ ("host" | "sandbox"))) => {
+                    if open_urls.insert(scheme.into(), at.into()).is_some() {
+                        bail!("--open-urls: {scheme} is given more than once");
+                    }
+                }
+                _ => bail!("--open-urls {v:?}: expected http, https, or mailto, then =host or =sandbox"),
+            }
+        }
+        t.insert("open-urls".into(), open_urls.into());
         if let Some(list) = &self.devices {
             let classes: Vec<toml::Value> = match list.trim() {
                 "none" => Vec::new(),
@@ -180,6 +196,7 @@ mod tests {
             config_dir: "/home/u/.config/psbox".into(),
             root: "/home/u/Sandbox".into(),
             pasta: true,
+            exe: "/usr/bin/psbox".into(),
         }
     }
 
@@ -215,6 +232,7 @@ mod tests {
             },
             xwayland: true,
             network: Some("host".into()),
+            open_urls: vec!["https=sandbox".into(), "mailto=host".into()],
             ..Default::default()
         };
         let xs = spec(&Options {
@@ -234,6 +252,24 @@ mod tests {
         .unwrap();
         assert_eq!(talk.dbus_talk, ["org.a.b", "org.c.d"]);
         assert!(xs.display && xs.xwayland && xs.network == Some(Network::Host));
+        assert_eq!(s.open_urls.host_schemes(), ["http", "https", "mailto"]);
+        assert_eq!(xs.open_urls.host_schemes(), ["http", "mailto"]);
+        for bad in [
+            &["ftp=host"][..],
+            &["https"],
+            &["https=elsewhere"],
+            &["https=sandbox", "https=host"],
+        ] {
+            let o = Options {
+                home: HomeArgs {
+                    home_tmpfs: true,
+                    ..Default::default()
+                },
+                open_urls: bad.iter().map(|v| v.to_string()).collect(),
+                ..Default::default()
+            };
+            assert!(o.settings(&host(), Path::new("/")).is_err(), "{bad:?}");
+        }
         assert_eq!(s.env["A"], "b=c");
         assert_eq!(s.idle_timeout, 0);
         let downloads = &s.mount["bind-000"];

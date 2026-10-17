@@ -130,6 +130,13 @@ The process, in the sandbox's PID namespace, that opens the gateway's
 connections to the host bus, so the host portal reads a client's process ids
 in the sandbox's PID namespace.
 
+## Link handler
+
+The default app for links inside a sandbox with a session bus, unless
+`[open-urls]` keeps every link inside: psbox itself, as `psbox open-uri`,
+which sends the `http`, `https`, and `mailto` links `[open-urls]` does not
+keep in the sandbox to the host's default app through the OpenURI portal.
+
 ## App id
 
 The desktop file id a process is registered with at the host portal: the

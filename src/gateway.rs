@@ -15,7 +15,7 @@
 //! expects them from. Calls to those names are forwarded unfiltered through
 //! the same per-client host connection; signals from them are not.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -60,6 +60,9 @@ struct Pending {
     caller_serial: u32,
     file: Option<FileRequest>,
     via: Via,
+    /// An OpenURI call: the request it returns keeps the host connection
+    /// open after the client leaves (see [`Client::open_requests`]).
+    opens: bool,
 }
 
 /// The private-bus connection that owns one `dbus-talk` name.
@@ -78,9 +81,34 @@ struct Client {
     pending: Mutex<HashMap<u32, Pending>>,
     /// File chooser request objects (host paths) awaiting a response.
     file_requests: Mutex<HashMap<String, FileRequest>>,
+    /// OpenURI request objects (host paths) awaiting a response. The host
+    /// portal cancels a request when its caller disconnects, which would
+    /// close the app chooser it shows when no default app is set, and
+    /// callers such as `gdbus call` exit as soon as they have the request.
+    /// The portal opens the chosen app itself, so the host connection stays
+    /// until these are answered.
+    open_requests: Mutex<HashSet<String>>,
+    /// The client has left the private bus.
+    gone: std::sync::atomic::AtomicBool,
     /// The host's current owners of the gateway names (well-known name to
     /// unique name): only their signals reach the client.
     owners: Mutex<HashMap<String, String>>,
+}
+
+impl Client {
+    fn is_gone(&self) -> bool {
+        self.gone.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Closes the host connection of a client that has left once no
+    /// OpenURI call or request it made is waiting for an answer.
+    fn close_if_done(&self) {
+        let pending = self.pending.lock().unwrap();
+        let done = !pending.values().any(|p| p.opens) && self.open_requests.lock().unwrap().is_empty();
+        if self.is_gone() && done {
+            self.host.shutdown();
+        }
+    }
 }
 
 pub struct Gateway {
@@ -204,7 +232,8 @@ impl Gateway {
         }
     }
 
-    /// Drops the host connection of a client that left the private bus.
+    /// Drops the host connection of a client that left the private bus,
+    /// once nothing it started still needs it.
     fn name_changed(&self, msg: &Message) {
         let Ok(args) = msg.args() else { return };
         let (Some(name), Some(new)) = (
@@ -217,7 +246,8 @@ impl Gateway {
             && new.is_empty()
             && let Some(c) = self.clients.lock().unwrap().remove(name)
         {
-            c.host.shutdown();
+            c.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+            c.close_if_done();
         }
     }
 
@@ -258,6 +288,12 @@ impl Gateway {
         }
         if via == Via::Portal {
             portal::rewrite_paths(&mut out, &client.private_seg, &client.host_seg);
+            // A closed request gets no response.
+            if out.is("org.freedesktop.portal.Request", "Close")
+                && let Some(path) = &out.path
+            {
+                client.open_requests.lock().unwrap().remove(path);
+            }
         }
         let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
         let mut pending = client.pending.lock().unwrap();
@@ -269,6 +305,7 @@ impl Gateway {
                     caller_serial: msg.serial,
                     file,
                     via,
+                    opens: via == Via::Portal && msg.interface.as_deref() == Some(portal::OPEN_URI_IFACE),
                 },
             );
         }
@@ -329,6 +366,8 @@ impl Gateway {
             host,
             pending: Mutex::new(HashMap::new()),
             file_requests: Mutex::new(HashMap::new()),
+            open_requests: Mutex::new(HashSet::new()),
+            gone: std::sync::atomic::AtomicBool::new(false),
             owners: Mutex::new(owners),
         });
         self.clients.lock().unwrap().insert(sender.into(), client.clone());
@@ -388,6 +427,14 @@ impl Gateway {
                         continue;
                     }
                     self.clients.lock().unwrap().remove(&client.name);
+                    // Calls and requests on a closed connection are never
+                    // answered, so callers still waiting are told. Shut down
+                    // first: a call sent before that is pending by the time
+                    // its send returns (both happen under the pending lock),
+                    // and one sent after fails and is answered with an error.
+                    client.host.shutdown();
+                    self.fail_pending(client);
+                    self.end_open_requests(client);
                     return;
                 }
             };
@@ -398,6 +445,11 @@ impl Gateway {
                         && let Ok(args) = msg.args()
                     {
                         owner_changed(&mut client.owners.lock().unwrap(), &args);
+                        // A portal that has gone never answers its requests.
+                        if args.first().and_then(Value::as_str) == Some(portal::PORTAL_NAME) {
+                            self.end_open_requests(client);
+                            client.close_if_done();
+                        }
                     }
                     Ok(())
                 }
@@ -419,16 +471,29 @@ impl Gateway {
 
     fn relay_reply(&self, client: &Client, msg: Message, fds: Vec<OwnedFd>) -> Result<()> {
         let Some(serial) = msg.reply_serial else { return Ok(()) };
-        let Some(pending) = client.pending.lock().unwrap().remove(&serial) else {
+        // Held until an OpenURI request is recorded, so a client leaving
+        // meanwhile never finds neither the reply nor the request.
+        let mut waiting = client.pending.lock().unwrap();
+        let Some(pending) = waiting.remove(&serial) else {
             return Ok(());
         };
-        if let (Some(kind), message::METHOD_RETURN) = (pending.file, msg.kind)
-            && let Some(handle) = msg
+        let handle = match msg.kind {
+            message::METHOD_RETURN => msg
                 .args()
                 .ok()
-                .and_then(|a| a.first().and_then(|v| v.as_str().map(str::to_string)))
-        {
-            client.file_requests.lock().unwrap().insert(handle, kind);
+                .and_then(|a| a.first().and_then(|v| v.as_str().map(str::to_string))),
+            _ => None,
+        };
+        if let (Some(kind), Some(handle)) = (pending.file, &handle) {
+            client.file_requests.lock().unwrap().insert(handle.clone(), kind);
+        }
+        if let (true, Some(handle)) = (pending.opens, handle) {
+            client.open_requests.lock().unwrap().insert(handle);
+        }
+        drop(waiting);
+        if client.is_gone() {
+            client.close_if_done();
+            return Ok(());
         }
         let mut out = Message {
             kind: msg.kind,
@@ -449,6 +514,56 @@ impl Gateway {
         Ok(())
     }
 
+    /// Answers every call still waiting for a reply from the client's host
+    /// connection with an error.
+    fn fail_pending(&self, client: &Client) {
+        let pending: Vec<Pending> = client.pending.lock().unwrap().drain().map(|(_, p)| p).collect();
+        if client.is_gone() {
+            return;
+        }
+        for p in pending {
+            let mut error = Message {
+                kind: message::ERROR,
+                flags: message::FLAG_NO_REPLY_EXPECTED,
+                error_name: Some("org.freedesktop.DBus.Error.NoReply".into()),
+                reply_serial: Some(p.caller_serial),
+                destination: Some(client.name.clone()),
+                ..Default::default()
+            };
+            error.set_body(&[Value::Str("the host bus connection closed".into())]);
+            let _ = self.conn(p.via).send(&error, &[]);
+        }
+    }
+
+    /// Ends the client's open OpenURI requests, which will never be
+    /// answered, telling a client still waiting for them.
+    fn end_open_requests(&self, client: &Client) {
+        let ended: Vec<String> = client.open_requests.lock().unwrap().drain().collect();
+        if !client.is_gone() {
+            for path in ended {
+                let _ = self.end_request(client, &path);
+            }
+        }
+    }
+
+    /// Sends the client a `Response` ending the request at the host path
+    /// `path`, with the code for "ended in some other way".
+    fn end_request(&self, client: &Client, path: &str) -> Result<()> {
+        let mut out = Message {
+            kind: message::SIGNAL,
+            flags: message::FLAG_NO_REPLY_EXPECTED,
+            path: Some(path.into()),
+            interface: Some("org.freedesktop.portal.Request".into()),
+            member: Some("Response".into()),
+            destination: Some(client.name.clone()),
+            ..Default::default()
+        };
+        out.set_body(&[Value::U32(2), Value::Dict("s".into(), "v".into(), Vec::new())]);
+        portal::rewrite_paths(&mut out, &client.host_seg, &client.private_seg);
+        self.private.send(&out, &[])?;
+        Ok(())
+    }
+
     fn relay_signal(&self, client: &Client, msg: Message, fds: Vec<OwnedFd>) -> Result<()> {
         // Any host process can send a signal straight to this connection;
         // only the current owners of the gateway names are passed on.
@@ -464,6 +579,15 @@ impl Gateway {
         {
             return Ok(());
         }
+        let response = msg.is("org.freedesktop.portal.Request", "Response");
+        if response && let Some(path) = msg.path.as_deref() {
+            client.open_requests.lock().unwrap().remove(path);
+        }
+        // A client that has left gets nothing more.
+        if client.is_gone() {
+            client.close_if_done();
+            return Ok(());
+        }
         let mut out = Message {
             kind: message::SIGNAL,
             flags: message::FLAG_NO_REPLY_EXPECTED,
@@ -475,7 +599,7 @@ impl Gateway {
             body: msg.body.clone(),
             ..Default::default()
         };
-        if msg.is("org.freedesktop.portal.Request", "Response") {
+        if response {
             let kind = msg
                 .path
                 .as_deref()

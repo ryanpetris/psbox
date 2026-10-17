@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Open on the host
+Comment=Opens links in the host's default app through the OpenURI portal
+Exec=/run/psbox/bin/psbox open-uri -- %u
+NoDisplay=true
+MimeType=@MIME_TYPES@

@@ -26,6 +26,7 @@ pub fn config(data: &[u8]) {
         config_dir: "/home/u/.config/psbox".into(),
         root: "/home/u/Sandbox".into(),
         pasta: true,
+        exe: "/usr/bin/psbox".into(),
     };
     let id = Identity::Instance {
         sandbox: "app".into(),

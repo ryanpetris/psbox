@@ -405,6 +405,7 @@ mod tests {
             config_dir: root.join("config"),
             root: "/home/u/Sandbox".into(),
             pasta: true,
+            exe: "/usr/bin/psbox".into(),
         };
         (root, dirs, host)
     }

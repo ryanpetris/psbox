@@ -132,9 +132,31 @@ them gets its own host connection, which registers the client's app id
 (from the command that started it) with
 `org.freedesktop.host.portal.Registry`, so host services see per-client
 lifetimes and portal request and session paths map one-to-one onto the
-paths the client predicted from its own name. The gateway reads the policy
+paths the client predicted from its own name. A client's host connection
+closes when the client leaves the private bus, which ends its inhibitors
+and sessions, except that it stays until an open OpenURI request is
+answered: the host portal cancels a request whose caller disconnects, and
+callers such as `gdbus call` exit as soon as they have the request, which
+would close the app chooser (shown when no default app is set) before the
+user picks an app. If the host portal goes away instead, the gateway ends
+those requests with a `Response` of its own, so a client waiting for one is
+not left hanging. The gateway reads the policy
 from the current plan for each call, so device-class changes (Camera,
 Realtime) apply live. The policy is in [isolation.md](isolation.md#d-bus).
+
+GLib and `xdg-open` run a link's local handler before they try the
+portal, and the host's desktop entries are visible in `/usr`, so a
+sandboxed app would start the host's browser inside its own sandbox. With a
+session bus, the root has the psbox executable (bound read-only at
+`/run/psbox/bin/psbox`), and a `mimeapps.list` and desktop entry in
+`/run/psbox` that make `psbox open-uri` the handler for the schemes
+`[open-urls]` sends to the host; `XDG_CONFIG_DIRS` and `XDG_DATA_DIRS` find
+them first. `psbox open-uri` calls `OpenURI.OpenURI` on the session bus
+with the caller's `XDG_ACTIVATION_TOKEN` and waits for the request's
+`Response` (with `dbus = "host"` it talks to the host portal directly, with
+no gateway to keep the request open). The host portal opens the link with
+the host's default app, which for a sandbox installed with `psbox install`
+is `psbox run`.
 
 The host portal identifies a client by the process that opened its host
 connection and reads the process ids a client passes (Realtime) in that

@@ -32,6 +32,8 @@ pub struct HostEnv {
     pub root: PathBuf,
     /// Whether `pasta` is on `PATH` (isolated networking needs it).
     pub pasta: bool,
+    /// The psbox executable, bound into sandboxes as the link handler.
+    pub exe: PathBuf,
 }
 
 /// The first executable called `name` on `PATH`.
@@ -100,6 +102,7 @@ impl HostEnv {
             config_dir,
             root,
             pasta: find_in_path("pasta").is_some(),
+            exe: std::env::current_exe().context("find the psbox executable")?,
         })
     }
 
@@ -407,6 +410,9 @@ pub struct Plan {
     pub dbus_talk: Vec<String>,
     /// Serve X11 clients with an on-demand Xwayland.
     pub xwayland: bool,
+    /// The schemes whose links open in the host's default app: those
+    /// `open-urls` sends to the host, with a session bus.
+    pub open_urls: Vec<String>,
     pub network: Network,
     /// `network` is `host` only because pasta is not installed.
     pub network_fallback: bool,
@@ -428,6 +434,24 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin";
 
 /// The address pasta answers DNS on inside an isolated sandbox.
 pub const PASTA_DNS: &str = "169.254.1.1";
+
+/// Holds the sandbox's link handler, in sandboxes with a session bus:
+/// `bin/psbox` (psbox itself, for `psbox open-uri`), `config` first in
+/// `XDG_CONFIG_DIRS`, and `share` first in `XDG_DATA_DIRS`.
+pub const OPEN_URLS_DIR: &str = "/run/psbox";
+
+/// The link handler's `mimeapps.list` and desktop entry, claiming `schemes`.
+fn link_handler(schemes: &[String]) -> (String, String) {
+    let defaults: String = schemes
+        .iter()
+        .map(|s| format!("x-scheme-handler/{s}=psbox-open-uri.desktop\n"))
+        .collect();
+    let types: String = schemes.iter().map(|s| format!("x-scheme-handler/{s};")).collect();
+    (
+        format!("[Default Applications]\n{defaults}"),
+        include_str!("assets/psbox-open-uri.desktop").replace("@MIME_TYPES@", &types),
+    )
+}
 
 /// How a running sandbox gets from one plan to another.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -725,6 +749,9 @@ pub fn diff(old: &Plan, new: &Plan) -> Change {
     if old.network != new.network {
         c.restart.push("network".into());
     }
+    if old.open_urls != new.open_urls && old.dbus == new.dbus {
+        c.restart.push("open-urls".into());
+    }
     let cache_tmpfs = |p: &Plan| {
         p.mounts.contains(&Mount::Tmpfs {
             dst: p.home.join(".cache"),
@@ -764,11 +791,15 @@ pub fn diff(old: &Plan, new: &Plan) -> Change {
             c.restart.push(format!("mount at {}", m.dst().display()));
         }
     }
-    // Home, network, and Xwayland changes show up as mount changes too;
-    // report them once.
+    // Home, network, Xwayland, open-urls, and dbus changes show up as mount
+    // changes too; report them once.
     if c.restart.iter().any(|r| r == "xwayland") {
         let x11 = format!("mount at {}", crate::x11::SOCKET_DIR);
         c.restart.retain(|r| *r != x11);
+    }
+    if c.restart.iter().any(|r| r == "open-urls" || r == "dbus") {
+        let handler = format!("mount at {OPEN_URLS_DIR}/");
+        c.restart.retain(|r| !r.starts_with(&handler));
     }
     if c.restart.iter().any(|r| r == "network") {
         c.restart
@@ -1060,6 +1091,30 @@ impl Plan {
                 }),
             }
         }
+        // The link handler (see below) is made before the shares, so its
+        // files are always created in the sandbox root, never in a share.
+        let open_urls: Vec<String> = match spec.dbus {
+            Dbus::Off => Vec::new(),
+            Dbus::Portal | Dbus::Host => spec.open_urls.host_schemes().into_iter().map(String::from).collect(),
+        };
+        let handler = !open_urls.is_empty();
+        if handler {
+            let (mimeapps, entry) = link_handler(&open_urls);
+            mounts.push(Mount::Bind {
+                src: host.exe.clone(),
+                dst: format!("{OPEN_URLS_DIR}/bin/psbox").into(),
+                ro: true,
+                optional: false,
+            });
+            mounts.push(Mount::File {
+                dst: format!("{OPEN_URLS_DIR}/config/mimeapps.list").into(),
+                content: mimeapps,
+            });
+            mounts.push(Mount::File {
+                dst: format!("{OPEN_URLS_DIR}/share/applications/psbox-open-uri.desktop").into(),
+                content: entry,
+            });
+        }
         // Parents before children, after everything psbox mounts itself.
         shares.sort_by_key(|m| m.dst().components().count());
         mounts.extend(shares);
@@ -1086,6 +1141,19 @@ impl Plan {
             env.insert("GTK_USE_PORTAL".into(), "1".into());
             env.insert("GDK_DEBUG".into(), "portals".into());
             env.insert("GNOTIFICATION_BACKEND".into(), "portal".into());
+        }
+        // GLib and xdg-open run a link's local handler before trying the
+        // portal, and the host's desktop entries (such as a browser's or a
+        // mail client's) are visible in /usr. A handler of the sandbox's
+        // own, found before them, sends the links `open-urls` sends to the
+        // host to the OpenURI portal instead, and so to the host's default
+        // app.
+        if handler {
+            env.insert("XDG_CONFIG_DIRS".into(), format!("{OPEN_URLS_DIR}/config:/etc/xdg"));
+            env.insert(
+                "XDG_DATA_DIRS".into(),
+                format!("{OPEN_URLS_DIR}/share:/usr/local/share:/usr/share"),
+            );
         }
         env.extend(spec.env.clone());
 
@@ -1142,6 +1210,7 @@ impl Plan {
             },
             bus,
             xwayland,
+            open_urls,
             network,
             network_fallback,
             app_id: spec.app_id.clone(),
@@ -1374,6 +1443,7 @@ mod tests {
             config_dir: "/home/u/.config/psbox".into(),
             root: "/home/u/Sandbox".into(),
             pasta: true,
+            exe: "/usr/bin/psbox".into(),
         }
     }
 
@@ -1645,7 +1715,7 @@ mod tests {
         );
         assert_eq!(diff(&build("network = \"host\""), &isolated).restart, vec!["network"]);
         let none = build("network = \"none\"");
-        assert!(!none.mounts.iter().any(|m| matches!(m, Mount::File { .. })));
+        assert!(!none.mounts.iter().any(|m| m.dst() == Path::new("/etc/resolv.conf")));
     }
 
     #[test]
@@ -1689,6 +1759,98 @@ mod tests {
         assert!(task("").unwrap().network_fallback);
         assert_eq!(task("network = \"isolated\"").unwrap().problems.len(), 1);
         assert!(!task("network = \"host\"").unwrap().network_fallback);
+    }
+
+    #[test]
+    fn links_open_on_the_host_through_the_sandboxs_own_handler() {
+        let build = |text: &str| Plan::build(&main("app"), &Spec::parse(text).unwrap(), &host()).unwrap();
+        let file = |p: &Plan, name: &str| {
+            p.mounts.iter().find_map(|m| match m {
+                Mount::File { dst, content } if dst.ends_with(name) => Some(content.clone()),
+                _ => None,
+            })
+        };
+        let claims = |p: &Plan| {
+            let list = file(p, "mimeapps.list").unwrap_or_default();
+            ["http", "https", "mailto"]
+                .into_iter()
+                .filter(|s| list.contains(&format!("x-scheme-handler/{s}=psbox-open-uri.desktop\n")))
+                .collect::<Vec<_>>()
+        };
+
+        let plan = build("");
+        assert_eq!(plan.open_urls, ["http", "https", "mailto"]);
+        assert_eq!(claims(&plan), ["http", "https", "mailto"]);
+        assert!(plan.mounts.contains(&Mount::Bind {
+            src: "/usr/bin/psbox".into(),
+            dst: "/run/psbox/bin/psbox".into(),
+            ro: true,
+            optional: false,
+        }));
+        let entry = file(&plan, "psbox-open-uri.desktop").unwrap();
+        assert!(entry.contains(&format!("Exec={OPEN_URLS_DIR}/bin/psbox open-uri -- %u\n")));
+        assert!(entry.contains("MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/mailto;\n"));
+        assert_eq!(plan.env["XDG_CONFIG_DIRS"], "/run/psbox/config:/etc/xdg");
+        assert_eq!(
+            plan.env["XDG_DATA_DIRS"],
+            "/run/psbox/share:/usr/local/share:/usr/share"
+        );
+        assert_eq!(build("dbus = \"host\"").open_urls.len(), 3);
+
+        // A share above the handler's directory comes after its files, so
+        // they are never created in the share.
+        let shared = build("ro = [\"/run\"]");
+        let at = |dst: &str| shared.mounts.iter().position(|m| m.dst() == Path::new(dst)).unwrap();
+        assert!(at("/run/psbox/share/applications/psbox-open-uri.desktop") < at("/run"));
+
+        // Browsers handle their own web links, and mail clients their own
+        // mail links; the rest still go to the host. Profiles merge the
+        // table key by key.
+        for (text, host) in [
+            ("extends = [\"browser\"]", vec!["mailto"]),
+            ("[open-urls]\nmailto = \"sandbox\"", vec!["http", "https"]),
+            ("extends = [\"browser\"]\n[open-urls]\nmailto = \"sandbox\"", vec![]),
+            (
+                "extends = [\"browser\"]\n[open-urls]\nhttps = \"host\"",
+                vec!["https", "mailto"],
+            ),
+        ] {
+            let p = build(text);
+            assert_eq!(p.open_urls, host, "{text}");
+            assert_eq!(claims(&p), host, "{text}");
+            if !host.is_empty() {
+                let types: String = host.iter().map(|s| format!("x-scheme-handler/{s};")).collect();
+                let entry = file(&p, "psbox-open-uri.desktop").unwrap();
+                assert!(entry.contains(&format!("MimeType={types}\n")), "{text}");
+            }
+        }
+        assert!(Spec::parse("[open-urls]\nftp = \"host\"").is_err());
+        assert!(Spec::parse("[open-urls]\nhttp = \"elsewhere\"").is_err());
+
+        // Without a bus there is no portal to send links to, and with every
+        // link kept inside there is nothing to send.
+        for text in [
+            "dbus = \"off\"",
+            "extends = [\"browser\"]\n[open-urls]\nmailto = \"sandbox\"",
+        ] {
+            let p = build(text);
+            assert!(p.open_urls.is_empty(), "{text}");
+            assert!(!p.mounts.iter().any(|m| m.dst().starts_with(OPEN_URLS_DIR)), "{text}");
+            assert!(!p.env.contains_key("XDG_DATA_DIRS"), "{text}");
+        }
+
+        assert_eq!(
+            build("env = { XDG_DATA_DIRS = \"/x\" }").env["XDG_DATA_DIRS"],
+            "/x",
+            "the config's env wins"
+        );
+        let c = diff(&plan, &build("[open-urls]\nhttp = \"sandbox\""));
+        assert_eq!(c.restart, vec!["open-urls"]);
+        let c = diff(
+            &plan,
+            &build("extends = [\"browser\"]\n[open-urls]\nmailto = \"sandbox\""),
+        );
+        assert_eq!(c.restart, vec!["open-urls"]);
     }
 
     #[test]
