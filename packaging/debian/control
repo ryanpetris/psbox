@@ -10,11 +10,12 @@ Homepage: https://petris.dev/psbox
 Package: psbox
 Architecture: amd64 arm64
 Depends: ${shlibs:Depends}, ${misc:Depends}, dbus, systemd
-Suggests: passt, xwayland-satellite
+Suggests: passt, xdg-desktop-portal, xwayland-satellite
 Description: Run Linux applications inside private-home sandboxes
  psbox runs applications in sandboxes with a private home, built on Linux
  namespaces, the new mount API, Landlock, seccomp, and cgroups. Each
  sandbox is supervised by a socket-activated systemd user service.
  .
- passt provides isolated sandbox networking, and xwayland-satellite runs
- X11 applications inside sandboxes.
+ passt provides isolated sandbox networking, xdg-desktop-portal provides
+ host portals and portal identities for sandboxed applications, and
+ xwayland-satellite runs X11 applications inside sandboxes.

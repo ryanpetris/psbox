@@ -16,6 +16,7 @@ depends=(
 makedepends=('cargo')
 optdepends=(
     'passt: isolated sandbox networking'
+    'xdg-desktop-portal: host portals and portal identities for sandboxed apps'
     'xwayland-satellite: X11 applications inside sandboxes'
 )
 source=("${pkgname}-${pkgver}.tar.gz")

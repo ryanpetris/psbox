@@ -11,9 +11,10 @@
 | A systemd user session | Socket-activated supervisor units |
 | `dbus-daemon` | The private session bus (`dbus.mode: 'portal'`, the default) |
 | `pasta` (package `passt`), optional | Isolated networking; without it, sandboxes that do not set `network` use the host network |
+| `xdg-desktop-portal` 1.19 or newer, optional | Host portals (file dialogs, screen sharing, and the rest) and [portal identities](configuration.md#portal-identity) for sandboxed apps |
 | `xwayland-satellite` and `Xwayland`, optional | X11 apps (`xwayland`) |
 
-`psbox check` reports each of these.
+`psbox check` reports each of these except the host portal.
 
 ## From a package
 
@@ -22,8 +23,8 @@ and Debian packages for amd64 and arm64 (`psbox_<version>-<rel>_<arch>.deb`,
 built on Debian 13). They are native builds, linked against the
 distribution's C library; the [archives](#from-a-release-archive) hold the
 static binary. They install the binary, the user units, and the bash
-and zsh completions, and depend on `dbus` and `systemd`; `passt` and
-`xwayland-satellite` are optional:
+and zsh completions, and depend on `dbus` and `systemd`; `passt`,
+`xdg-desktop-portal`, and `xwayland-satellite` are optional:
 
 ```sh
 sudo pacman -U psbox-<version>-1-x86_64.pkg.tar.zst      # Arch
