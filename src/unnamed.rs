@@ -1,189 +1,167 @@
 //! `psbox sandbox`: options for an unnamed, oneshot sandbox and the settings
 //! file its supervisor reads in place of a named config.
+//!
+//! The settings are a config like any other, evaluated by the client:
+//! profiles, then a file, then each `-c KEY=VALUE` as a Jsonnet object that
+//! merges into the key, then the `--bind` and `--ro-bind` mounts. The
+//! evaluated JSON goes to the supervisor, so it needs no context from the
+//! caller.
 
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::Value;
 
+use crate::jsonnet::{self, Layer};
 use crate::plan::HostEnv;
-use crate::spec::{Spec, Tokens};
+use crate::spec::{self, Spec};
 
-/// Exactly one way to provide the home.
-#[derive(clap::Args, Debug, Default)]
-#[group(required = true, multiple = false)]
-pub struct HomeArgs {
-    /// Bind this directory read-write as the home.
-    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
-    home: Option<String>,
-    /// An empty in-memory home.
-    #[arg(long)]
-    home_tmpfs: bool,
-    /// No home.
-    #[arg(long)]
-    no_home: bool,
-}
+/// Mount names `--bind` and `--ro-bind` make, which `-c` cannot write.
+pub const BIND_PREFIX: &str = "bind-";
+pub const RO_BIND_PREFIX: &str = "ro-bind-";
 
 #[derive(clap::Args, Debug, Default)]
 pub struct Options {
-    #[command(flatten)]
-    home: HomeArgs,
-    /// `tmpfs` (default) hides `~/.cache`; `home` keeps it.
-    #[arg(long, value_name = "MODE", value_parser = ["tmpfs", "home"])]
-    cache: Option<String>,
-    /// Comma-separated device classes, replacing `gpu,audio`; `none` for no
-    /// devices.
-    #[arg(long, value_name = "LIST")]
-    devices: Option<String>,
-    /// `portal` (default): a private bus with portals; `host`: the host
-    /// buses; `off`: no bus.
-    #[arg(long, value_name = "MODE", value_parser = ["portal", "host", "off"])]
-    dbus: Option<String>,
-    /// A host bus name the sandbox may call through the gateway (with the
-    /// `portal` bus); repeat for more.
+    /// Set a config key, such as `xwayland.mode=builtin` or
+    /// `environment.EDITOR=vi`; repeat for more. Quote a name containing a
+    /// dot: `mount."a.b".source=/x`.
+    #[arg(short = 'c', long = "config", value_name = "KEY=VALUE")]
+    config: Vec<String>,
+    /// Start from a profile: `~/.config/psbox/profiles/NAME.libsonnet`, or
+    /// a built-in one; repeat for more.
     #[arg(long, value_name = "NAME")]
-    dbus_talk: Vec<String>,
-    /// Where links of a scheme (`http`, `https`, `mailto`) open: `host`
-    /// (default) or `sandbox`; repeat for more.
-    #[arg(long, value_name = "SCHEME=WHERE")]
-    open_urls: Vec<String>,
-    /// `isolated` (outbound only, through pasta; the default when pasta is
-    /// installed, otherwise `host`), `host`, or `none`.
-    #[arg(long, value_name = "MODE", value_parser = ["host", "isolated", "none"])]
-    network: Option<String>,
-    /// No Wayland and no Xwayland.
-    #[arg(long, conflicts_with = "xwayland")]
-    no_display: bool,
-    /// Serve X11 apps with a private Xwayland: `builtin` (the default), with
-    /// psbox's title bars, or `xwayland-satellite`, with satellite's.
-    #[arg(
-        long,
-        value_name = "MODE",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "builtin",
-        value_parser = ["builtin", "xwayland-satellite"]
-    )]
-    xwayland: Option<String>,
-    /// How X11 apps meet a scaled display, with `--xwayland`: `native` (the
-    /// default), `round-up`, or `compositor`.
-    #[arg(long, value_name = "MODE", value_parser = ["native", "round-up", "compositor"])]
-    xwayland_scale: Option<String>,
+    profile: Vec<String>,
+    /// Start from a config file, after the profiles.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    file: Option<PathBuf>,
+    /// Give the sandbox the portal identity of this desktop entry id; the
+    /// host portal must accept it.
+    #[arg(long, value_name = "ID")]
+    app_id: Option<String>,
     /// Share a host path read-write, at the same path or at DST.
     #[arg(long, value_name = "SRC[:DST]", value_hint = clap::ValueHint::AnyPath)]
     bind: Vec<String>,
     /// Share a host path read-only, at the same path or at DST.
     #[arg(long, value_name = "SRC[:DST]", value_hint = clap::ValueHint::AnyPath)]
     ro_bind: Vec<String>,
-    /// Set an environment variable.
-    #[arg(long, value_name = "K=V")]
-    env: Vec<String>,
 }
 
-impl Options {
-    /// The settings file body. Paths are made absolute here, relative ones
-    /// against `cwd`, so the supervisor needs no context from the caller.
-    pub fn settings(&self, host: &HostEnv, cwd: &Path) -> Result<String> {
-        let path = |p: &str| -> Result<String> {
-            if p.starts_with("@self") {
-                bail!("{p:?}: @self needs a named sandbox");
-            }
-            let raw = if p.starts_with('~') || p.starts_with('@') {
-                let tokens = Tokens {
-                    home: &host.home,
-                    root: &host.root,
-                    name: "",
-                };
-                tokens.expand(p)?
-            } else {
-                cwd.join(p)
-            };
-            // A trailing `/` marks a directory; keep it through normalizing.
-            let slash = if p.ends_with('/') && p.len() > 1 { "/" } else { "" };
-            Ok(format!("{}{slash}", normalize(&raw).to_string_lossy()))
+/// What `psbox sandbox` leaves for the supervisor.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Settings {
+    /// The evaluated config.
+    pub config: Value,
+    /// The portal identity, from `--app-id`.
+    pub app_id: Option<String>,
+}
+
+impl Settings {
+    /// The checked config.
+    pub fn spec(&self) -> Result<Spec> {
+        let none = |_: &str| false;
+        let ctx = spec::Context {
+            name: None,
+            storage: None,
+            host_entry: &none,
         };
-
-        let mut t = toml::Table::new();
-        let home = match (&self.home.home, self.home.home_tmpfs, self.home.no_home) {
-            (Some(dir), _, _) => path(dir)?,
-            (None, true, _) => "tmpfs".into(),
-            (None, false, true) => "none".into(),
-            (None, false, false) => bail!("choose --home, --home-tmpfs, or --no-home"),
-        };
-        t.insert("home".into(), home.into());
-        for (key, value) in [("cache", &self.cache), ("dbus", &self.dbus), ("network", &self.network)] {
-            if let Some(v) = value {
-                t.insert(key.into(), v.clone().into());
-            }
-        }
-        if !self.dbus_talk.is_empty() {
-            let names: Vec<toml::Value> = self.dbus_talk.iter().map(|n| n.clone().into()).collect();
-            t.insert("dbus-talk".into(), names.into());
-        }
-        let mut open_urls = toml::Table::new();
-        for v in &self.open_urls {
-            match v.split_once('=') {
-                Some((scheme @ ("http" | "https" | "mailto"), at @ ("host" | "sandbox"))) => {
-                    if open_urls.insert(scheme.into(), at.into()).is_some() {
-                        bail!("--open-urls: {scheme} is given more than once");
-                    }
-                }
-                _ => bail!("--open-urls {v:?}: expected http, https, or mailto, then =host or =sandbox"),
-            }
-        }
-        t.insert("open-urls".into(), open_urls.into());
-        if let Some(list) = &self.devices {
-            let classes: Vec<toml::Value> = match list.trim() {
-                "none" => Vec::new(),
-                l => l.split(',').map(|c| c.trim().to_string().into()).collect(),
-            };
-            t.insert("devices".into(), classes.into());
-        }
-        t.insert("display".into(), (!self.no_display).into());
-        for (key, value) in [("xwayland", &self.xwayland), ("xwayland-scale", &self.xwayland_scale)] {
-            if let Some(v) = value {
-                t.insert(key.into(), v.clone().into());
-            }
-        }
-
-        let mut env = toml::Table::new();
-        for kv in &self.env {
-            let (k, v) = kv
-                .split_once('=')
-                .with_context(|| format!("--env {kv:?}: expected K=V"))?;
-            env.insert(k.into(), v.into());
-        }
-        t.insert("env".into(), env.into());
-
-        let mut mounts = toml::Table::new();
-        for (flag, mode, specs) in [("bind", "rw", &self.bind), ("ro-bind", "ro", &self.ro_bind)] {
-            for (i, spec) in specs.iter().enumerate() {
-                let (src, dst) = spec.split_once(':').unwrap_or((spec, spec));
-                if src.is_empty() || dst.is_empty() || dst.contains(':') {
-                    bail!("--{flag} {spec:?}: expected SRC or SRC:DST");
-                }
-                let (src, dst) = (path(src)?, path(dst)?);
-                let mut m = toml::Table::new();
-                m.insert("host".into(), src.into());
-                m.insert("at".into(), dst.into());
-                m.insert("mode".into(), mode.into());
-                mounts.insert(format!("{flag}-{i:03}"), m.into());
-            }
-        }
-        t.insert("mount".into(), mounts.into());
+        let mut spec =
+            Spec::from_json(&self.config, &Default::default(), &ctx).map_err(|problem| spec::ConfigError {
+                name: None,
+                file: None,
+                problem,
+            })?;
         // The supervisor stops as soon as the command has exited.
-        t.insert("idle-timeout".into(), 0.into());
-
-        let text = toml::to_string(&t)?;
-        Spec::parse(&text)?;
-        Ok(text)
+        spec.idle_timeout = 0;
+        Ok(spec)
     }
 }
 
-/// Resolves `.` and `..` without touching the filesystem, so symlinks in a
+/// What a `-c` value means at a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Bool,
+    Number,
+    Text,
+    /// Text that names a host path, made absolute against the working
+    /// directory.
+    Path,
+    /// JSON: a list or an object.
+    Json,
+}
+
+/// The kind of value a key takes, and whether `null` removes it.
+fn want(key: &[String]) -> (Want, bool) {
+    let k: Vec<&str> = key.iter().map(String::as_str).collect();
+    match k.as_slice() {
+        ["sandbox", "idle-timeout"] => (Want::Number, false),
+        ["home" | "dbus" | "network" | "display" | "xwayland"] => (Want::Json, true),
+        ["home", "path"] => (Want::Path, false),
+        [
+            "devices",
+            "gpu" | "audio" | "camera" | "gamepad" | "security-key" | "alsa",
+        ] => (Want::Bool, false),
+        ["devices", "usb"] | ["dbus", "talk"] => (Want::Json, false),
+        ["environment", _] => (Want::Text, true),
+        ["mount", _] => (Want::Json, true),
+        ["mount", _, "source" | "destination"] => (Want::Path, false),
+        ["mount", _, "optional" | "create"] => (Want::Bool, false),
+        _ => (Want::Text, false),
+    }
+}
+
+/// Splits `KEY=VALUE` and the key into its segments; a segment may be a
+/// JSON string, to hold a `.` or `=`.
+fn split_setting(setting: &str) -> Result<(Vec<String>, &str)> {
+    let mut key = Vec::new();
+    let mut rest = setting;
+    loop {
+        let segment;
+        if rest.starts_with('"') {
+            let mut end = None;
+            let mut escaped = false;
+            for (i, ch) in rest.char_indices().skip(1) {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => {
+                        end = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.ok_or_else(|| anyhow!("-c {setting:?}: unterminated quote"))?;
+            segment = serde_json::from_str::<String>(&rest[..=end]).with_context(|| format!("-c {setting:?}"))?;
+            rest = &rest[end + 1..];
+        } else {
+            let end = rest.find(['.', '=']).unwrap_or(rest.len());
+            segment = rest[..end].to_string();
+            rest = &rest[end..];
+        }
+        if segment.is_empty() {
+            bail!("-c {setting:?}: expected KEY=VALUE with a dotted KEY");
+        }
+        key.push(segment);
+        match rest.chars().next() {
+            Some('.') => rest = &rest[1..],
+            Some('=') => return Ok((key, &rest[1..])),
+            _ => bail!("-c {setting:?}: expected KEY=VALUE"),
+        }
+    }
+}
+
+/// `~` and `~/...` against the home, and relative paths against `cwd`,
+/// resolving `.` and `..` without touching the filesystem, so symlinks in a
 /// share's path stay where the user named them.
-fn normalize(path: &Path) -> PathBuf {
+fn cli_path(p: &str, host: &HostEnv, cwd: &Path) -> String {
+    let raw = match p.strip_prefix('~') {
+        Some("") => host.home.clone(),
+        Some(rest) if rest.starts_with('/') => host.home.join(&rest[1..]),
+        _ => cwd.join(p),
+    };
     let mut out = PathBuf::new();
-    for c in path.components() {
+    for c in raw.components() {
         match c {
             Component::ParentDir => {
                 out.pop();
@@ -192,13 +170,154 @@ fn normalize(path: &Path) -> PathBuf {
             other => out.push(other),
         }
     }
-    out
+    out.to_string_lossy().into_owned()
+}
+
+/// The value a `-c` setting gives its key.
+fn setting_value(key: &[String], value: &str, host: &HostEnv, cwd: &Path) -> Result<Value> {
+    let (want, nullable) = want(key);
+    let shown = key.join(".");
+    if value == "null" && nullable {
+        return Ok(Value::Null);
+    }
+    if value.starts_with(['"', '{', '[']) {
+        return serde_json::from_str(value).with_context(|| format!("-c {shown}: {value:?} isn't valid JSON"));
+    }
+    Ok(match want {
+        Want::Bool => match value {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => bail!("-c {shown}: expected true or false, got {value:?}"),
+        },
+        Want::Number => Value::from(
+            value
+                .parse::<u64>()
+                .with_context(|| format!("-c {shown}: expected a whole number, got {value:?}"))?,
+        ),
+        Want::Text => Value::String(value.to_string()),
+        Want::Path => Value::String(cli_path(value, host, cwd)),
+        Want::Json => bail!(
+            "-c {shown}: expected {}JSON, got {value:?}",
+            if nullable { "null or " } else { "" }
+        ),
+    })
+}
+
+/// Jsonnet for an object that sets `key` to `value`, merging into what is
+/// already there; a section a profile set to null is started afresh.
+fn setting_snippet(key: &[String], value: &Value) -> String {
+    let name = serde_json::to_string(&key[0]).expect("strings serialize");
+    if key.len() == 1 {
+        return format!("{{ {name}: {value} }}");
+    }
+    let inner = setting_snippet(&key[1..], value);
+    format!("{{ {name}: (if {name} in super && super[{name}] != null then super[{name}] else {{}}) + {inner} }}")
+}
+
+impl Options {
+    /// The settings: evaluated, checked, with paths made absolute (relative
+    /// ones against `cwd`).
+    pub fn settings(&self, host: &HostEnv, cwd: &Path) -> Result<Settings> {
+        let mut layers = Vec::new();
+        for name in &self.profile {
+            let file = host.config_dir.join("profiles").join(format!("{name}.libsonnet"));
+            if file.exists() {
+                layers.push(Layer::File(file));
+            } else if jsonnet::BUILTIN_PROFILES.iter().any(|(n, _)| n == name) {
+                layers.push(Layer::Builtin(name.clone()));
+            } else {
+                bail!("no profile named {name} · {} doesn't exist", crate::ui::tilde(&file));
+            }
+        }
+        if let Some(file) = &self.file {
+            layers.push(Layer::File(PathBuf::from(cli_path(&file.to_string_lossy(), host, cwd))));
+        }
+        for (i, setting) in self.config.iter().enumerate() {
+            let (key, value) = split_setting(setting)?;
+            if let Some(first) = key.first()
+                && matches!(first.as_str(), "app" | "task")
+            {
+                bail!("-c {}: an unnamed sandbox has no {first}s", key.join("."));
+            }
+            if let [m, name, ..] = key.as_slice()
+                && m == "mount"
+                && (name.starts_with(BIND_PREFIX) || name.starts_with(RO_BIND_PREFIX))
+            {
+                bail!(
+                    "-c {}: mount names starting with {BIND_PREFIX} or {RO_BIND_PREFIX} belong to --bind and --ro-bind",
+                    key.join(".")
+                );
+            }
+            let value = setting_value(&key, value, host, cwd)?;
+            layers.push(Layer::Snippet {
+                name: format!("<-c #{}>", i + 1),
+                text: setting_snippet(&key, &value),
+            });
+        }
+        let mut mounts = serde_json::Map::new();
+        for (flag, prefix, mode, specs) in [
+            ("bind", BIND_PREFIX, "read-write", &self.bind),
+            ("ro-bind", RO_BIND_PREFIX, "read-only", &self.ro_bind),
+        ] {
+            for (i, spec) in specs.iter().enumerate() {
+                let (src, dst) = spec.split_once(':').unwrap_or((spec, spec));
+                if src.is_empty() || dst.is_empty() || dst.contains(':') {
+                    bail!("--{flag} {spec:?}: expected SRC or SRC:DST");
+                }
+                mounts.insert(
+                    format!("{prefix}{i:03}"),
+                    serde_json::json!({
+                        "source": cli_path(src, host, cwd),
+                        "destination": cli_path(dst, host, cwd),
+                        "mode": mode,
+                    }),
+                );
+            }
+        }
+        if !mounts.is_empty() {
+            layers.push(Layer::Snippet {
+                name: "<--bind>".into(),
+                text: format!("{{ mount+: {} }}", Value::Object(mounts)),
+            });
+        }
+
+        let evaluation = jsonnet::evaluate(&jsonnet::Input {
+            layers,
+            name: None,
+            home: &host.home,
+            root: &host.root,
+            forbidden: spec::canonical(std::slice::from_ref(&host.root)),
+            before_read: None,
+        })
+        .map_err(|f| spec::ConfigError {
+            name: None,
+            file: None,
+            problem: f.problem,
+        })?;
+        let settings = Settings {
+            config: evaluation.config,
+            app_id: self.app_id.clone(),
+        };
+        let spec = settings.spec()?;
+        jsonnet::check_files(&evaluation.files, &spec::canonical(&spec.writable())).map_err(|e| anyhow!("{e}"))?;
+        if let Some(id) = &settings.app_id {
+            spec::validate_app_id(id)?;
+            match spec.dbus.as_ref().map(|d| d.mode) {
+                Some(spec::DbusMode::Portal) => {}
+                Some(spec::DbusMode::Host) => {
+                    bail!("--app-id needs the private bus; with the host bus the portal sees psbox, not the app")
+                }
+                None => bail!("--app-id needs a session bus"),
+            }
+        }
+        Ok(settings)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{Dbus, Home, MountMode, Network, Xwayland, XwaylandScale};
+    use crate::spec::{DbusMode, DeviceClass, Home, MountMode, NetworkSetting, XwaylandMode, XwaylandScale};
 
     fn host() -> HostEnv {
         HostEnv {
@@ -209,7 +328,7 @@ mod tests {
             runtime_dir: "/run/user/1000".into(),
             wayland_socket: None,
             session_bus: None,
-            config_dir: "/home/u/.config/psbox".into(),
+            config_dir: "/nonexistent/psbox".into(),
             root: "/home/u/Sandbox".into(),
             pasta: true,
             exe: "/usr/bin/psbox".into(),
@@ -217,164 +336,138 @@ mod tests {
     }
 
     fn spec(o: &Options) -> Result<Spec> {
-        Spec::parse(&o.settings(&host(), Path::new("/work/dir"))?)
+        o.settings(&host(), Path::new("/work/dir"))?.spec()
+    }
+
+    fn with(config: &[&str]) -> Options {
+        Options {
+            config: config.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn builds_settings_from_flags() {
-        let o = Options {
-            home: HomeArgs {
-                home: Some("../client".into()),
-                ..Default::default()
-            },
-            devices: Some("gpu, camera".into()),
-            dbus: Some("host".into()),
-            dbus_talk: vec![],
-            no_display: true,
-            bind: vec!["~/Downloads".into(), "data:/srv/data".into()],
-            ro_bind: vec!["/etc/hosts:~/hosts".into()],
-            env: vec!["A=b=c".into()],
-            ..Default::default()
-        };
-        let s = spec(&o).unwrap();
-        assert_eq!(s.home, Home::Path("/work/client".into()));
-        assert_eq!(s.device_classes().len(), 2);
-        assert_eq!(s.dbus, Dbus::Host);
-        assert!(!s.display && s.xwayland == Xwayland::Off && s.network.is_none());
-        let x = Options {
-            home: HomeArgs {
-                home_tmpfs: true,
-                ..Default::default()
-            },
-            xwayland: Some("builtin".into()),
-            network: Some("host".into()),
-            open_urls: vec!["https=sandbox".into(), "mailto=host".into()],
-            ..Default::default()
-        };
-        let xs = spec(&Options {
-            bind: vec!["~/games/".into()],
-            ..x
-        })
-        .unwrap();
-        assert_eq!(xs.mount["bind-000"].host.as_deref(), Some("/home/u/games/"));
-        let talk = spec(&Options {
-            home: HomeArgs {
-                home_tmpfs: true,
-                ..Default::default()
-            },
-            dbus_talk: vec!["org.a.b".into(), "org.c.d".into()],
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(talk.dbus_talk, ["org.a.b", "org.c.d"]);
-        assert!(xs.display && xs.xwayland == Xwayland::Builtin && xs.network == Some(Network::Host));
-        assert_eq!(s.open_urls.host_schemes(), ["http", "https", "mailto"]);
-        assert_eq!(xs.open_urls.host_schemes(), ["http", "mailto"]);
-        #[derive(clap::Parser)]
-        struct Cli {
-            #[command(flatten)]
-            options: Options,
-        }
-        use clap::Parser;
-        let mode = |args: &[&str]| {
-            let cli = Cli::try_parse_from(["psbox", "--home-tmpfs"].iter().chain(args)).unwrap();
-            spec(&cli.options).unwrap().xwayland
-        };
-        assert_eq!(mode(&[]), Xwayland::Off);
-        assert_eq!(mode(&["--xwayland"]), Xwayland::Builtin);
-        assert_eq!(mode(&["--xwayland=xwayland-satellite"]), Xwayland::Satellite);
-        assert!(Cli::try_parse_from(["psbox", "--home-tmpfs", "--xwayland=satellite"]).is_err());
-        let scale = |args: &[&str]| {
-            let cli = Cli::try_parse_from(["psbox", "--home-tmpfs"].iter().chain(args)).unwrap();
-            spec(&cli.options).map(|s| s.xwayland_scale)
-        };
-        assert_eq!(
-            scale(&["--xwayland", "--xwayland-scale", "round-up"]).unwrap(),
-            XwaylandScale::RoundUp
-        );
-        assert!(scale(&["--xwayland=xwayland-satellite", "--xwayland-scale", "compositor"]).is_err());
-        for bad in [
-            &["ftp=host"][..],
-            &["https"],
-            &["https=elsewhere"],
-            &["https=sandbox", "https=host"],
-        ] {
-            let o = Options {
-                home: HomeArgs {
-                    home_tmpfs: true,
-                    ..Default::default()
-                },
-                open_urls: bad.iter().map(|v| v.to_string()).collect(),
-                ..Default::default()
-            };
-            assert!(o.settings(&host(), Path::new("/")).is_err(), "{bad:?}");
-        }
-        assert_eq!(s.env["A"], "b=c");
+    fn defaults_to_a_temporary_home() {
+        let s = spec(&Options::default()).unwrap();
+        assert_eq!(s.home, Some(Home::Temporary));
         assert_eq!(s.idle_timeout, 0);
-        let downloads = &s.mount["bind-000"];
-        assert_eq!(downloads.host.as_deref(), Some("/home/u/Downloads"));
-        assert_eq!(downloads.at.as_deref(), Some("/home/u/Downloads"));
-        assert_eq!(s.mount["bind-001"].host.as_deref(), Some("/work/dir/data"));
-        assert_eq!(s.mount["bind-001"].at.as_deref(), Some("/srv/data"));
+        assert!(s.app.is_empty());
+    }
+
+    #[test]
+    fn settings_from_config_keys() {
+        let s = spec(&with(&[
+            "home.mode=path",
+            "home.path=../client",
+            "devices.camera=true",
+            "devices.usb=[\"0483:5740\"]",
+            "dbus.mode=host",
+            "display=null",
+            "environment.A=b=c",
+            "environment.N=1.0",
+            "environment.Q=\"null\"",
+            "network.mode=host",
+        ]))
+        .unwrap();
+        assert_eq!(
+            s.home,
+            Some(Home::Path {
+                path: "/work/client".into(),
+                cache: spec::Cache::Temporary
+            })
+        );
+        assert!(s.devices.contains(&DeviceClass::Camera));
+        assert!(s.devices.contains(&DeviceClass::Usb {
+            vendor: 0x0483,
+            product: 0x5740
+        }));
+        assert_eq!(s.dbus.as_ref().map(|d| d.mode), Some(DbusMode::Host));
+        assert!(!s.display && s.xwayland.is_none());
+        assert_eq!(s.network, NetworkSetting::Host);
+        assert_eq!(s.environment["A"], "b=c");
+        assert_eq!(s.environment["N"], "1.0");
+        assert_eq!(s.environment["Q"], "null");
+
+        let x = spec(&with(&["xwayland={}", "xwayland.scale=round-up"])).unwrap();
+        let xw = x.xwayland.unwrap();
+        assert_eq!((xw.mode, xw.scale), (XwaylandMode::Builtin, XwaylandScale::RoundUp));
+        assert!(
+            spec(&with(&[
+                "xwayland.mode=xwayland-satellite",
+                "xwayland.scale=compositor"
+            ]))
+            .is_err()
+        );
+        let removed = spec(&with(&["environment.A=x", "environment.A=null"])).unwrap();
+        assert!(!removed.environment.contains_key("A"));
+        // A section set to null comes back with its defaults.
+        let back = spec(&with(&["dbus=null", "dbus.mode=portal"])).unwrap();
+        assert_eq!(back.dbus.map(|d| d.mode), Some(DbusMode::Portal));
+        let quoted = spec(&with(&["mount.\"a.b\".source=/srv", "mount.\"a.b\".mode=read-only"])).unwrap();
+        assert_eq!(quoted.mount["a.b"].mode, MountMode::ReadOnly);
+    }
+
+    #[test]
+    fn binds_and_profiles() {
+        let s = spec(&Options {
+            bind: vec!["~/Music".into(), "data:/srv/data".into()],
+            ro_bind: vec!["/etc/hosts:~/hosts".into()],
+            profile: vec!["browser".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.mount["bind-000"].source.as_deref(), Some(Path::new("/home/u/Music")));
+        assert_eq!(s.mount["bind-001"].source.as_deref(), Some(Path::new("/work/dir/data")));
+        assert_eq!(s.mount["bind-001"].destination, Path::new("/srv/data"));
         let hosts = &s.mount["ro-bind-000"];
         assert_eq!(
-            (hosts.mode, hosts.at.as_deref()),
-            (MountMode::Ro, Some("/home/u/hosts"))
+            (hosts.mode, hosts.destination.as_path()),
+            (MountMode::ReadOnly, Path::new("/home/u/hosts"))
         );
+        assert!(s.devices.contains(&DeviceClass::Camera), "the browser profile");
+        assert!(s.mount.contains_key("downloads"), "the browser profile");
     }
 
     #[test]
-    fn home_choices_and_errors() {
-        let tmpfs = Options {
-            home: HomeArgs {
-                home_tmpfs: true,
+    fn errors() {
+        let bad = |o: Options| format!("{:#}", spec(&o).unwrap_err());
+        assert!(bad(with(&["app.x.run=[\"x\"]"])).contains("no apps"));
+        assert!(bad(with(&["mount.bind-000.source=/x"])).contains("--bind"));
+        assert!(bad(with(&["devices.gpu=yes"])).contains("true or false"));
+        assert!(bad(with(&["sandbox.idle-timeout=soon"])).contains("whole number"));
+        assert!(bad(with(&["network.mode=lan"])).contains("lan"));
+        assert!(bad(with(&["nokey"])).contains("KEY=VALUE"));
+        assert!(bad(with(&["home.storage=x"])).contains("unknown key"));
+        assert!(
+            bad(Options {
+                profile: vec!["nope".into()],
                 ..Default::default()
-            },
-            devices: Some("none".into()),
-            ..Default::default()
-        };
-        let s = spec(&tmpfs).unwrap();
-        assert_eq!(s.home, Home::Tmpfs);
-        assert!(s.device_classes().is_empty());
-
-        let none = Options {
-            home: HomeArgs {
-                no_home: true,
+            })
+            .contains("no profile named nope")
+        );
+        assert!(
+            bad(Options {
+                app_id: Some("org.example.App".into()),
+                config: vec!["dbus=null".into()],
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(spec(&none).unwrap().home, Home::None);
-
-        let bad = |o: Options| spec(&o).unwrap_err().to_string();
-        assert!(bad(Options::default()).contains("--home"));
-        let mut o = Options {
-            home: HomeArgs {
-                home: Some("@self".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(bad(o).contains("@self"));
-        o = Options {
-            home: HomeArgs {
-                home_tmpfs: true,
-                ..Default::default()
-            },
-            network: Some("lan".into()),
-            ..Default::default()
-        };
-        assert!(bad(o).contains("lan"));
+            })
+            .contains("needs a session bus")
+        );
         for spec in ["/src:/dst:ro", "/etc/hosts:", ":/dst", ""] {
             let o = Options {
-                home: HomeArgs {
-                    home_tmpfs: true,
-                    ..Default::default()
-                },
                 bind: vec![spec.into()],
                 ..Default::default()
             };
             assert!(bad(o).contains("SRC:DST"), "{spec:?}");
         }
+    }
+
+    #[test]
+    fn key_segments() {
+        let (k, v) = split_setting("mount.\"a.b\".source=/x=y").unwrap();
+        assert_eq!(k, ["mount", "a.b", "source"]);
+        assert_eq!(v, "/x=y");
+        assert!(split_setting("mount..x=1").is_err());
+        assert!(split_setting("\"open=1").is_err());
     }
 }

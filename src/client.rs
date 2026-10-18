@@ -10,12 +10,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::plan::{HostEnv, Identity, Plan};
-use crate::protocol::{self, Request, Response};
+use crate::protocol::{self, NoIdentity, Request, Response, Unidentified};
 use crate::spec::Spec;
 use crate::sys::cvt_int;
 use crate::sys::fd::{Seqpacket, poll_readable};
 use crate::systemd::{self, Systemd};
 use crate::ui;
+use crate::unnamed::Settings;
 
 /// Connects to a running sandbox without starting it. The supervisor's
 /// state comes from systemd: connecting to the socket alone would start it.
@@ -61,16 +62,16 @@ fn connect_or_start(host: &HostEnv, id: &Identity, create_dirs: bool) -> Result<
 fn check_config(host: &HostEnv, id: &Identity, create_dirs: bool) -> Result<()> {
     match id {
         Identity::Instance { sandbox, .. } | Identity::Task { sandbox, .. } => {
-            let plan = Plan::build(id, &Spec::load(sandbox, &host.config_dir)?, host)?;
+            let plan = Plan::build(id, &Spec::load(sandbox, host)?, host)?;
             preflight(&plan, id, create_dirs)
         }
         Identity::Unnamed { .. } => Ok(()),
     }
 }
 
-/// With `create_dirs`, creates the missing directories marked with a
-/// trailing `/` outside the sandbox root too (the supervisor creates those
-/// inside it), then checks that the sandbox can start.
+/// With `create_dirs`, creates the missing sources of mounts with `create`
+/// outside the sandbox root too (the supervisor creates those inside it),
+/// then checks that the sandbox can start.
 fn preflight(plan: &Plan, id: &Identity, create_dirs: bool) -> Result<()> {
     if create_dirs {
         for dir in plan.create_dirs(true)? {
@@ -83,10 +84,25 @@ fn preflight(plan: &Plan, id: &Identity, create_dirs: bool) -> Result<()> {
 /// Runs `argv` in a new unnamed sandbox described by `settings` (see
 /// `unnamed.rs`) and returns the exit code to use. The sandbox and its socket
 /// unit are gone when this returns.
-pub fn sandbox(settings: &str, argv: Vec<String>, create_dirs: bool) -> Result<i32> {
+pub fn sandbox(settings: &Settings, argv: Vec<String>, create_dirs: bool) -> Result<i32> {
     let host = HostEnv::from_process()?;
     let id = Identity::Unnamed { id: random_id()? };
-    preflight(&Plan::build(&id, &Spec::parse(settings)?, &host)?, &id, create_dirs)?;
+    preflight(&Plan::build(&id, &settings.spec()?, &host)?, &id, create_dirs)?;
+    if let Some(app_id) = &settings.app_id {
+        use crate::identity::Probe;
+        let dirs = crate::install::Dirs::for_host(&host);
+        if let Some(by) = crate::install::claimant(app_id, crate::plan::UNNAMED, &dirs) {
+            bail!("--app-id {app_id}: {app_id}.desktop belongs to the sandbox {by}");
+        }
+        match crate::identity::probe(app_id, crate::identity::STARTING)? {
+            Probe::Accepted => {}
+            Probe::Unknown => bail!(
+                "the host portal doesn't accept {app_id}: there's no {app_id}.desktop in its applications directories"
+            ),
+            Probe::NoPortal => bail!("--app-id {app_id}: no portal runs on the host bus"),
+        }
+    }
+    let body = serde_json::to_string(settings)?;
     let dir = host.socket_dir();
     fs::DirBuilder::new()
         .recursive(true)
@@ -100,7 +116,7 @@ pub fn sandbox(settings: &str, argv: Vec<String>, create_dirs: bool) -> Result<i
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("create {}", path.display()))?;
-    if let Err(e) = file.write_all(settings.as_bytes()) {
+    if let Err(e) = file.write_all(body.as_bytes()) {
         let _ = fs::remove_file(&path);
         return Err(e).with_context(|| format!("write {}", path.display()));
     }
@@ -134,8 +150,8 @@ fn recv(conn: &Seqpacket, id: &Identity) -> Result<Option<(Response, Vec<OwnedFd
     }
 }
 
-/// Runs a command in the sandbox and returns the exit code to use.
-pub fn run(id: &Identity, command: Option<String>, args: Vec<String>, exec: bool, create_dirs: bool) -> Result<i32> {
+/// Runs an app in the sandbox and returns the exit code to use.
+pub fn run(id: &Identity, app: Option<String>, args: Vec<String>, exec: bool, create_dirs: bool) -> Result<i32> {
     let host = HostEnv::from_process()?;
     let conn = connect_or_start(&host, id, create_dirs)?;
     let env: BTreeMap<String, String> = std::env::vars_os()
@@ -151,7 +167,7 @@ pub fn run(id: &Identity, command: Option<String>, args: Vec<String>, exec: bool
     protocol::send(
         &conn,
         &Request::Spawn(protocol::Spawn {
-            command,
+            app,
             args,
             env,
             cwd,
@@ -178,6 +194,7 @@ pub fn run(id: &Identity, command: Option<String>, args: Vec<String>, exec: bool
                     Response::Spawned {
                         restart_pending,
                         network_fallback,
+                        unidentified,
                         ..
                     },
                     _,
@@ -185,6 +202,29 @@ pub fn run(id: &Identity, command: Option<String>, args: Vec<String>, exec: bool
                     let who = ui::paint(ui::BOLD, id.describe());
                     if network_fallback {
                         warn_network_fallback(id);
+                    }
+                    if let Some(Unidentified { id: app_id, reason }) = unidentified {
+                        ui::warning(format!(
+                            "{who} runs without a portal identity {}",
+                            ui::paint(
+                                ui::DIM,
+                                format!(
+                                    "· {}, so file dialogs show only the sandbox and screen sharing, the camera portal, and printing are unavailable",
+                                    reason.describe(&app_id)
+                                )
+                            )
+                        ));
+                        match reason {
+                            NoIdentity::Unknown => ui::fix(format!(
+                                "{} writes its desktop entry; then restart it with {}",
+                                ui::code("psbox install"),
+                                ui::code(format!("psbox stop {}", id.cli_args()))
+                            )),
+                            NoIdentity::Claimed { .. } => {
+                                ui::fix(format!("give the app an {} of its own", ui::code("id")))
+                            }
+                            NoIdentity::NoPortal => {}
+                        }
                     }
                     if !restart_pending.is_empty() {
                         ui::warning(format!(
@@ -208,8 +248,8 @@ pub fn run(id: &Identity, command: Option<String>, args: Vec<String>, exec: bool
     }
 }
 
-/// Warns that a sandbox without `network` uses the host network because
-/// pasta is not installed.
+/// Warns that a sandbox with the automatic network uses the host network
+/// because pasta is not installed.
 pub fn warn_network_fallback(id: &Identity) {
     ui::warning(format!(
         "{} is using the host network {}",
@@ -219,8 +259,8 @@ pub fn warn_network_fallback(id: &Identity) {
     ui::fix(format!(
         "install pasta for isolated networking, or {} to silence this",
         match id {
-            Identity::Unnamed { .. } => format!("pass {}", ui::code("--network host")),
-            _ => format!("set {}", ui::code("network = \"host\"")),
+            Identity::Unnamed { .. } => format!("pass {}", ui::code("-c network.mode=host")),
+            _ => format!("set {}", ui::code("network: { mode: 'host' }")),
         }
     ));
 }
@@ -273,7 +313,11 @@ mod tests {
     fn unreadable_response_means_an_older_supervisor() {
         let (a, b) = Seqpacket::pair().unwrap();
         // A reply from a version whose `Spawned` lacks a field this one has.
-        a.send(br#"{"Spawned":{"pid":1,"restart_pending":[]}}"#, &[]).unwrap();
+        a.send(
+            br#"{"Spawned":{"pid":1,"restart_pending":[],"network_fallback":false}}"#,
+            &[],
+        )
+        .unwrap();
         let id = Identity::Instance {
             sandbox: "firefox".into(),
             instance: None,

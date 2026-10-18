@@ -1,4 +1,4 @@
-//! The display scale xwayland-satellite is told (`xwayland-scale`).
+//! The display scale xwayland-satellite is told (`xwayland.scale`).
 //!
 //! Satellite sizes the X screen from an output's current mode and works at
 //! the scale the compositor gives it: `wl_output.scale`, overridden by a

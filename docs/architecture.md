@@ -10,9 +10,11 @@ sandbox.
 psbox run <name>  --seqpacket + SCM_RIGHTS-->  psbox@<key>.service (socket-activated, Delegate=yes)
                                                supervisor: owns user + mount namespaces and the cgroup subtree
                                                  |- forker thread  (joined to the sandbox PID namespace)
-                                                 |- infra/     init (PID 1), the private dbus-daemon and the services it activates,
-                                                 |            the connector, xwayland-satellite and Xwayland, psbox decorations
-                                                 '- workload/  apps, cloned straight into this cgroup
+                                                 |- infra/init/       init (PID 1)
+                                                 |- infra/bus/        the private dbus-daemon and the services it activates
+                                                 |- infra/display/    xwayland-satellite and Xwayland, psbox decorations
+                                                 |- infra/connector/  the host bus connector
+                                                 '- workload/launch-<n>/  one launch: what `run` or `task` started, and its children
 ```
 
 - The supervisor creates its user and mount namespaces as it starts, before
@@ -21,8 +23,9 @@ psbox run <name>  --seqpacket + SCM_RIGHTS-->  psbox@<key>.service (socket-activ
   abstract-socket and signal scopes. Because no filesystem access is
   handled, Landlock does not block its mount syscalls. Everything started
   later inherits the scopes.
+- The supervisor itself (with `pasta`) runs in `supervisor/`.
 - `init` is cloned with `CLONE_NEWPID | CLONE_INTO_CGROUP | CLONE_PIDFD`. It
-  unshares mount and IPC namespaces (and network for `isolated` and `none`),
+  unshares mount and IPC namespaces (and network, unless the sandbox uses the host's),
   builds the root on a detached tmpfs with `open_tree`, `fsopen`/`fsmount`,
   `move_mount`, and `mount_setattr`, pivots, hands the supervisor writable
   clones of the read-only root and `/dev` mounts, drops every capability,
@@ -33,7 +36,16 @@ psbox run <name>  --seqpacket + SCM_RIGHTS-->  psbox@<key>.service (socket-activ
   mount, IPC, and network namespaces through the init pidfd, starts a
   session, applies seccomp, and execs. The supervisor is the real parent of
   every app, so exit codes and signals pass straight through.
-- The sandbox is idle when `workload/` is not populated and no client is
+- Each launch gets a cgroup of its own, `workload/launch-<n>`. The launch,
+  the bus, and the display helpers unshare a cgroup namespace right after
+  they are cloned, so their cgroup is the root of what they see. psbox
+  requires the cgroup2 hierarchy to be mounted with `nsdelegate` (systemd's
+  default), which makes a cgroup namespace a delegation boundary: no
+  process in it can move itself or a child into another cgroup. So a
+  process's cgroup tells which launch it belongs to, which is how the
+  gateway finds its [portal identity](#portal-identity). A finished
+  launch's cgroup is removed.
+- The sandbox is idle when no launch cgroup is populated and no client is
   connected; after `idle-timeout` seconds of that, the supervisor stops.
 
 ## Supervisors and units
@@ -67,12 +79,26 @@ message per packet, with file descriptors (the command's stdio) passed as
 
 ## Plans and the startup check
 
-A sandbox config and the host's facts (paths, sockets, whether `pasta` is
-installed) make a plan: the mounts, environment, commands, bus, display,
-and network the sandbox gets. The client builds the plan before starting a
+A sandbox config, evaluated (see below), and the host's facts (paths,
+sockets, whether `pasta` is installed) make a plan: the mounts,
+environment, apps, bus, display, and network the sandbox gets. The client builds the plan before starting a
 sandbox and runs the [startup check](cli.md#the-startup-check) on it; the
 supervisor builds it again from the same config and repeats the check
 before creating anything.
+
+Configs are Jsonnet, evaluated in process with `rsjsonnet-lang`: psbox's
+library (`import 'psbox'`) composes its base, the profiles, the file, and
+any `-c` settings into one object, and each task's config is that object
+with the task's overrides added. Rust gets the manifested JSON and
+validates it strictly, filling in defaults. Every file the evaluation reads
+is opened once, checked to be a regular file outside the places the sandbox
+can write, and read through the descriptor that was checked; after
+evaluating, the files are checked again against the places the result
+makes writable (see [configuration.md](configuration.md#what-a-config-may-read)).
+
+The supervisor watches the directories of the files the config read, and
+the nearest existing parent of an import that was missing, with inotify.
+A change re-evaluates the config; an unchanged result does nothing.
 
 When the config changes, the supervisor builds a new plan and compares it
 with the running one: mounts that can change live are attached and
@@ -118,20 +144,19 @@ node is still reachable.
 
 ## D-Bus
 
-Each sandbox with `dbus = "portal"` runs a private `dbus-daemon` in the
-`infra` cgroup with a psbox-written configuration. Its activatable services
+Each sandbox with the private bus (`dbus.mode: 'portal'`) runs a private
+`dbus-daemon` in `infra/bus` with a psbox-written configuration. Its activatable services
 are links to the host's `/usr/share/dbus-1/services` files minus portals and
-`dbus-talk` names, plus the sandbox's own `~/.local/share/dbus-1/services`. A plain private bus
+`dbus.talk` names, plus the sandbox's own `~/.local/share/dbus-1/services`. A plain private bus
 would activate `xdg-desktop-portal` inside the sandbox from the host's
 service files; leaving portal services out makes portal names always reach
 the gateway.
 
 The supervisor's gateway owns `org.freedesktop.portal.Desktop` and
 `org.freedesktop.Notifications` on that bus. Each sandbox client that calls
-them gets its own host connection, which registers the client's app id
-(from the command that started it) with
-`org.freedesktop.host.portal.Registry`, so host services see per-client
-lifetimes and portal request and session paths map one-to-one onto the
+them gets its own host connection, which registers the client's
+[portal identity](#portal-identity), when it has one, so host services see
+per-client lifetimes and portal request and session paths map one-to-one onto the
 paths the client predicted from its own name. A client's host connection
 closes when the client leaves the private bus, which ends its inhibitors
 and sessions, except that it stays until an open OpenURI request is
@@ -150,10 +175,10 @@ sandboxed app would start the host's browser inside its own sandbox. With a
 session bus, the root has the psbox executable (bound read-only at
 `/run/psbox/bin/psbox`), and a `mimeapps.list` and desktop entry in
 `/run/psbox` that make `psbox open-uri` the handler for the schemes
-`[open-urls]` sends to the host; `XDG_CONFIG_DIRS` and `XDG_DATA_DIRS` find
+`links` sends to the host; `XDG_CONFIG_DIRS` and `XDG_DATA_DIRS` find
 them first. `psbox open-uri` calls `OpenURI.OpenURI` on the session bus
 with the caller's `XDG_ACTIVATION_TOKEN` and waits for the request's
-`Response` (with `dbus = "host"` it talks to the host portal directly, with
+`Response` (with `mode: 'host'` it talks to the host portal directly, with
 no gateway to keep the request open). The host portal opens the link with
 the host's default app, which for a sandbox installed with `psbox install`
 is `psbox run`.
@@ -162,7 +187,7 @@ The host portal identifies a client by the process that opened its host
 connection and reads the process ids a client passes (Realtime) in that
 process's PID namespace, as it does for Flatpak apps. So the connector opens
 the host connections: a process forked on the forker thread into the
-sandbox's PID namespace and the `infra` cgroup, started on first use, that
+sandbox's PID namespace and `infra/connector`, started on first use, that
 connects a socket to the host bus for each request and passes it back. It
 joins the sandbox's mount namespace (and network namespace, when the sandbox
 has one) and reaches the host bus through a descriptor for its socket
@@ -177,7 +202,7 @@ supervisor's memory on the host. If it exits, does not answer
 within five seconds, or finds its socket refusing connections (the host bus
 made a new one), a new one is started for that client.
 
-Each `dbus-talk` name gets its own gateway connection to the private bus,
+Each `dbus.talk` name gets its own gateway connection to the private bus,
 which owns that name: GDBus proxies call the owner's unique name, which is
 then unambiguous, and the bus accepts a reply only from the connection that
 was called. Calls to it go out through the caller's host connection
@@ -188,10 +213,42 @@ converted to little-endian when it is read; one whose body cannot be
 decoded is skipped (with an error reply to a method call) without ending
 the connection.
 
-The host bus, for the gateway and for `dbus = "host"`, is `PSBOX_HOST_BUS`
+The host bus, for the gateway and for `mode: 'host'`, is `PSBOX_HOST_BUS`
 when set (used for headless tests), else `DBUS_SESSION_BUS_ADDRESS`, else
 `$XDG_RUNTIME_DIR/bus`. It must be a `unix:path=` address: the abstract-socket
 scope means a host bus at an abstract address cannot be reached.
+
+## Portal identity
+
+The host portal identifies an unsandboxed app by the systemd unit it runs
+in, and a Flatpak app by its sandbox; a psbox process is neither, so the
+gateway registers each client's host connection with
+`org.freedesktop.host.portal.Registry.Register` under its launch's
+identity (see [configuration.md](configuration.md#portal-identity) for
+which launch gets which).
+
+When a launch starts, the supervisor calls `Register` with the candidate id
+on a host bus connection of its own, which it then closes: the host portal
+accepts the id only when it has an application entry with it. `App info
+not found` means it has none, so the launch runs without an identity; no
+portal on the host bus means none can be registered; any other error is
+retried for up to 25 seconds (a portal that is starting), then the launch
+fails. An id whose installed entry psbox tagged for another sandbox is not
+used. A launch without an identity gets none of the portal environment
+variables (`GTK_USE_PORTAL` and the like), so its toolkit uses its own
+dialogs; values the config sets for them are dropped, with a log line.
+
+When a client first calls a portal, the gateway asks the private bus for
+its credentials (`GetConnectionCredentials`, whose `ProcessFD` is a pidfd),
+reads the process's cgroup through `/proc` and checks the pidfd again, so a
+reused pid is never taken for it, and maps the cgroup to a launch, or to
+`infra/bus` for services the bus started. The new host connection
+registers that identity before it carries anything, and the gateway pins
+the unique name of the portal that answered; if the portal's owner
+changes, the gateway registers again and holds the client's calls until it
+replies. A client without an identity reaches only the portals listed in
+[isolation.md](isolation.md#d-bus); other portal interfaces answer
+`UnknownInterface`, and introspection shows only those.
 
 ## Xwayland
 
@@ -199,7 +256,7 @@ With `xwayland` on (and a Wayland socket), the supervisor picks a display
 number `N`, creates the sandbox's X socket itself as a filesystem socket at
 `/tmp/.X11-unix/XN` (on a tmpfs of its own, even when `/tmp` is a share),
 and sets `DISPLAY=:N` for everything it starts. The first connection starts
-`xwayland-satellite :N -listenfd 3 -nolisten local` in the `infra` cgroup;
+`xwayland-satellite :N -listenfd 3 -nolisten local` in `infra/display`;
 it runs a rootless Xwayland and turns each X11 window into a Wayland window
 on the host compositor. If it exits, the next X client starts it again.
 
@@ -207,7 +264,7 @@ With `builtin`, satellite's `WAYLAND_DISPLAY` is
 `/tmp/.X11-unix/psbox-wayland-N` instead of the host's socket, on the X
 socket's own tmpfs, so it is never in a share. The supervisor accepts
 satellite's connection there, closing any from another
-process (by `SO_PEERCRED`), and starts `psbox decorations` in `infra` with
+process (by `SO_PEERCRED`), and starts `psbox decorations` in `infra/display` with
 it, from the psbox bound at `/run/psbox/bin/psbox`. A ready-made socket
 (`WAYLAND_SOCKET`) would not do: satellite starts Xwayland with its own
 environment and descriptors before it connects, and Xwayland would take
@@ -234,7 +291,7 @@ the sandbox, the last three for each new frame, and the proxy waits for
 them; without them it falls back to a light theme, the default layout, and
 its built-in font.
 
-For `xwayland-scale`, the proxy rewrites the scale satellite sees, per
+For `xwayland.scale`, the proxy rewrites the scale satellite sees, per
 output. Satellite sizes the X screen from an output's current mode and
 works at `wl_output.scale`, overridden by a window's
 `wp_fractional_scale_v1.preferred_scale`. With `round-up`, the preferred
@@ -255,7 +312,7 @@ line in the log. Title bars are drawn at the real scale.
 
 X clients (libxcb, and Xlib through it) try the abstract socket
 `@/tmp/.X11-unix/XN` before the file and fall back to the file only when
-that name does not exist. With `network = "host"` the sandbox shares the
+that name does not exist. With `network.mode: 'host'` the sandbox shares the
 host's abstract names, and Landlock refuses connections to the host's X
 servers, which clients treat as fatal. So `N` is the first number from 28787
 (`0x7073`, "ps" in ASCII) up to 59535 that has no abstract X socket in
@@ -281,11 +338,11 @@ see the host's `/run/systemd/resolve` for name lookups.
 | `lib.rs`, `main.rs` | Command line and dispatch (`main.rs` only calls the library) |
 | `cli.rs`, `ui.rs` | Reporting commands and terminal output |
 | `client.rs`, `unnamed.rs` | The client side of `run`, `task`, and `sandbox` |
-| `spec.rs`, `plan.rs` | Config parsing and validation; plans and the startup check |
+| `jsonnet.rs`, `spec.rs`, `plan.rs` | Evaluating and validating configs; plans and the startup check |
 | `supervisor.rs` | The supervisor: start, spawn, live changes, devices, idle |
 | `root.rs`, `spawn.rs`, `forker.rs`, `inject.rs` | The sandbox root, spawning, and joining the sandbox's namespaces |
 | `sys/` | Namespaces, the mount API, Landlock, seccomp, cgroups, inotify, file descriptors |
-| `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `dbus/` | The private bus, the gateway and its connector, the portal policy, and the D-Bus wire format |
+| `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `identity.rs`, `dbus/` | The private bus, the gateway and its connector, the portal policy, portal identities, and the D-Bus wire format |
 | `devices.rs`, `x11.rs`, `desktop.rs`, `install.rs`, `systemd.rs`, `protocol.rs` | Device classes, Xwayland, desktop entries, the user manager, and the client protocol |
 | `decorations/` | `psbox decorations`: the Wayland proxy between satellite and the compositor, and the title bars it draws |
 | `fuzz.rs` | Entry points for the fuzz targets (built only for them) |

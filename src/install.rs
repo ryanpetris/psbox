@@ -1,11 +1,13 @@
 //! `psbox install`: desktop and autostart entries for every sandbox.
 //!
-//! Entries go to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/autostart`
-//! under the same ids as the host's entries, so the sandboxed launcher
-//! replaces the host one in menus and at login. Only files carrying the
-//! psbox generator marker are ever overwritten or removed, and each names the
-//! sandbox it was generated for, so a config that fails to load keeps its
-//! entries.
+//! Each `app` entry of a config is one file: an application in
+//! `$XDG_DATA_HOME/applications`, an autostart entry in
+//! `$XDG_CONFIG_HOME/autostart`, under its id, so the sandboxed entry
+//! replaces a host one with the same id in menus and at login. Only files
+//! carrying the psbox generator marker are ever overwritten or removed, and
+//! each names the sandbox it was generated for, so a config that fails to
+//! load keeps its entries. When sandboxes claim the same file, the one whose
+//! name sorts first gets it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -16,9 +18,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::desktop::{self, Entry, GENERATOR_MARKER, SANDBOX_TAG, Target};
+use crate::desktop::{self, ACTION_PREFIX, Entry, GENERATOR_MARKER, SANDBOX_TAG, Target};
 use crate::plan::HostEnv;
-use crate::spec::{Spec, Tokens};
+use crate::spec::{Action, AppSpec, KeyValue, Kind, Spec};
 use crate::sys::path_cstr;
 
 /// Where entries are read from and written to.
@@ -33,7 +35,8 @@ pub struct Dirs {
 }
 
 impl Dirs {
-    pub fn from_env(host: &HostEnv) -> Self {
+    /// The directories in this process's environment.
+    pub fn for_host(host: &HostEnv) -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let list = |k: &str, default: &str| -> Vec<PathBuf> {
             var(k)
@@ -73,14 +76,17 @@ pub struct Generation {
     /// Entries that could not be generated, as (sandbox, config entry,
     /// problem).
     pub warnings: Vec<(String, String, String)>,
-    /// Paths of entries that could not be built; installed files there are
-    /// kept.
+    /// Things worth knowing that leave nothing out, as (sandbox, config
+    /// entry, note).
+    pub notes: Vec<(String, String, String)>,
+    /// Paths of entries that could not be built, or that another sandbox
+    /// claims; installed files there are kept.
     pub failed: Vec<PathBuf>,
 }
 
 /// Who generated a file: `None` if psbox did not write it, `Some(None)` for
 /// a psbox file without an `@sandbox` line, else the sandbox it names.
-fn owner(path: &Path) -> Option<Option<String>> {
+pub fn owner(path: &Path) -> Option<Option<String>> {
     let text = fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     if lines.next() != Some(GENERATOR_MARKER) {
@@ -93,74 +99,160 @@ fn is_generated(path: &Path) -> bool {
     owner(path).is_some()
 }
 
-/// Finds a host entry `<id>.desktop` under `<dir>/<sub>`, skipping files
-/// psbox wrote.
+/// The relative paths GIO looks up a desktop file id at: `<id>.desktop`,
+/// and with one `-` taken as a directory (`kde4-foo` in `kde4/foo.desktop`).
+fn id_paths(id: &str) -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from(format!("{id}.desktop"))];
+    for (i, _) in id.match_indices('-') {
+        out.push(Path::new(&id[..i]).join(format!("{}.desktop", &id[i + 1..])));
+    }
+    out
+}
+
+/// Finds a host entry for `id` under `<dir>/<sub>`, skipping files psbox
+/// wrote.
 fn find_host(dirs: &[PathBuf], sub: &str, id: &str) -> Option<PathBuf> {
     dirs.iter()
-        .map(|d| d.join(sub).join(format!("{id}.desktop")))
+        .flat_map(|d| id_paths(id).into_iter().map(move |p| d.join(sub).join(p)))
         .find(|p| p.is_file() && !is_generated(p))
 }
 
-struct Source<'a> {
-    from: &'a str,
-    entry: Option<&'a str>,
-    set: &'a BTreeMap<String, String>,
-    remove_args: &'a [String],
+/// Whether the host has an application entry `id` that psbox did not
+/// write, for the implicit default app to inherit.
+pub fn host_entry_exists(id: &str, host: &HostEnv) -> bool {
+    let dirs = Dirs::for_host(host);
+    let data_home = dirs.applications.parent().map(Path::to_path_buf).into_iter();
+    let search: Vec<PathBuf> = data_home.chain(dirs.data_dirs.iter().cloned()).collect();
+    find_host(&search, "applications", id).is_some()
 }
 
-fn build(
-    source: &Source<'_>,
-    search: &[(&[PathBuf], &str)],
-    target: &Target<'_>,
-    tokens: &Tokens<'_>,
-) -> Result<Entry> {
-    let mut entry = match source.entry {
-        Some(text) => Entry::parse(text).context("inline entry")?,
-        None => {
+/// Applies Desktop Entry keys from a config to `section`.
+fn apply_keys(entry: &mut Entry, section: &str, keys: &BTreeMap<String, KeyValue>) -> Result<()> {
+    for (key, value) in keys {
+        match value {
+            KeyValue::Remove => entry.remove_all(section, key),
+            KeyValue::Bool(b) => entry.set(section, key, if *b { "true" } else { "false" }),
+            KeyValue::Str(s) => {
+                entry.remove_all(section, key);
+                entry.set(
+                    section,
+                    key,
+                    &desktop::escape(s).with_context(|| format!("keys.{key}"))?,
+                );
+            }
+            KeyValue::List(items) => entry.set(
+                section,
+                key,
+                &desktop::escape_list(items).with_context(|| format!("keys.{key}"))?,
+            ),
+            KeyValue::Localized { default, locales } => {
+                entry.remove_all(section, key);
+                entry.set(
+                    section,
+                    key,
+                    &desktop::escape(default).with_context(|| format!("keys.{key}"))?,
+                );
+                for (locale, text) in locales {
+                    let escaped = desktop::escape(text).with_context(|| format!("keys.{key}.{locale}"))?;
+                    entry.set(section, &format!("{key}[{locale}]"), &escaped);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where host entries of one kind are found: each set of data directories
+/// with the subdirectory to look in.
+type Search<'a> = [(&'a [PathBuf], &'a str)];
+
+/// What an entry is built from.
+struct Source<'a> {
+    /// The host entry to copy, and where to look for it.
+    copy: Option<(&'a str, &'a Search<'a>)>,
+    /// The name of the app entry, `Name` when written from scratch.
+    name: &'a str,
+    keys: &'a BTreeMap<String, KeyValue>,
+    actions: Option<&'a BTreeMap<String, Option<Action>>>,
+    remove_arguments: &'a [String],
+    no_display: Option<bool>,
+}
+
+fn build(source: &Source<'_>, target: &Target<'_>) -> Result<Entry> {
+    let mut entry = match source.copy {
+        Some((id, search)) => {
             let path = search
                 .iter()
-                .find_map(|(dirs, sub)| find_host(dirs, sub, source.from))
-                .with_context(|| format!("no host entry {}.desktop", source.from))?;
+                .find_map(|(dirs, sub)| find_host(dirs, sub, id))
+                .with_context(|| format!("no host entry {id}.desktop"))?;
             let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            Entry::parse(&text).with_context(|| format!("{}", path.display()))?
+            let mut entry = Entry::parse(&text).with_context(|| format!("{}", path.display()))?;
+            desktop::rewrite(&mut entry, target, source.remove_arguments)?;
+            entry
+        }
+        None => {
+            let mut entry = Entry::new();
+            entry.set(desktop::MAIN, "Name", &desktop::escape(source.name)?);
+            entry
         }
     };
-    desktop::rewrite(&mut entry, target, source.remove_args)?;
-    for (k, v) in source.set {
-        entry.set(desktop::MAIN, k, v);
+    apply_keys(&mut entry, desktop::MAIN, source.keys)?;
+    for (name, action) in source.actions.into_iter().flatten() {
+        let section = format!("{ACTION_PREFIX}{name}");
+        match action {
+            None => entry.remove_section(&section),
+            Some(a) => {
+                entry.add_section(&section);
+                if !a.keys.contains_key("Name") && entry.get(&section, "Name").is_none() {
+                    entry.set(&section, "Name", &desktop::escape(name)?);
+                }
+                apply_keys(&mut entry, &section, &a.keys)?;
+                entry.set(&section, "Exec", &target.exec(&a.arguments));
+            }
+        }
     }
-    if let Some(icon) = entry
-        .get(desktop::MAIN, "Icon")
-        .filter(|i| i.starts_with('~') || i.starts_with('@'))
-    {
-        let expanded = tokens.expand(icon)?;
-        entry.set(desktop::MAIN, "Icon", &expanded.to_string_lossy());
+    match source.no_display {
+        Some(true) => entry.set(desktop::MAIN, "NoDisplay", "true"),
+        Some(false) => entry.remove(desktop::MAIN, "NoDisplay"),
+        None => {}
     }
+    desktop::finish(&mut entry, target);
     Ok(entry)
 }
 
-/// Generates every configured entry. Entries are independent: one that
+/// Generates every configured entry, from sandboxes in name order: when two
+/// claim one file, the first gets it. Entries are independent: one that
 /// cannot be built is reported and skipped.
-pub fn generate(sandboxes: &[(String, Spec)], host: &HostEnv, dirs: &Dirs, psbox: &Path) -> Generation {
+pub fn generate(sandboxes: &[(String, Spec)], dirs: &Dirs, psbox: &Path) -> Generation {
     let mut out: Vec<Generated> = Vec::new();
     let mut warnings = Vec::new();
+    let mut notes = Vec::new();
     let mut failed = Vec::new();
-    let apps: &[(&[PathBuf], &str)] = &[(&dirs.data_dirs, "applications")];
-    let autostart: &[(&[PathBuf], &str)] = &[(&dirs.config_dirs, "autostart"), (&dirs.data_dirs, "applications")];
-    for (name, spec) in sandboxes {
-        let tokens = Tokens {
-            home: &host.home,
-            root: &host.root,
-            name,
-        };
+    let data_home: Vec<PathBuf> = dirs.applications.parent().map(Path::to_path_buf).into_iter().collect();
+    let config_home: Vec<PathBuf> = dirs.autostart.parent().map(Path::to_path_buf).into_iter().collect();
+    let apps: &Search = &[(&data_home, "applications"), (&dirs.data_dirs, "applications")];
+    let autostart: &Search = &[
+        (&config_home, "autostart"),
+        (&dirs.config_dirs, "autostart"),
+        (&data_home, "applications"),
+        (&dirs.data_dirs, "applications"),
+    ];
+    let mut sorted: Vec<&(String, Spec)> = sandboxes.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, spec) in sorted {
         let mut push = |path: PathBuf, r: Result<Entry>, what: String| match r {
             Ok(entry) => {
                 if let Some(prev) = out.iter().find(|g| g.path == path) {
                     warnings.push((
                         name.clone(),
                         what,
-                        format!("{} is already generated for {}", crate::ui::tilde(&path), prev.sandbox),
+                        format!(
+                            "{} also belongs to {}, whose name sorts first",
+                            crate::ui::tilde(&path),
+                            prev.sandbox
+                        ),
                     ));
+                    failed.push(path);
                 } else {
                     out.push(Generated {
                         path,
@@ -174,59 +266,71 @@ pub fn generate(sandboxes: &[(String, Spec)], host: &HostEnv, dirs: &Dirs, psbox
                 failed.push(path);
             }
         };
-        for (cmd_name, cmd) in &spec.command {
-            let Some(d) = &cmd.desktop else { continue };
-            let id = desktop_id(cmd_name, cmd.app_id.as_deref(), d.id.as_deref());
-            let source = Source {
-                from: d.from.as_deref().unwrap_or(&id),
-                entry: d.entry.as_deref(),
-                set: &d.set,
-                remove_args: &d.remove_args,
+        for (app_name, app) in &spec.app {
+            let what = format!("app.{app_name}");
+            let dir = match app.kind() {
+                Kind::Application => &dirs.applications,
+                Kind::Autostart => &dirs.autostart,
             };
-            let target = Target {
-                psbox,
-                sandbox: name,
-                command: cmd_name,
-            };
-            let path = dirs.applications.join(format!("{id}.desktop"));
-            push(
-                path,
-                build(&source, apps, &target, &tokens),
-                format!("[command.{cmd_name}]"),
-            );
-        }
-        for (id, a) in &spec.autostart {
-            let path = dirs.autostart.join(format!("{id}.desktop"));
-            let what = format!("[autostart.{id}]");
-            if a.hidden {
-                push(path, Ok(desktop::hidden(id)), what);
-                continue;
+            let path = dir.join(format!("{}.desktop", app.id()));
+            match app {
+                AppSpec::Suppress { id, .. } => push(path, Ok(desktop::hidden(id)), what),
+                AppSpec::Application(a) if !a.has_entry() => notes.push((
+                    name.clone(),
+                    what,
+                    format!(
+                        "no {app_name}.desktop to inherit, so the default app has no menu entry or portal identity; define app.{app_name} or set it to null"
+                    ),
+                )),
+                AppSpec::Application(a) => {
+                    let target = Target {
+                        psbox,
+                        sandbox: name,
+                        app: app_name,
+                    };
+                    let source = Source {
+                        copy: a.source_id.as_deref().map(|id| (id, apps)),
+                        name: app_name,
+                        keys: &a.keys,
+                        actions: Some(&a.actions),
+                        remove_arguments: &a.remove_arguments,
+                        no_display: a.no_display,
+                    };
+                    push(path, build(&source, &target), what);
+                }
+                AppSpec::Autostart(s) => {
+                    let target = Target {
+                        psbox,
+                        sandbox: name,
+                        app: &s.app,
+                    };
+                    let source = Source {
+                        copy: s.source_id.as_deref().map(|id| (id, autostart)),
+                        name: app_name,
+                        keys: &s.keys,
+                        actions: None,
+                        remove_arguments: &s.remove_arguments,
+                        no_display: None,
+                    };
+                    push(path, build(&source, &target), what);
+                }
             }
-            let command = a.command.clone().unwrap_or_else(|| name.clone());
-            let source = Source {
-                from: a.from.as_deref().unwrap_or(id),
-                entry: a.entry.as_deref(),
-                set: &a.set,
-                remove_args: &a.remove_args,
-            };
-            let target = Target {
-                psbox,
-                sandbox: name,
-                command: &command,
-            };
-            push(path, build(&source, autostart, &target, &tokens), what);
         }
     }
     Generation {
         entries: out,
         warnings,
+        notes,
         failed,
     }
 }
 
-/// The desktop file id of a command's entry.
-pub fn desktop_id(command: &str, app_id: Option<&str>, id: Option<&str>) -> String {
-    id.or(app_id).unwrap_or(command).to_string()
+/// The sandbox, other than `sandbox`, whose installed application entry
+/// has the portal identity `id`.
+pub fn claimant(id: &str, sandbox: &str, dirs: &Dirs) -> Option<String> {
+    owner(&dirs.applications.join(format!("{id}.desktop")))
+        .flatten()
+        .filter(|s| s != sandbox)
 }
 
 /// Replaces the file at `path` with `body`. The content goes to a new,
@@ -374,7 +478,7 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    fn setup(tag: &str) -> (PathBuf, Dirs, HostEnv) {
+    fn setup(tag: &str) -> (PathBuf, Dirs) {
         let root = tempdir(tag);
         let dirs = Dirs {
             applications: root.join("home/.local/share/applications"),
@@ -386,7 +490,8 @@ mod tests {
         fs::create_dir_all(root.join("etc/xdg/autostart")).unwrap();
         fs::write(
             root.join("usr/share/applications/code-oss.desktop"),
-            "[Desktop Entry]\nName=Code\nExec=code --new-window %F\nTryExec=code\nIcon=code-oss\n",
+            "[Desktop Entry]\nName=Code\nExec=code --new-window %F\nTryExec=code\nIcon=code-oss\n\
+             Actions=new-empty-window;\n\n[Desktop Action new-empty-window]\nName=New Empty Window\nExec=code --new-window %F\n",
         )
         .unwrap();
         fs::write(
@@ -394,59 +499,49 @@ mod tests {
             "[Desktop Entry]\nName=Steam\nExec=steam -silent\n",
         )
         .unwrap();
-        let host = HostEnv {
-            uid: 1000,
-            gid: 1000,
-            user: "u".into(),
-            home: "/home/u".into(),
-            runtime_dir: "/run/user/1000".into(),
-            wayland_socket: None,
-            session_bus: None,
-            config_dir: root.join("config"),
-            root: "/home/u/Sandbox".into(),
-            pasta: true,
-            exe: "/usr/bin/psbox".into(),
-        };
-        (root, dirs, host)
+        (root, dirs)
+    }
+
+    fn spec(name: &str, text: &str, host_entries: &[&str]) -> Spec {
+        crate::spec::parse_named(name, &format!("local psbox = import 'psbox';\n{text}"), host_entries)
+            .unwrap_or_else(|e| panic!("{e:#}"))
     }
 
     fn specs() -> Vec<(String, Spec)> {
-        let code = Spec::parse(
-            r#"
-            [command.code]
-            exec = ["code"]
-            desktop = { id = "code-oss", remove-args = ["--new-window"], set = { StartupWMClass = "code-oss" } }
-
-            [command.insiders]
-            exec = ["~/.bin/code-insiders"]
-            desktop.entry = """
-            [Desktop Entry]
-            Name=Code Insiders
-            Exec=launch %u
-            Icon=@self.bin/icon.png
-            Type=Application
-            """
-            "#,
-        )
-        .unwrap();
-        let steam = Spec::parse(
-            r#"
-            [command.steam]
-            exec = ["steam"]
-
-            [autostart.steam-autostart]
-            hidden = true
-            "#,
-        )
-        .unwrap();
+        let code = spec(
+            "code",
+            "{ app+: {
+                 code: { run: ['code'], id: 'code-oss', 'source-id': 'code-oss',
+                         'remove-arguments': ['--new-window'], keys: { StartupWMClass: 'code-oss' } },
+                 insiders: { run: [psbox.path([psbox.home, '.bin', 'code-insiders'])],
+                             keys: { Name: 'Code Insiders', Icon: psbox.storageFor('bin') + '/icon.png',
+                                     MimeType: ['x-scheme-handler/vscode'] } },
+               } }",
+            &[],
+        );
+        let steam = spec(
+            "steam",
+            "{ app+: { 'steam-autostart': { kind: 'autostart', suppress: true } } }",
+            &[],
+        );
         vec![("code".into(), code), ("steam".into(), steam)]
+    }
+
+    fn psbox() -> &'static Path {
+        Path::new("/usr/bin/psbox")
     }
 
     #[test]
     fn generates_and_installs_entries() {
-        let (root, dirs, host) = setup("gen");
-        let generation = generate(&specs(), &host, &dirs, Path::new("/usr/bin/psbox"));
+        let (root, dirs) = setup("gen");
+        let generation = generate(&specs(), &dirs, psbox());
         assert!(generation.warnings.is_empty(), "{:?}", generation.warnings);
+        // steam's implicit default app has no host entry to inherit.
+        assert_eq!(generation.notes.len(), 1);
+        assert_eq!(
+            (generation.notes[0].0.as_str(), generation.notes[0].1.as_str()),
+            ("steam", "app.steam")
+        );
         let gen_ = &generation.entries;
         assert_eq!(gen_.len(), 3);
 
@@ -454,18 +549,26 @@ mod tests {
         let e = Entry::parse(&code.body).unwrap();
         assert_eq!(
             e.get(desktop::MAIN, "Exec"),
-            Some("/usr/bin/psbox run code --command code -- %F")
+            Some("/usr/bin/psbox run code --app code -- %F")
         );
         assert_eq!(e.get(desktop::MAIN, "TryExec"), None);
         assert_eq!(e.get(desktop::MAIN, "StartupWMClass"), Some("code-oss"));
         assert_eq!(e.get(desktop::MAIN, "DBusActivatable"), Some("false"));
+        assert_eq!(e.get(desktop::MAIN, "Actions"), Some("new-empty-window;"));
+        assert_eq!(
+            e.get("Desktop Action new-empty-window", "Exec"),
+            Some("/usr/bin/psbox run code --app code -- %F")
+        );
 
         let insiders = gen_.iter().find(|g| g.path.ends_with("insiders.desktop")).unwrap();
         let e = Entry::parse(&insiders.body).unwrap();
+        assert_eq!(e.get(desktop::MAIN, "Name"), Some("Code Insiders"));
+        assert_eq!(e.get(desktop::MAIN, "Type"), Some("Application"));
         assert_eq!(e.get(desktop::MAIN, "Icon"), Some("/home/u/Sandbox/code.bin/icon.png"));
+        assert_eq!(e.get(desktop::MAIN, "MimeType"), Some("x-scheme-handler/vscode;"));
         assert_eq!(
             e.get(desktop::MAIN, "Exec"),
-            Some("/usr/bin/psbox run code --command insiders -- %u")
+            Some("/usr/bin/psbox run code --app insiders -- %U")
         );
 
         let hidden = gen_
@@ -552,9 +655,9 @@ mod tests {
 
     #[test]
     fn reports_missing_host_entries() {
-        let (root, dirs, host) = setup("missing");
-        let spec = Spec::parse("[command.x]\nexec = [\"x\"]\ndesktop = {}\n").unwrap();
-        let generation = generate(&[("x".into(), spec)], &host, &dirs, Path::new("/usr/bin/psbox"));
+        let (root, dirs) = setup("missing");
+        let s = spec("x", "{ app+: { x: { 'source-id': 'x' } } }", &[]);
+        let generation = generate(&[("x".into(), s)], &dirs, psbox());
         assert!(generation.entries.is_empty());
         assert!(
             generation.warnings[0].2.contains("no host entry x.desktop"),
@@ -566,19 +669,148 @@ mod tests {
     }
 
     #[test]
-    fn autostart_commands_use_the_autostart_entry() {
-        let (root, dirs, host) = setup("autostart");
-        let spec = Spec::parse(
-            "[command.steam]\nexec = [\"steam\"]\n[autostart.steam-autostart]\ncommand = \"steam\"\nremove-args = [\"-silent\"]\n",
-        )
-        .unwrap();
-        let generation = generate(&[("steam".into(), spec)], &host, &dirs, Path::new("/usr/bin/psbox"));
+    fn autostart_entries_start_their_app() {
+        let (root, dirs) = setup("autostart");
+        let s = spec(
+            "steam",
+            "{ app+: { 'steam-autostart': { kind: 'autostart', 'source-id': 'steam-autostart',
+                                            'remove-arguments': ['-silent'] } } }",
+            &[],
+        );
+        let generation = generate(&[("steam".into(), s)], &dirs, psbox());
         assert!(generation.warnings.is_empty(), "{:?}", generation.warnings);
+        assert_eq!(generation.entries.len(), 1);
+        assert!(generation.entries[0].path.starts_with(&dirs.autostart));
         let e = Entry::parse(&generation.entries[0].body).unwrap();
         assert_eq!(
             e.get(desktop::MAIN, "Exec"),
-            Some("/usr/bin/psbox run steam --command steam --")
+            Some("/usr/bin/psbox run steam --app steam --")
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn builds_entries_from_keys_and_actions() {
+        let (root, dirs) = setup("keys");
+        let s = spec(
+            "app",
+            "{ app+: { app: {
+                 keys: { Name: { default: 'App', de: 'Anwendung' }, Categories: ['Game', 'Emulator'], Terminal: false },
+                 actions: { 'new-window': { Name: 'New Window', arguments: ['--new-window'] } },
+                 'no-display': true,
+               } } }",
+            &[],
+        );
+        let generation = generate(&[("app".into(), s)], &dirs, psbox());
+        assert!(generation.warnings.is_empty(), "{:?}", generation.warnings);
+        let e = Entry::parse(&generation.entries[0].body).unwrap();
+        assert_eq!(e.get(desktop::MAIN, "Name"), Some("App"));
+        assert_eq!(e.get(desktop::MAIN, "Name[de]"), Some("Anwendung"));
+        assert_eq!(e.get(desktop::MAIN, "Categories"), Some("Game;Emulator;"));
+        assert_eq!(e.get(desktop::MAIN, "Terminal"), Some("false"));
+        assert_eq!(e.get(desktop::MAIN, "NoDisplay"), Some("true"));
+        assert_eq!(e.get(desktop::MAIN, "Exec"), Some("/usr/bin/psbox run app --app app"));
+        assert_eq!(e.get(desktop::MAIN, "Actions"), Some("new-window;"));
+        assert_eq!(e.get("Desktop Action new-window", "Name"), Some("New Window"));
+        assert_eq!(
+            e.get("Desktop Action new-window", "Exec"),
+            Some("/usr/bin/psbox run app --app app -- --new-window")
+        );
+
+        // Keys and actions set to null remove what was copied.
+        let s = spec(
+            "code-oss",
+            "{ app+: { 'code-oss': { 'source-id': 'code-oss',
+                                     keys: { Icon: null, Name: 'Mine' },
+                                     actions: { 'new-empty-window': null } } } }",
+            &[],
+        );
+        let generation = generate(&[("code-oss".into(), s)], &dirs, psbox());
+        let e = Entry::parse(&generation.entries[0].body).unwrap();
+        assert_eq!(e.get(desktop::MAIN, "Icon"), None);
+        assert_eq!(e.get(desktop::MAIN, "Name"), Some("Mine"));
+        assert_eq!(e.get(desktop::MAIN, "Actions"), None);
+        assert!(e.actions().is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_implicit_default_app_inherits_a_host_entry() {
+        let (root, dirs) = setup("implicit");
+        let s = spec("code-oss", "{}", &["code-oss"]);
+        let generation = generate(&[("code-oss".into(), s)], &dirs, psbox());
+        assert!(generation.notes.is_empty() && generation.warnings.is_empty());
+        let e = Entry::parse(&generation.entries[0].body).unwrap();
+        assert_eq!(e.get(desktop::MAIN, "Name"), Some("Code"));
+        assert_eq!(
+            e.get(desktop::MAIN, "Exec"),
+            Some("/usr/bin/psbox run code-oss --app code-oss -- --new-window %F")
+        );
+
+        // An entry only in the user's own applications directory counts too.
+        fs::create_dir_all(&dirs.applications).unwrap();
+        fs::write(
+            dirs.applications.join("mine.desktop"),
+            "[Desktop Entry]\nName=Mine\nExec=mine\n",
+        )
+        .unwrap();
+        let s = spec("mine", "{}", &["mine"]);
+        let generation = generate(&[("mine".into(), s)], &dirs, psbox());
+        assert!(generation.failed.is_empty(), "{:?}", generation.warnings);
+        let e = Entry::parse(&generation.entries[0].body).unwrap();
+        assert_eq!(e.get(desktop::MAIN, "Name"), Some("Mine"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_sandbox_whose_name_sorts_first_gets_a_shared_file() {
+        let (root, dirs) = setup("shared");
+        let web = |name: &str| spec(name, "{ app+: { web: { run: ['web'], id: 'shared' } } }", &[]);
+        let generation = generate(
+            &[("beta".into(), web("beta")), ("alpha".into(), web("alpha"))],
+            &dirs,
+            psbox(),
+        );
+        let shared = dirs.applications.join("shared.desktop");
+        let winners: Vec<&str> = generation
+            .entries
+            .iter()
+            .filter(|g| g.path == shared)
+            .map(|g| g.sandbox.as_str())
+            .collect();
+        assert_eq!(winners, ["alpha"]);
+        assert!(
+            generation
+                .warnings
+                .iter()
+                .any(|(sandbox, _, why)| sandbox == "beta" && why.contains("also belongs to alpha")),
+            "{:?}",
+            generation.warnings
+        );
+        assert!(generation.failed.contains(&shared));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn another_sandboxs_entry_claims_its_id() {
+        let (root, dirs) = setup("claimed");
+        fs::create_dir_all(&dirs.applications).unwrap();
+        fs::write(
+            dirs.applications.join("shared.desktop"),
+            format!("{GENERATOR_MARKER}\n{SANDBOX_TAG}alpha\n[Desktop Entry]\n"),
+        )
+        .unwrap();
+        assert_eq!(claimant("shared", "beta", &dirs).as_deref(), Some("alpha"));
+        assert_eq!(claimant("shared", "alpha", &dirs), None);
+        assert_eq!(claimant("other", "beta", &dirs), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ids_map_dashes_to_directories_as_gio_does() {
+        assert_eq!(
+            id_paths("kde4-foo"),
+            [PathBuf::from("kde4-foo.desktop"), PathBuf::from("kde4/foo.desktop")]
+        );
     }
 }

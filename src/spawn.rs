@@ -1,9 +1,10 @@
 //! Starting processes inside a running sandbox without an in-sandbox agent.
 //!
 //! The supervisor's forker thread (see `forker.rs`) has joined the sandbox's
-//! PID namespace, so its `clone3` children land there, directly in the
-//! workload cgroup. The child then joins the sandbox's mount and IPC
-//! namespaces through the init's pidfd, applies seccomp, and execs. The
+//! PID namespace, so its `clone3` children land there, directly in their
+//! cgroup. The child then starts a cgroup namespace rooted at that cgroup
+//! (when asked), joins the sandbox's mount and IPC namespaces through the
+//! init's pidfd, applies seccomp, and execs. The
 //! supervisor stays the real parent, so it reads the exit status and
 //! delivers signals through a pidfd.
 //!
@@ -32,8 +33,11 @@ pub struct SpawnJob {
     pub init_pidfd: RawFd,
     /// Also join the init's network namespace (when the sandbox has one).
     pub join_net: bool,
-    /// The workload cgroup directory.
+    /// The cgroup directory the process starts in.
     pub cgroup: OwnedFd,
+    /// Start a cgroup namespace rooted at `cgroup`, so neither the process
+    /// nor its children can move into another cgroup.
+    pub cgroup_ns: bool,
     pub seccomp: Vec<libc::sock_filter>,
 }
 
@@ -43,6 +47,7 @@ pub struct Child {
 }
 
 const STAGE_SETNS: u32 = 1;
+const STAGE_CGROUPNS: u32 = 2;
 const STAGE_SETSID: u32 = 3;
 const STAGE_STDIO: u32 = 4;
 const STAGE_SECCOMP: u32 = 6;
@@ -51,6 +56,7 @@ const STAGE_EXEC: u32 = 7;
 fn stage_name(stage: u32) -> &'static str {
     match stage {
         STAGE_SETNS => "join sandbox namespaces",
+        STAGE_CGROUPNS => "start a cgroup namespace",
         STAGE_SETSID => "start session",
         STAGE_STDIO => "set up stdio",
         STAGE_SECCOMP => "apply seccomp",
@@ -69,6 +75,7 @@ const HIGH_FD: i32 = 64;
 /// Everything the child touches, prepared before `fork`.
 struct Raw<'a> {
     init_pidfd: i32,
+    cgroup_ns: bool,
     ns_flags: i32,
     err_fd: i32,
     stdio: [i32; 3],
@@ -146,6 +153,7 @@ pub fn spawn(job: SpawnJob) -> io::Result<Child> {
     }
     let raw = Raw {
         init_pidfd: job.init_pidfd,
+        cgroup_ns: job.cgroup_ns,
         ns_flags,
         err_fd: err_wr.as_raw_fd(),
         stdio: [
@@ -223,7 +231,7 @@ unsafe fn child(r: &Raw<'_>) -> ! {
     // SAFETY: this runs in the child of `clone3` in a multithreaded process,
     // so it may only make async-signal-safe calls: every call below is a
     // raw syscall or a libc wrapper that is one (prctl, sigemptyset,
-    // sigprocmask, signal, setns, setsid, dup2, fcntl, isatty, ioctl, chdir,
+    // sigprocmask, signal, unshare, setns, setsid, dup2, fcntl, isatty, ioctl, chdir,
     // close_range, seccomp, execve, write, _exit). Nothing allocates or takes
     // a lock, and every pointer used refers to data `spawn` prepared before
     // the fork (`r`, its C strings, argv, envp, and the seccomp program),
@@ -235,6 +243,11 @@ unsafe fn child(r: &Raw<'_>) -> ! {
         libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
 
+        // `clone3` put the child in its cgroup, so a namespace started now
+        // is rooted there.
+        if r.cgroup_ns && libc::unshare(libc::CLONE_NEWCGROUP) < 0 {
+            fail(r, STAGE_CGROUPNS, errno());
+        }
         if libc::setns(r.init_pidfd, r.ns_flags) < 0 {
             fail(r, STAGE_SETNS, errno());
         }

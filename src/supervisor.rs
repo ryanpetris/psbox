@@ -18,12 +18,12 @@ use crate::devices::{self, Change, HostPaths};
 use crate::forker::Forker;
 use crate::gateway::{self, Gateway};
 use crate::inject;
-use crate::plan::{HostEnv, Identity, Mount, Plan, client_env_allowed};
+use crate::plan::{HostEnv, Identity, Mount, PORTAL_ENV, Plan, client_env_allowed};
 use crate::portal::Policy;
-use crate::protocol::{self, LiveMount, Process, PublishedDevice, Request, Response, Status};
+use crate::protocol::{self, LiveMount, NoIdentity, Process, PublishedDevice, Request, Response, Status, Unidentified};
 use crate::root;
 use crate::spawn::{self, Exit, SpawnJob};
-use crate::spec::{DeviceClass, MountMode, Network, Spec, Tokens, Xwayland};
+use crate::spec::{DbusMode, DeviceClass, MountMode, Network, Spec, XwaylandMode};
 use crate::sys::cgroup::Cgroups;
 use crate::sys::fd::{Seqpacket, poll_readable};
 use crate::sys::mount::{MOUNT_ATTR_NODEV, MOUNT_ATTR_NOSUID, MOUNT_ATTR_RDONLY, PointKind};
@@ -52,13 +52,24 @@ struct Published {
     complete: bool,
 }
 
+/// One launch: what it ran under, while its cgroup exists.
+struct Launch {
+    /// Its portal identity, decided when it started.
+    identity: Option<String>,
+    /// Its first process has started, so an empty cgroup means it is over.
+    started: bool,
+}
+
 #[derive(Default)]
 struct State {
     clients: usize,
     mounts: Vec<LiveMount>,
     devices: BTreeMap<(u32, u32), Published>,
-    /// Processes started for a command (host pid -> command name).
+    /// Processes started for an app (host pid -> app name).
     spawned: HashMap<i32, String>,
+    /// Launches by number (`workload/launch-<n>`).
+    launches: HashMap<u64, Launch>,
+    next_launch: u64,
     /// Counter for `$XDG_RUNTIME_DIR/doc/<n>` file dialog mounts.
     docs: u32,
     /// Whether any client has started a process yet.
@@ -101,6 +112,12 @@ struct Supervisor {
     started: std::time::SystemTime,
     /// The X display number, when the sandbox has Xwayland.
     display: Option<u32>,
+    /// The portal identity of the private bus and the services it starts:
+    /// the default app's (a task's own), decided when the bus started.
+    bus_identity: Mutex<Option<String>>,
+    /// The evaluated config the plan came from, to skip reloads that change
+    /// nothing.
+    config_json: Mutex<String>,
 }
 
 /// Runs the supervisor for `id` until the sandbox stops.
@@ -138,16 +155,25 @@ fn refuse_waiting(listener: &Seqpacket, message: &str) {
 fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
     id.validate()?;
     let host = HostEnv::from_process()?;
-    let spec = match id {
+    if !sys::cgroup::nsdelegate()? {
+        bail!("cgroup v2 is mounted without nsdelegate, which psbox needs to keep each launch in its cgroup");
+    }
+    let (plan, config_json) = match id {
         Identity::Unnamed { .. } => {
             let path = host.settings_path(id);
             let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
             let _ = fs::remove_file(&path);
-            Spec::parse(&text).with_context(|| format!("{}", path.display()))?
+            let settings: crate::unnamed::Settings =
+                serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+            let mut plan = Plan::build(id, &settings.spec()?, &host)?;
+            plan.exec_identity = settings.app_id.clone();
+            (plan, text)
         }
-        Identity::Instance { .. } | Identity::Task { .. } => Spec::load(id.sandbox(), &host.config_dir)?,
+        Identity::Instance { .. } | Identity::Task { .. } => {
+            let loaded = Spec::load_checked(id.sandbox(), &host, &[], None).map_err(|f| f.error)?;
+            (Plan::build(id, &loaded.spec, &host)?, loaded.json)
+        }
     };
-    let plan = Plan::build(id, &spec, &host)?;
     let name = plan.key.clone();
     for dir in plan.create_dirs(false)? {
         eprintln!("psbox[{name}]: created {}", dir.display());
@@ -157,8 +183,8 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         eprintln!("psbox[{name}]: pasta is not installed; using the host network instead of isolated networking");
     }
     let display = match plan.xwayland {
-        Xwayland::Off => None,
-        _ => Some(x11::free_display().context("choose an X display")?),
+        None => None,
+        Some(_) => Some(x11::free_display().context("choose an X display")?),
     };
 
     if let Some(dir) = &plan.host_home_dir {
@@ -182,7 +208,7 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         .context("Landlock scopes")?;
 
     let (sup_end, init_end) = Seqpacket::pair()?;
-    let infra = fs::File::open(&cg.infra).with_context(|| format!("open {}", cg.infra.display()))?;
+    let infra = fs::File::open(&cg.init).with_context(|| format!("open {}", cg.init.display()))?;
     // SAFETY: still single-threaded, so the child may run normal code.
     let init = match unsafe { process::clone3(libc::CLONE_NEWPID as u64, infra.as_raw_fd()) }.context("start init")? {
         Some(c) => c,
@@ -228,6 +254,8 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         reconciling: Mutex::new(()),
         started: std::time::SystemTime::now(),
         display,
+        bus_identity: Mutex::new(None),
+        config_json: Mutex::new(config_json),
     });
     eprintln!("psbox[{name}]: sandbox ready (init pid {pid})");
 
@@ -293,14 +321,6 @@ impl Supervisor {
         self.plan().key.clone()
     }
 
-    fn tokens(&self) -> Tokens<'_> {
-        Tokens {
-            home: &self.host.home,
-            root: &self.host.root,
-            name: self.id.sandbox(),
-        }
-    }
-
     fn serve(&self, conn: &Seqpacket) -> Result<()> {
         if conn.peer_uid()? != self.host.uid {
             bail!("permission denied");
@@ -321,7 +341,7 @@ impl Supervisor {
             }
             Request::Mount { host, at, mode } => {
                 let _mounting = self.mounting.lock().unwrap();
-                self.mount(&host, &at, mode)?;
+                self.mount(Path::new(&host), Path::new(&at), mode)?;
                 protocol::send(conn, &Response::Done, &[])?;
                 Ok(())
             }
@@ -350,9 +370,57 @@ impl Supervisor {
         }
     }
 
+    /// The portal identity the app id `id` gives a launch: `id` when the
+    /// host portal accepts it and no other sandbox's entry claims it, or why
+    /// not; an error when the host portal does not answer. Only a sandbox
+    /// with the private bus has identities.
+    fn decide_identity(&self, id: Option<&str>) -> Result<Result<Option<String>, Unidentified>> {
+        let Some(id) = id else { return Ok(Ok(None)) };
+        if self.plan().dbus != Some(DbusMode::Portal) {
+            return Ok(Ok(None));
+        }
+        let reason = |reason| Unidentified {
+            id: id.to_string(),
+            reason,
+        };
+        let dirs = crate::install::Dirs::for_host(&self.host);
+        if let Some(by) = crate::install::claimant(id, self.id.sandbox(), &dirs) {
+            return Ok(Err(reason(NoIdentity::Claimed { by })));
+        }
+        Ok(match crate::identity::probe(id, crate::identity::STARTING)? {
+            crate::identity::Probe::Accepted => Ok(Some(id.to_string())),
+            crate::identity::Probe::Unknown => Err(reason(NoIdentity::Unknown)),
+            crate::identity::Probe::NoPortal => Err(reason(NoIdentity::NoPortal)),
+        })
+    }
+
+    /// The environment for a process with a portal identity (`identified`)
+    /// or without: one without gets none of the switches that make toolkits
+    /// use portals, even ones the config sets, so their own dialogs open.
+    fn portal_env(&self, env: &mut BTreeMap<String, String>, identified: bool) {
+        if self.plan().dbus != Some(DbusMode::Portal) {
+            return;
+        }
+        for (key, value) in PORTAL_ENV {
+            match identified {
+                true => {
+                    env.insert(key.into(), value.into());
+                }
+                false => {
+                    if env.remove(key).is_some() {
+                        eprintln!(
+                            "psbox[{}]: {key} dropped: the launch has no portal identity",
+                            self.key()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn serve_spawn(&self, conn: &Seqpacket, spawn: protocol::Spawn, fds: Vec<OwnedFd>) -> Result<()> {
         let protocol::Spawn {
-            command,
+            app,
             args,
             env: client_env,
             cwd: client_cwd,
@@ -362,35 +430,44 @@ impl Supervisor {
             .try_into()
             .map_err(|_| anyhow!("spawn needs exactly three descriptors"))?;
         let plan = self.plan();
-        let name = match command {
-            Some(c) => c,
-            None => plan
-                .default_command()
-                .ok_or_else(|| anyhow!("sandbox has several commands; choose one with --command"))?
-                .to_string(),
+        let name = match app.as_deref().or(plan.default_app.as_deref()) {
+            Some(name) => Some(name.to_string()),
+            None if exec => None,
+            None => bail!("{} has no default app; choose one with --app", self.id.describe()),
         };
-        let cmd = plan
-            .commands
-            .get(&name)
-            .ok_or_else(|| anyhow!("unknown command {name:?}"))?;
-        let mut argv: Vec<String> = if exec { Vec::new() } else { cmd.exec.clone() };
+        let app = match &name {
+            Some(name) => Some(
+                plan.apps
+                    .get(name)
+                    .ok_or_else(|| anyhow!("{} has no app named {name}", self.id.describe()))?,
+            ),
+            None => None,
+        };
+        let mut argv: Vec<String> = match (exec, app) {
+            (false, Some(app)) => app.run.clone(),
+            _ => Vec::new(),
+        };
         argv.extend(args);
         if argv.is_empty() {
             bail!("nothing to run");
         }
-        let argv: Vec<String> = argv
-            .into_iter()
-            .map(|a| match a.strip_prefix("~/") {
-                Some(rest) => self.plan().home.join(rest).to_string_lossy().into_owned(),
-                None => a,
-            })
-            .collect();
+        let candidate = match (app, exec && name.is_none()) {
+            (_, true) => plan.exec_identity.clone(),
+            (Some(app), false) => app.id.clone(),
+            (None, false) => None,
+        };
+        let (identity, unidentified) = match self.decide_identity(candidate.as_deref())? {
+            Ok(identity) => (identity, None),
+            Err(why) => (None, Some(why)),
+        };
 
         let mut env: BTreeMap<String, String> = client_env.into_iter().filter(|(k, _)| client_env_allowed(k)).collect();
         env.extend(self.env());
-        env.extend(cmd.env.clone());
+        if let Some(app) = app {
+            env.extend(app.env.clone());
+        }
+        self.portal_env(&mut env, identity.is_some());
 
-        let plan = self.plan();
         let has_home = plan.mounts.iter().any(|m| m.dst() == plan.home);
         let cwd = if self.has_dir(&client_cwd) {
             client_cwd
@@ -399,16 +476,56 @@ impl Supervisor {
         } else {
             PathBuf::from("/")
         };
-        let child = self.spawn(
-            argv.clone(),
-            env,
-            cwd,
-            [stdin, stdout, stderr],
-            Vec::new(),
-            &self.cg.workload,
-        )?;
-        eprintln!("psbox[{}]: started {:?} as pid {}", self.key(), argv, child.pid);
-        self.state.lock().unwrap().spawned.insert(child.pid, name.clone());
+        let n = {
+            let mut st = self.state.lock().unwrap();
+            st.next_launch += 1;
+            let n = st.next_launch;
+            st.launches.insert(
+                n,
+                Launch {
+                    identity: identity.clone(),
+                    started: false,
+                },
+            );
+            n
+        };
+        let started = self.cg.create_launch(n).and_then(|cgroup| {
+            self.spawn(
+                argv.clone(),
+                env,
+                cwd,
+                [stdin, stdout, stderr],
+                Vec::new(),
+                &cgroup,
+                true,
+            )
+        });
+        let child = match started {
+            Ok(child) => child,
+            Err(e) => {
+                self.state.lock().unwrap().launches.remove(&n);
+                let _ = Cgroups::remove(&self.cg.launch(n));
+                return Err(e);
+            }
+        };
+        let label = name.clone().unwrap_or_else(|| argv[0].clone());
+        eprintln!(
+            "psbox[{}]: started {:?} as pid {} (launch {n}, {})",
+            self.key(),
+            argv,
+            child.pid,
+            match &identity {
+                Some(id) => format!("portal identity {id}"),
+                None => "no portal identity".into(),
+            }
+        );
+        {
+            let mut st = self.state.lock().unwrap();
+            st.spawned.insert(child.pid, label);
+            if let Some(l) = st.launches.get_mut(&n) {
+                l.started = true;
+            }
+        }
         let restart_pending = self.state.lock().unwrap().pending_restart.clone();
         protocol::send(
             conn,
@@ -416,6 +533,7 @@ impl Supervisor {
                 pid: child.pid,
                 restart_pending,
                 network_fallback: self.plan().network_fallback,
+                unidentified,
             },
             &[],
         )?;
@@ -458,7 +576,9 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Starts a process in the sandbox, in the cgroup `cgroup`.
+    /// Starts a process in the sandbox, in the cgroup `cgroup`, and with
+    /// `cgroup_ns` in a cgroup namespace rooted there.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         &self,
         argv: Vec<String>,
@@ -467,6 +587,7 @@ impl Supervisor {
         stdio: [OwnedFd; 3],
         extra_fds: Vec<OwnedFd>,
         cgroup: &Path,
+        cgroup_ns: bool,
     ) -> Result<spawn::Child> {
         let job = SpawnJob {
             argv: argv.clone(),
@@ -477,6 +598,7 @@ impl Supervisor {
             init_pidfd: self.init_pidfd.as_raw_fd(),
             join_net: self.plan().network != Network::Host,
             cgroup: fs::File::open(cgroup)?.into(),
+            cgroup_ns,
             seccomp: self.seccomp.clone(),
         };
         self.forker
@@ -510,10 +632,26 @@ impl Supervisor {
         env
     }
 
-    /// Starts the private session bus in the `infra` cgroup and the gateway
-    /// to the host bus. The sandbox stops if the bus exits.
+    /// Starts the private session bus in the `infra/bus` cgroup and the
+    /// gateway to the host bus. The bus, and the services it starts, get the
+    /// portal identity of the default app (a task's own). The sandbox stops
+    /// if the bus exits.
     fn start_bus(self: &Arc<Self>) -> Result<()> {
         let paths = self.plan().bus.clone().expect("bus configured");
+        let identity = match self.decide_identity(self.plan().exec_identity.as_deref())? {
+            Ok(identity) => identity,
+            Err(why) => {
+                eprintln!(
+                    "psbox[{}]: the session bus runs without a portal identity: {}",
+                    self.key(),
+                    why.reason.describe(&why.id)
+                );
+                None
+            }
+        };
+        *self.bus_identity.lock().unwrap() = identity.clone();
+        let mut env = self.env();
+        self.portal_env(&mut env, identity.is_some());
         let root = self.root()?;
         bus::prepare(root.as_fd(), &paths, &self.plan().home, &self.plan().dbus_talk)?;
         let argv = vec![
@@ -528,7 +666,7 @@ impl Supervisor {
             std::io::stdout().as_fd().try_clone_to_owned()?,
             std::io::stderr().as_fd().try_clone_to_owned()?,
         ];
-        let daemon = self.spawn(argv, self.env(), PathBuf::from("/"), stdio, Vec::new(), &self.cg.infra)?;
+        let daemon = self.spawn(argv, env, PathBuf::from("/"), stdio, Vec::new(), &self.cg.bus, true)?;
         // The socket's directory, opened without following symlinks, named
         // through its descriptor.
         let socket_dir = mount::openat2(
@@ -571,12 +709,12 @@ impl Supervisor {
     }
 
     /// Listens on the sandbox's X socket and starts `xwayland-satellite`
-    /// (in `infra`) whenever a client connects while it is not running.
-    /// With `xwayland = "builtin"`, satellite reaches the compositor through
-    /// `psbox decorations`, which draws its windows' title bars (see
+    /// (in `infra/display`) whenever a client connects while it is not
+    /// running. In the builtin mode, satellite reaches the compositor
+    /// through `psbox decorations`, which draws its windows' title bars (see
     /// [`Self::connect_decorations`]).
     fn start_xwayland(self: &Arc<Self>, display: u32) -> Result<()> {
-        let decorate = self.plan().xwayland == Xwayland::Builtin;
+        let decorate = self.plan().xwayland == Some(XwaylandMode::Builtin);
         let root = self.root()?;
         let listener = x11::listen(root.as_fd(), display)?;
         let wayland = x11::decorations_socket(display);
@@ -601,7 +739,8 @@ impl Supervisor {
                         PathBuf::from("/"),
                         Self::stdio()?,
                         vec![listener.try_clone()?],
-                        &s.cg.infra,
+                        &s.cg.display,
+                        true,
                     )
                 })();
                 let child = match started {
@@ -639,7 +778,7 @@ impl Supervisor {
     }
 
     /// Waits for `satellite` to connect to its Wayland socket and starts
-    /// `psbox decorations` (in `infra`) with that connection; `None` if
+    /// `psbox decorations` (in `infra/display`) with that connection; `None` if
     /// satellite exits first. Satellite starts Xwayland with its own
     /// environment and descriptors before it connects, so the connection
     /// cannot be handed to it ready-made (`WAYLAND_SOCKET`): Xwayland would
@@ -666,7 +805,8 @@ impl Supervisor {
             PathBuf::from("/"),
             Self::stdio()?,
             vec![conn],
-            &self.cg.infra,
+            &self.cg.display,
+            true,
         )?;
         eprintln!("psbox[{}]: started decorations (pid {})", self.key(), child.pid);
         Ok(Some(child))
@@ -707,23 +847,6 @@ impl Supervisor {
             eprintln!("psbox[{}]: pasta exited: {status:?}", s.key());
         });
         Ok(())
-    }
-
-    /// The host pid of a process given its pid inside the sandbox.
-    fn host_pid(&self, sandbox_pid: u32) -> Option<i32> {
-        fs::read_dir("/proc")
-            .ok()?
-            .flatten()
-            .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()))
-            .find(|&pid| self.is_sandbox_process(pid, sandbox_pid))
-    }
-
-    /// Whether host pid `pid` is, right now, the process with pid
-    /// `sandbox_pid` in the sandbox's own pid namespace.
-    fn is_sandbox_process(&self, pid: i32, sandbox_pid: u32) -> bool {
-        let ns = |pid: i32| fs::read_link(format!("/proc/{pid}/ns/pid")).ok();
-        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-        ns(pid).is_some() && ns(pid) == ns(self.init_pid) && innermost_id(&status) == Some(sandbox_pid)
     }
 
     /// Attaches one plan mount (a bind or tmpfs) in the running sandbox.
@@ -780,8 +903,9 @@ impl Supervisor {
         Ok(Some(prepared))
     }
 
-    /// Replaces each overlay over one of `hosts` with a fresh one, so the
-    /// sandbox sees what a task wrote there. The new overlay is assembled
+    /// Replaces each overlay whose source overlaps one of `hosts` (is,
+    /// contains, or is inside one, symlinks resolved) with a fresh one, so
+    /// the sandbox sees what a task wrote there. The new overlay is assembled
     /// detached, with every later plan entry and live mount beneath it
     /// attached inside, and swapped in as one tree: if any part fails,
     /// nothing changes. An overlay with a tmpfs or another overlay mounted
@@ -792,7 +916,11 @@ impl Supervisor {
         let mut failed = Vec::new();
         for m in &plan.mounts {
             let Mount::Overlay { lower, dst, .. } = m else { continue };
-            if !hosts.iter().any(|h| h == lower) {
+            let resolved = fs::canonicalize(lower).unwrap_or_else(|_| lower.clone());
+            if !hosts
+                .iter()
+                .any(|h| resolved.starts_with(h) || h.starts_with(&resolved))
+            {
                 continue;
             }
             // Each overlay stands alone: one that cannot be refreshed does
@@ -923,14 +1051,34 @@ impl Supervisor {
             .with_context(|| format!("attach {}", p.dst.display()))
     }
 
-    /// Reloads the config and applies what can change live. Changes that
-    /// need a restart are recorded instead, and the sandbox stops when idle.
-    /// New mounts are prepared before anything is detached, so a missing
-    /// source leaves the sandbox as it was; a mount that still fails to
-    /// apply marks the sandbox for a restart.
-    fn reload(&self) -> Result<()> {
-        let spec = Spec::load(self.id.sandbox(), &self.host.config_dir)?;
-        let new = Plan::build(&self.id, &spec, &self.host)?;
+    /// The host paths the running sandbox can write: its plan's writable
+    /// binds and its writable live mounts. No file its config reads may be
+    /// inside them.
+    fn writable_now(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self
+            .plan()
+            .mounts
+            .iter()
+            .filter_map(|m| match m {
+                Mount::Bind { src, ro: false, .. } => Some(src.clone()),
+                _ => None,
+            })
+            .collect();
+        for lm in &self.state.lock().unwrap().mounts {
+            if lm.mode == MountMode::ReadWrite {
+                out.push(PathBuf::from(&lm.host));
+            }
+        }
+        out
+    }
+
+    /// Applies a reloaded config: what can change live does, and changes
+    /// that need a restart are recorded instead, so the sandbox stops when
+    /// idle. New mounts are prepared before anything is detached, so a
+    /// missing source leaves the sandbox as it was; a mount that still fails
+    /// to apply marks the sandbox for a restart.
+    fn apply(&self, spec: &Spec) -> Result<()> {
+        let new = Plan::build(&self.id, spec, &self.host)?;
         for dir in new.create_dirs(false)? {
             eprintln!("psbox[{}]: created {}", self.key(), dir.display());
         }
@@ -1001,7 +1149,7 @@ impl Supervisor {
             lost
         };
         for lm in lost {
-            if let Err(e) = self.mount(&lm.host, &lm.at, lm.mode) {
+            if let Err(e) = self.mount(Path::new(&lm.host), Path::new(&lm.at), lm.mode) {
                 eprintln!("psbox[{}]: re-attach {}: {e:#}", self.key(), lm.at);
             }
         }
@@ -1033,26 +1181,47 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Watches the sandbox config and the profiles directory.
+    /// Watches the files the config reads and applies it again when one
+    /// changes. The config is evaluated before the mount lock is taken, and
+    /// a result that is the same as before changes nothing.
     fn watch_config(&self) {
         let _ = fs::create_dir_all(self.host.config_dir.join("sandboxes"));
-        let mut watch = match ConfigWatch::new(&self.host.config_dir, self.id.sandbox()) {
+        let watch = match ConfigWatch::new(&self.host.config_dir) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("psbox[{}]: cannot watch the config: {e}", self.key());
                 return;
             }
         };
+        let mut first = true;
         loop {
-            let Ok(events) = watch.ino.read() else { return };
-            if !watch.relevant(&events) {
-                continue;
+            if !first {
+                let Ok(events) = watch.ino.read() else { return };
+                if !watch.relevant(&events) {
+                    continue;
+                }
+                // Editors write in several steps; let them finish.
+                std::thread::sleep(Duration::from_millis(200));
             }
-            // Editors write in several steps; let them finish.
-            std::thread::sleep(Duration::from_millis(200));
-            let _mounting = self.mounting.lock().unwrap();
-            if let Err(e) = self.reload() {
-                eprintln!("psbox[{}]: config not applied: {e:#}", self.key());
+            first = false;
+            let before_read = |dir: &Path| watch.watch(dir);
+            let loaded = Spec::load_checked(self.id.sandbox(), &self.host, &self.writable_now(), Some(&before_read));
+            match loaded {
+                Ok(loaded) => {
+                    watch.set(&loaded.files, &loaded.missing);
+                    if *self.config_json.lock().unwrap() == loaded.json {
+                        continue;
+                    }
+                    let _mounting = self.mounting.lock().unwrap();
+                    match self.apply(&loaded.spec) {
+                        Ok(()) => *self.config_json.lock().unwrap() = loaded.json,
+                        Err(e) => eprintln!("psbox[{}]: config not applied: {e:#}", self.key()),
+                    }
+                }
+                Err(failure) => {
+                    watch.keep(&failure.files, &failure.missing);
+                    eprintln!("psbox[{}]: config not applied: {:#}", self.key(), failure.error);
+                }
             }
         }
     }
@@ -1147,7 +1316,7 @@ impl Supervisor {
                 other => (None, other.dst().to_path_buf()),
             })
             .chain(live.iter().map(|m| {
-                let src = (m.mode == MountMode::Rw).then(|| PathBuf::from(&m.host));
+                let src = (m.mode == MountMode::ReadWrite).then(|| PathBuf::from(&m.host));
                 (src, PathBuf::from(&m.at))
             }))
             .collect();
@@ -1209,21 +1378,23 @@ impl Supervisor {
         false
     }
 
-    fn mount(&self, host_path: &str, at: &str, mode: MountMode) -> Result<()> {
-        if !matches!(mode, MountMode::Ro | MountMode::Rw) {
-            bail!("live mounts support ro and rw");
+    fn mount(&self, src: &Path, dst: &Path, mode: MountMode) -> Result<()> {
+        if !matches!(mode, MountMode::ReadOnly | MountMode::ReadWrite) {
+            bail!("live mounts are read-only or read-write");
         }
-        let tokens = self.tokens();
-        let src = tokens.expand(host_path)?;
-        let dst = tokens.expand(at)?;
+        for p in [src, dst] {
+            if !p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                bail!("{} must be an absolute path without '..'", p.display());
+            }
+        }
         if dst == Path::new("/") || dst.starts_with("/proc") || dst.starts_with("/dev") {
             bail!("cannot mount at {}", dst.display());
         }
-        let (tree, kind) = self.live_tree(&src, mode)?;
-        self.ensure_point(&dst, kind)?;
-        inject::attach(self.init_pidfd.as_fd(), tree.as_fd(), &dst).context("attach")?;
+        let (tree, kind) = self.live_tree(src, mode)?;
+        self.ensure_point(dst, kind)?;
+        inject::attach(self.init_pidfd.as_fd(), tree.as_fd(), dst).context("attach")?;
         eprintln!(
-            "psbox[{}]: mounted {} at {} ({mode:?})",
+            "psbox[{}]: mounted {} at {} ({mode})",
             self.key(),
             src.display(),
             dst.display()
@@ -1249,7 +1420,7 @@ impl Supervisor {
         let meta = fs::File::from(source.try_clone()?).metadata()?;
         let tree = mount::clone_tree_fd(source.as_fd(), true)?;
         let mut attrs = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
-        if mode == MountMode::Ro {
+        if mode == MountMode::ReadOnly {
             attrs |= MOUNT_ATTR_RDONLY;
         }
         mount::set_attr_fd(tree.as_fd(), true, attrs, 0)?;
@@ -1257,7 +1428,11 @@ impl Supervisor {
     }
 
     fn umount(&self, at: &str) -> Result<()> {
-        let dst = self.tokens().expand(at)?.to_string_lossy().into_owned();
+        let dst = Path::new(at)
+            .components()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned();
         let mut state = self.state.lock().unwrap();
         let idx = state
             .mounts
@@ -1344,6 +1519,7 @@ impl Supervisor {
                 }
                 continue;
             }
+            self.remove_finished_launches();
             let busy = clients > 0 || Cgroups::populated(&self.cg.workload);
             if busy {
                 idle_since = None;
@@ -1366,6 +1542,32 @@ impl Supervisor {
                     self.plan().idle_timeout
                 );
                 let _ = self.shutdown(0);
+            }
+        }
+    }
+
+    /// Removes the cgroups of launches whose processes have all exited.
+    /// Only launches that have started count: a launch's cgroup is empty
+    /// between its creation and its first process.
+    fn remove_finished_launches(&self) {
+        let mut st = self.state.lock().unwrap();
+        let finished: Vec<u64> = st
+            .launches
+            .iter()
+            .filter(|(n, l)| l.started && !Cgroups::populated(&self.cg.launch(**n)))
+            .map(|(n, _)| *n)
+            .collect();
+        for n in finished {
+            match Cgroups::remove(&self.cg.launch(n)) {
+                Ok(()) => {
+                    st.launches.remove(&n);
+                }
+                // A process entered meanwhile; it is removed once it exits.
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                Err(e) => {
+                    eprintln!("psbox[{}]: remove launch {n}'s cgroup: {e}", self.key());
+                    st.launches.remove(&n);
+                }
             }
         }
     }
@@ -1704,72 +1906,103 @@ fn attach_within(root: BorrowedFd<'_>, base: &Path, p: Prepared) -> Result<()> {
     mount::attach(p.tree.as_fd(), point.as_fd()).with_context(|| format!("attach {}", p.dst.display()))
 }
 
-/// Watches the config files one sandbox is built from: its own file in
-/// `sandboxes/` and every profile. `profiles/` is watched from when it
-/// exists, including when it is created after the supervisor starts.
+/// Watches the directories of every file a config read, so a change to
+/// any of them reloads it: the config itself, the profiles it imports, and
+/// for an import that does not exist yet, its nearest existing parent.
+/// Directories rather than files, because editors replace a file by
+/// renaming another over it.
 struct ConfigWatch {
     ino: crate::sys::inotify::Inotify,
-    config_dir: PathBuf,
-    file: String,
-    sandboxes: i32,
-    config: i32,
-    profiles: Option<i32>,
+    sandboxes: PathBuf,
+    /// Watched directories and their watch descriptors.
+    watched: Mutex<HashMap<PathBuf, i32>>,
 }
 
 impl ConfigWatch {
-    const MASK: u32 =
-        libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM;
+    const MASK: u32 = libc::IN_CLOSE_WRITE
+        | libc::IN_MOVED_TO
+        | libc::IN_CREATE
+        | libc::IN_DELETE
+        | libc::IN_MOVED_FROM
+        | libc::IN_DELETE_SELF
+        | libc::IN_MOVE_SELF;
 
-    /// `config_dir/sandboxes` must exist.
-    fn new(config_dir: &Path, sandbox: &str) -> io::Result<Self> {
-        let ino = crate::sys::inotify::Inotify::new()?;
-        let sandboxes = ino.add(&config_dir.join("sandboxes"), Self::MASK)?;
-        let config = ino.add(config_dir, libc::IN_CREATE | libc::IN_MOVED_TO)?;
-        let mut w = Self {
-            ino,
-            config_dir: config_dir.to_path_buf(),
-            file: format!("{sandbox}.toml"),
-            sandboxes,
-            config,
-            profiles: None,
+    /// `config_dir/sandboxes` must exist; it is always watched.
+    fn new(config_dir: &Path) -> io::Result<Self> {
+        let w = Self {
+            ino: crate::sys::inotify::Inotify::new()?,
+            sandboxes: config_dir.join("sandboxes"),
+            watched: Mutex::new(HashMap::new()),
         };
-        w.watch_profiles();
+        w.add(&w.sandboxes.clone())?;
         Ok(w)
     }
 
-    fn watch_profiles(&mut self) {
-        self.profiles = self.ino.add(&self.config_dir.join("profiles"), Self::MASK).ok();
+    fn add(&self, dir: &Path) -> io::Result<()> {
+        let mut watched = self.watched.lock().unwrap();
+        if !watched.contains_key(dir) {
+            let wd = self.ino.add(dir, Self::MASK)?;
+            watched.insert(dir.to_path_buf(), wd);
+        }
+        Ok(())
     }
 
-    /// Whether `events` may change this sandbox's config. A new `profiles/`
-    /// directory counts, since it may arrive with profiles already in it.
-    fn relevant(&mut self, events: &[crate::sys::inotify::Event]) -> bool {
+    /// Watches the directory of `file`, before it is read.
+    fn watch(&self, file: &Path) {
+        if let Some(dir) = file.parent() {
+            let _ = self.add(dir);
+        }
+    }
+
+    /// The directories to watch for these files and missing imports.
+    fn dirs(&self, files: &[crate::jsonnet::LoadedFile], missing: &[PathBuf]) -> Vec<PathBuf> {
+        let mut dirs = vec![self.sandboxes.clone()];
+        for f in files {
+            dirs.extend(f.path.parent().map(Path::to_path_buf));
+            dirs.extend(f.resolved.parent().map(Path::to_path_buf));
+        }
+        for m in missing {
+            dirs.extend(m.ancestors().skip(1).find(|a| a.is_dir()).map(Path::to_path_buf));
+        }
+        dirs
+    }
+
+    /// Watches exactly what a successful evaluation read.
+    fn set(&self, files: &[crate::jsonnet::LoadedFile], missing: &[PathBuf]) {
+        let dirs = self.dirs(files, missing);
+        for dir in &dirs {
+            let _ = self.add(dir);
+        }
+        let mut watched = self.watched.lock().unwrap();
+        watched.retain(|dir, wd| {
+            let keep = dirs.contains(dir);
+            if !keep {
+                self.ino.remove(*wd);
+            }
+            keep
+        });
+    }
+
+    /// Also watches what a failed evaluation read, so fixing it reloads.
+    fn keep(&self, files: &[crate::jsonnet::LoadedFile], missing: &[PathBuf]) {
+        for dir in self.dirs(files, missing) {
+            let _ = self.add(&dir);
+        }
+    }
+
+    /// Whether `events` may change the config: anything in a watched
+    /// directory.
+    fn relevant(&self, events: &[crate::sys::inotify::Event]) -> bool {
+        let mut watched = self.watched.lock().unwrap();
         let mut relevant = false;
         for e in events {
-            if e.wd == self.config && e.name == "profiles" {
-                self.watch_profiles();
-                relevant |= self.profiles.is_some();
-            } else if Some(e.wd) == self.profiles && e.mask & libc::IN_IGNORED != 0 {
-                // The directory is gone; a new one is noticed through `config`.
-                self.profiles = None;
-            } else if (e.wd == self.sandboxes && e.name == self.file)
-                || (Some(e.wd) == self.profiles && e.name.ends_with(".toml"))
-            {
-                relevant = true;
+            if e.mask & libc::IN_IGNORED != 0 {
+                watched.retain(|_, wd| *wd != e.wd);
             }
+            relevant |= watched.values().any(|wd| *wd == e.wd) || e.mask & libc::IN_IGNORED != 0;
         }
         relevant
     }
-}
-
-/// The id a process or thread has in its own pid namespace: the last
-/// `NSpid` entry of its `/proc` status.
-fn innermost_id(status: &str) -> Option<u32> {
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("NSpid:"))
-        .and_then(|v| v.split_whitespace().last())
-        .and_then(|v| v.parse().ok())
 }
 
 /// Atomically creates or replaces `/dev/<name>` as a symlink to `target`.
@@ -1813,27 +2046,15 @@ fn unlink_if_ours(dev: BorrowedFd<'_>, name: &str, target: &str) -> io::Result<(
 }
 
 impl gateway::Host for Supervisor {
-    fn app_id_for_pid(&self, sandbox_pid: u32) -> Option<String> {
-        let mut pid = self.host_pid(sandbox_pid)?;
-        for _ in 0..64 {
-            let command = self.state.lock().unwrap().spawned.get(&pid).cloned();
-            if let Some(name) = command {
-                let own = self.plan().commands.get(&name).and_then(|c| c.app_id.clone());
-                return own.or_else(|| self.plan().app_id.clone());
-            }
-            let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-            let ppid = status
-                .lines()
-                .find_map(|l| l.strip_prefix("PPid:"))?
-                .trim()
-                .parse::<i32>()
-                .ok()?;
-            if ppid <= 1 || ppid == self.init_pid {
-                break;
-            }
-            pid = ppid;
+    fn identity(&self, pidfd: OwnedFd) -> Option<String> {
+        let cgroup = crate::identity::process_cgroup(pidfd.as_fd())?;
+        if let Some(n) = self.cg.launch_of(&cgroup) {
+            return self.state.lock().unwrap().launches.get(&n)?.identity.clone();
         }
-        self.plan().app_id.clone()
+        if cgroup.starts_with(&self.cg.bus) {
+            return self.bus_identity.lock().unwrap().clone();
+        }
+        None
     }
 
     fn policy(&self) -> Policy {
@@ -1871,7 +2092,7 @@ impl gateway::Host for Supervisor {
             bus,
             self.init_pidfd.as_raw_fd(),
             self.plan().network != Network::Host,
-            &self.cg.infra,
+            &self.cg.connector,
         )?;
         eprintln!("psbox[{}]: host bus connector started (pid {})", self.key(), c.pid);
         let key = self.key();
@@ -1908,7 +2129,7 @@ impl gateway::Host for Supervisor {
         };
         let file = host_path.file_name().context("path has no file name")?;
         let at = self.plan().runtime_dir.join("doc").join(n.to_string()).join(file);
-        self.mount(&host_path.to_string_lossy(), &at.to_string_lossy(), MountMode::Rw)?;
+        self.mount(host_path, &at, MountMode::ReadWrite)?;
         Ok(at)
     }
 
@@ -1922,30 +2143,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_watch_notices_profiles_created_later() {
+    fn config_watch_follows_what_the_config_reads() {
         let dir = std::env::temp_dir().join(format!("psbox-config-watch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("sandboxes")).unwrap();
-        let mut w = ConfigWatch::new(&dir, "app").unwrap();
-        assert!(w.profiles.is_none());
+        fs::create_dir_all(dir.join("profiles")).unwrap();
+        let w = ConfigWatch::new(&dir).unwrap();
 
-        fs::write(dir.join("sandboxes/other.toml"), "").unwrap();
-        assert!(!w.relevant(&w.ino.read().unwrap()));
-        fs::write(dir.join("sandboxes/app.toml"), "").unwrap();
+        fs::write(dir.join("sandboxes/app.jsonnet"), "").unwrap();
         assert!(w.relevant(&w.ino.read().unwrap()));
 
-        fs::create_dir(dir.join("profiles")).unwrap();
-        assert!(w.relevant(&w.ino.read().unwrap()));
-        assert!(w.profiles.is_some());
-        fs::write(dir.join("profiles/chat.toml"), "").unwrap();
+        // A profile is watched once evaluation reads it.
+        let profile = dir.join("profiles/p.libsonnet");
+        w.watch(&profile);
+        fs::write(&profile, "{}").unwrap();
         assert!(w.relevant(&w.ino.read().unwrap()));
 
-        fs::remove_dir_all(dir.join("profiles")).unwrap();
-        w.relevant(&w.ino.read().unwrap());
-        assert!(w.profiles.is_none());
-        fs::create_dir(dir.join("profiles")).unwrap();
+        // An import that does not exist yet: its nearest existing parent.
+        let missing = dir.join("later/q.libsonnet");
+        w.set(&[], std::slice::from_ref(&missing));
+        assert!(!w.watched.lock().unwrap().contains_key(&dir.join("profiles")));
+        fs::create_dir(dir.join("later")).unwrap();
         assert!(w.relevant(&w.ino.read().unwrap()));
-        assert!(w.profiles.is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1956,13 +2175,6 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         assert!(!mount_root(mount::open_dir(&dir).unwrap().as_fd()).unwrap());
         fs::remove_dir(&dir).unwrap();
-    }
-
-    #[test]
-    fn innermost_id_is_the_last_nspid() {
-        assert_eq!(innermost_id("Name:\tx\nNSpid:\t4242\t17\nPPid:\t1\n"), Some(17));
-        assert_eq!(innermost_id("NSpid:\t4242\n"), Some(4242));
-        assert_eq!(innermost_id("Name:\tx\n"), None);
     }
 
     #[test]

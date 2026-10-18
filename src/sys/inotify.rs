@@ -31,6 +31,12 @@ impl Inotify {
         cvt_int(unsafe { libc::inotify_add_watch(self.0.as_raw_fd(), c.as_ptr(), mask) })
     }
 
+    /// Stops the watch `wd`.
+    pub fn remove(&self, wd: i32) {
+        // SAFETY: valid fd; a stale watch descriptor only fails.
+        unsafe { libc::inotify_rm_watch(self.0.as_raw_fd(), wd) };
+    }
+
     /// Blocks for the next batch of events.
     pub fn read(&self) -> io::Result<Vec<Event>> {
         let mut buf = [0u8; 8192];

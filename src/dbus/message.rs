@@ -92,6 +92,17 @@ impl Message {
         m
     }
 
+    /// An empty reply to `to`; set its body with [`Message::set_body`].
+    pub fn method_return(to: &Message) -> Self {
+        Self {
+            kind: METHOD_RETURN,
+            flags: FLAG_NO_REPLY_EXPECTED,
+            reply_serial: Some(to.serial),
+            destination: to.sender.clone(),
+            ..Default::default()
+        }
+    }
+
     pub fn error(to: &Message, name: &str, text: &str) -> Self {
         let mut m = Self {
             kind: ERROR,

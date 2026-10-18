@@ -18,63 +18,79 @@ User-visible names, paths, units, and environment variables are `psbox`.
 
 ## Host modifications
 
-Every change psbox makes to the host, outside the sandbox root it builds,
-requires explicit approval from the user. This covers files, directories,
-sockets (including abstract sockets in the host network namespace), units,
-cgroups, and state held by host services. Do not add a new host
-modification, or widen an approved one, without asking first. Prefer a
-design that keeps the change inside the sandbox root.
+psbox changes the host, outside the sandbox root it builds, only in the
+ways listed here. Prefer a design that keeps a change inside the sandbox
+root.
 
-Approved host modifications (paths shown for uid 1000 with home
-`/home/user` and no `PSBOX_ROOT`, `XDG_DATA_HOME`, or
-`XDG_CONFIG_HOME` set):
+- **Persistent changes under home directories** (files and directories
+  that outlive the session, such as desktop entries, sandbox storage,
+  and config locations) need explicit approval from the user. Do not add
+  one, or widen an approved one, without asking first.
+- **Transient changes** (cgroups, files and sockets under `/run`, units
+  started and stopped through the user manager, abstract sockets, and
+  state held by running host services) need no approval. Call them out
+  to the user when adding or changing one, and keep the list below
+  current.
 
-- Sandbox storage: `home = "private"` creates
-  `/home/user/Sandbox/<name>` (for example
-  `/home/user/Sandbox/firefox`), and `home = "<path>"` or
-  `psbox sandbox --home <path>` creates that path if it is missing (for
-  example `/home/user/work/client`).
-- Runtime directory `/run/user/1000/psbox/`, containing:
-  - socket-unit sockets such as `/run/user/1000/psbox/firefox.sock` and
-    `/run/user/1000/psbox/retroarch.task-update.sock`;
-  - the shared empty mount point `/run/user/1000/psbox/.root`;
-  - the short-lived unnamed-sandbox settings file
-    `/run/user/1000/psbox/<key>.toml`, written by `psbox sandbox` and
-    removed by the supervisor after reading it.
-- systemd user units: `make dev/install` writes
-  `/home/user/.config/systemd/user/psbox@.service` and
-  `/home/user/.config/systemd/user/psbox@.socket` and runs
-  `systemctl --user daemon-reload`; psbox starts and stops units such as
-  `psbox@firefox.socket` and `psbox@firefox.service` through the user
-  manager.
-- cgroups: `supervisor/`, `infra/`, and `workload/` inside each unit's
-  delegated cgroup, for example
-  `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-psbox.slice/psbox@firefox.service/workload`.
-- `psbox install`, only when run: tagged entries in
-  `/home/user/.local/share/applications/` (for example
-  `/home/user/.local/share/applications/com.libretro.RetroArch.desktop`)
-  and `/home/user/.config/autostart/` (for example
-  `/home/user/.config/autostart/steam-autostart.desktop`).
-- Host portal registration: one `org.freedesktop.host.portal.Registry`
-  `Register` call to the host `xdg-desktop-portal` on
-  `/run/user/1000/bus` per sandbox client connection, held only for that
-  connection.
+Paths are shown for uid 1000 with home `/home/user` and no `PSBOX_ROOT`,
+`XDG_DATA_HOME`, or `XDG_CONFIG_HOME` set.
+
+Approved persistent changes:
+
+- Sandbox storage: a named sandbox's default home (`home.mode: 'path'`
+  without a `path`) creates `/home/user/Sandbox/<name>` (for example
+  `/home/user/Sandbox/firefox`), and a home `path`, in a config or
+  `psbox sandbox -c home.path=<path>`, creates that path if it is missing
+  (for example `/home/user/work/client`).
+- Mount sources marked `create: true` in a sandbox config: created as
+  directories when missing inside the sandbox root (for example
+  `source: psbox.storageFor('bin')` creates
+  `/home/user/Sandbox/retroarch.bin`), and elsewhere only when
+  `psbox run`, `task`, or `sandbox` is given `--create-dirs` (for example
+  `/home/user/Games/saves`).
 - Mount points inside shares: a missing mount point beneath a host share
-  is created on the host (for example `rw = ["~/Code"]` with a mount at
-  `~/Code/sub` creates `/home/user/Code/sub`).
+  is created on the host (for example a read-write mount of `~/Code` with
+  a mount at `~/Code/sub` creates `/home/user/Code/sub`).
 - Save dialogs: when an app saves through the file chooser portal to a
   new file the sandbox cannot already write, the supervisor creates that
   empty file at the path the user chose (for example
   `/home/user/Documents/report.pdf`) so it can be mounted into the
   sandbox. Existing files are never replaced or truncated.
+- `psbox install`, only when run: tagged entries in
+  `/home/user/.local/share/applications/` (for example
+  `/home/user/.local/share/applications/com.libretro.RetroArch.desktop`)
+  and `/home/user/.config/autostart/` (for example
+  `/home/user/.config/autostart/steam-autostart.desktop`).
 - The config watcher creates `/home/user/.config/psbox/sandboxes` when
   it is missing.
-- Directories marked with a trailing `/` in a sandbox config (`rw`, `ro`,
-  a mount's `host`, `--bind`, `--ro-bind`), for mounts that are not
-  optional: created when missing inside the sandbox root (for example
-  `host = "@self.bin/"` creates `/home/user/Sandbox/retroarch.bin`),
-  and elsewhere only when `psbox run`, `task`, or `sandbox` is given
-  `--create-dirs` (for example `/home/user/Games/saves/`).
+- systemd user unit files: `make dev/install` writes
+  `/home/user/.config/systemd/user/psbox@.service` and
+  `/home/user/.config/systemd/user/psbox@.socket`.
+
+Transient changes:
+
+- Runtime directory `/run/user/1000/psbox/`, containing:
+  - socket-unit sockets such as `/run/user/1000/psbox/firefox.sock` and
+    `/run/user/1000/psbox/retroarch.task-update.sock`;
+  - the shared empty mount point `/run/user/1000/psbox/.root`;
+  - the short-lived unnamed-sandbox settings file
+    `/run/user/1000/psbox/<key>.json`, written by `psbox sandbox` and
+    removed by the supervisor after reading it.
+- Units: psbox starts and stops units such as `psbox@firefox.socket` and
+  `psbox@firefox.service` through the user manager, and
+  `make dev/install` runs `systemctl --user daemon-reload`.
+- cgroups: `supervisor/`, `infra/` (with `infra/init`, `infra/bus`,
+  `infra/display`, and `infra/connector`), `workload/`, and one
+  `workload/launch-<n>` per launch, inside each unit's delegated cgroup,
+  for example
+  `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-psbox.slice/psbox@firefox.service/workload/launch-3`.
+- Host portal registration: `org.freedesktop.host.portal.Registry`
+  `Register` calls to the host `xdg-desktop-portal` on
+  `/run/user/1000/bus`, on connections psbox opens for them: to check
+  whether the portal accepts an app id (by the supervisor and
+  `psbox sandbox --app-id`), and to register each sandbox client
+  connection that has a portal identity, for as long as that connection
+  lasts.
 
 ## Temporary pre-1.0 rules
 
@@ -107,11 +123,11 @@ is reported.
 | --- | --- |
 | Command line and output | `lib.rs`, `cli.rs`, `ui.rs` |
 | Client | `client.rs`, `unnamed.rs`, `protocol.rs` |
-| Configuration and plans | `spec.rs`, `plan.rs`, `assets/profiles/` |
+| Configuration and plans | `jsonnet.rs`, `spec.rs`, `plan.rs`, `assets/psbox.libsonnet`, `assets/profiles/` |
 | Supervisor | `supervisor.rs` |
 | Sandbox root, spawning, and namespace joins | `root.rs`, `spawn.rs`, `forker.rs`, `inject.rs` |
 | Kernel interfaces | `sys/` (namespaces, mount API, Landlock, seccomp, cgroups, inotify, fds, processes) |
-| D-Bus | `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `dbus/` (wire format and connections) |
+| D-Bus | `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `identity.rs` (portal identity), `dbus/` (wire format and connections) |
 | Devices, Xwayland, desktop entries, systemd | `devices.rs`, `x11.rs`, `desktop.rs`, `install.rs`, `systemd.rs` |
 | X11 title bars (`psbox decorations`) | `decorations/` (Wayland proxy, wire format, frames) |
 | Fuzz entry points | `fuzz.rs`, `fuzz/fuzz_targets/` |

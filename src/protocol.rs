@@ -12,11 +12,12 @@ use crate::sys::fd::Seqpacket;
 
 pub const MAX_MESSAGE: usize = 64 * 1024;
 
-/// A command to start. With `exec`, `args` is the whole command line; the
-/// command only supplies environment and app id.
+/// An app to start (the default app when `None`). With `exec`, `args` is
+/// the whole command line; the app only supplies its environment and portal
+/// identity.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Spawn {
-    pub command: Option<String>,
+    pub app: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     /// The client's working directory, used when the sandbox has it.
@@ -43,14 +44,44 @@ pub enum Request {
     Umount {
         at: String,
     },
-    /// Replace the overlays over these host directories with fresh ones,
-    /// after a task wrote to them: an overlay does not reliably show changes
-    /// made to its lower directory while it is mounted.
+    /// Replace the overlays whose source overlaps these host paths with
+    /// fresh ones, after a task could write to them: an overlay does not
+    /// reliably show changes made to its lower directory while it is
+    /// mounted.
     Refresh {
         hosts: Vec<String>,
     },
     Status,
     Stop,
+}
+
+/// An app id a launch could not use as its portal identity, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unidentified {
+    pub id: String,
+    pub reason: NoIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NoIdentity {
+    /// The host portal has no application entry with the id.
+    Unknown,
+    /// Another sandbox's installed entry has the id.
+    Claimed { by: String },
+    /// No portal runs on the host bus.
+    NoPortal,
+}
+
+impl NoIdentity {
+    /// Why `id` is not a portal identity, as a sentence fragment.
+    pub fn describe(&self, id: &str) -> String {
+        match self {
+            NoIdentity::Unknown => format!("the host portal doesn't accept {id}, since it has no {id}.desktop"),
+            NoIdentity::Claimed { by } => format!("{id}.desktop belongs to the sandbox {by}"),
+            NoIdentity::NoPortal => "no portal runs on the host bus".into(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,11 +90,13 @@ pub enum Response {
     /// `restart_pending` lists what waits for a restart (config changes that
     /// cannot apply live, and mounts or devices that could not be changed);
     /// `network_fallback` is set when the sandbox uses the host network
-    /// only because pasta is not installed.
+    /// only because pasta is not installed; `unidentified` is set when a
+    /// launch with an app id runs without a portal identity.
     Spawned {
         pid: i32,
         restart_pending: Vec<String>,
         network_fallback: bool,
+        unidentified: Option<Unidentified>,
     },
     Exited {
         code: Option<i32>,
@@ -147,7 +180,7 @@ mod tests {
         let req = Request::Mount {
             host: "/h".into(),
             at: "/a".into(),
-            mode: MountMode::Ro,
+            mode: MountMode::ReadOnly,
         };
         use std::os::fd::AsFd;
         send(&a, &req, &[a.as_fd()]).unwrap();
@@ -155,7 +188,7 @@ mod tests {
         assert!(matches!(
             got,
             Request::Mount {
-                mode: MountMode::Ro,
+                mode: MountMode::ReadOnly,
                 ..
             }
         ));

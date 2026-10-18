@@ -62,9 +62,33 @@ pub fn stream_listen(path: &Path) -> io::Result<OwnedFd> {
 }
 
 /// Connects a `SOCK_STREAM` Unix socket to a path, or to an abstract name
-/// when `abstract_name` is set.
-pub fn stream_connect(name: &[u8], abstract_name: bool) -> io::Result<OwnedFd> {
+/// when `abstract_name` is set. With a `timeout`, connecting and every read
+/// and write on the socket fail after it.
+pub fn stream_connect(name: &[u8], abstract_name: bool, timeout: Option<std::time::Duration>) -> io::Result<OwnedFd> {
     let fd = new_socket_of(libc::SOCK_STREAM)?;
+    if let Some(timeout) = timeout {
+        // A zero timeval would mean no timeout at all.
+        let timeout = timeout.max(std::time::Duration::from_millis(1));
+        let tv = libc::timeval {
+            tv_sec: timeout.as_secs() as _,
+            tv_usec: timeout.subsec_micros() as _,
+        };
+        // On a Unix socket, the send timeout also bounds `connect` (a full
+        // listen backlog), and the receive timeout every read.
+        for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            // SAFETY: `tv` is a valid timeval for the duration of the call
+            // and its size is passed with it; `fd` is an open socket.
+            cvt_int(unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    (&raw const tv).cast(),
+                    mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            })?;
+        }
+    }
     let (addr, len) = sockaddr_bytes(name, abstract_name)?;
     // SAFETY: addr is a valid sockaddr_un of length len.
     cvt_int(unsafe { libc::connect(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) })?;

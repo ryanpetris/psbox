@@ -16,10 +16,10 @@ and read-only once built:
 | `/dev` | A read-only tmpfs with only `null`, `zero`, `full`, `random`, `urandom`, and `tty`, a private `devpts` and `/dev/shm`, and the devices its classes grant |
 | `/tmp`, `/var/tmp` | Private tmpfs |
 | `$XDG_RUNTIME_DIR` | A private tmpfs with only the forwarded sockets: Wayland, the audio sockets with `audio`, and the session bus |
-| `~` | The private home (`<root>/<name>`), a host path, a tmpfs, or nothing |
-| `~/.cache` | A tmpfs unless `cache = "home"` |
+| `~` | The sandbox's storage (`<root>/<name>`), another host path, a tmpfs, or nothing |
+| `~/.cache` | A tmpfs unless `home.cache` is `persistent` |
 | `/run/udev`, `/var/cache/fontconfig` | The host's, read-only, for device and font metadata |
-| `/run/psbox` | The psbox executable, read-only, for the link handler and for `xwayland = "builtin"`; with a session bus, unless `[open-urls]` keeps every link inside, the files that make the link handler the default for links (see [Links](configuration.md#links)) |
+| `/run/psbox` | The psbox executable, read-only, for the link handler and for `xwayland.mode: 'builtin'`; with a session bus, unless `links` keeps every link inside, the files that make the link handler the default for links (see [Links](configuration.md#links)) |
 | Shares and mounts | Only what the config lists, read-only or read-write as configured |
 
 Nothing else of the host's filesystem is visible: not your home, not other
@@ -33,8 +33,11 @@ unmounted to reveal what they cover or remounted read-write.
   uid and gid. Capabilities inside it apply to nothing on the host.
 - **Mount, PID, IPC:** every sandbox has its own. Its processes see only
   each other, and MIT-SHM and System V IPC stay inside.
-- **Network:** `isolated` and `none` sandboxes have their own network
-  namespace; `host` sandboxes share the host's (see [Network](#network)).
+- **Network:** every sandbox has its own network namespace unless it uses
+  the host's (see [Network](#network)).
+- **Cgroups:** each launch runs in a cgroup of its own, inside a cgroup
+  namespace rooted there; with the `nsdelegate` mount option psbox
+  requires, no process can move out of it.
 - **Capabilities:** every process in the sandbox runs with none, and with
   `no_new_privs`, so setuid binaries and file capabilities gain nothing.
   The one exception is the gateway's
@@ -57,7 +60,7 @@ unmounted to reveal what they cover or remounted read-write.
 The supervisor, and so every process in its sandbox, runs in a Landlock
 domain with the abstract-socket and signal scopes. A sandboxed process
 cannot connect to abstract Unix sockets created outside the sandbox (even
-with `network = "host"`, which shares the host's abstract socket names) and
+with `network.mode: 'host'`, which shares the host's abstract socket names) and
 cannot signal processes outside it. Processes within one sandbox can still
 reach each other's abstract sockets and signal each other.
 
@@ -76,11 +79,12 @@ before it is published.
 
 ## D-Bus
 
-With `dbus = "portal"` (the default), the sandbox has its own session bus.
+With the private bus (`dbus.mode: 'portal'`, the default), the sandbox has
+its own session bus.
 Services activated on it (such as `dconf` and `gvfsd`) run inside the
 sandbox and keep their state in the private home. Only the portals and
 notifications reach the host, through the supervisor's gateway, plus any
-names the config lists in `dbus-talk` (see below):
+names the config lists in `dbus.talk` (see below):
 
 | Portal interfaces | Treatment |
 | --- | --- |
@@ -95,29 +99,38 @@ names the config lists in `dbus-talk` (see below):
 | Anything else (Background, DynamicLauncher, RemoteDesktop, Location, Wallpaper, Usb, Documents, ...) | Refused with `AccessDenied` and logged |
 
 The sandbox's own link handler sends `http`, `https`, and `mailto` links,
-except those `[open-urls]` keeps in the sandbox, through `OpenURI.OpenURI`
+except those `links` keeps in the sandbox, through `OpenURI.OpenURI`
 to the host's default app (see [Links](configuration.md#links)).
 
 `org.freedesktop.Notifications` is forwarded (`Notify`, `CloseNotification`,
 `GetCapabilities`, and `GetServerInformation`) with the `image-path` and
 `sound-file` hints removed. Request and session objects take only `Close`. Names listed in
-[`dbus-talk`](configuration.md#host-bus-names) are reachable too, with
+[`dbus.talk`](configuration.md#host-bus-names) are reachable too, with
 calls and replies passed unfiltered: listing one gives the sandbox that
 service's full access, as yours. Every other host bus name is unreachable,
 and the system bus is not available.
 
-With `dbus = "host"`, the sandbox gets the host session bus and the system
+The table is for processes with a
+[portal identity](configuration.md#portal-identity). A process without one
+reaches only Settings, `OpenURI.OpenURI` and `OpenURI.SchemeSupported`,
+Realtime, Inhibit, and the network, memory, and power profile monitors;
+every other portal interface answers `UnknownInterface`, as if the host had
+none. Identity is attribution, not a boundary: the launches of one sandbox
+share its home, so one of them can leave behind a session service that the
+private bus later starts with the default app's identity.
+
+With `dbus.mode: 'host'`, the sandbox gets the host session bus and the system
 bus unfiltered: every host service is reachable with your own permissions.
-Use it only for apps that need it. With `dbus = "off"` there is no session
+Use it only for apps that need it. With `dbus: null` there is no session
 bus.
 
 ## Network
 
 | `network` | Reach |
 | --- | --- |
-| `isolated` | Outbound connections and DNS through `pasta`. No incoming connections, no route to the host's loopback services, no host abstract sockets |
-| `host` | The host's network, including services listening on `localhost`. Host abstract sockets stay unreachable |
-| `none` | Loopback only |
+| `mode: 'isolated'` | Outbound connections and DNS through `pasta`. No incoming connections, no route to the host's loopback services, no host abstract sockets |
+| `mode: 'host'` | The host's network, including services listening on `localhost`. Host abstract sockets stay unreachable |
+| `null` | Loopback only |
 
 `pasta` runs on the host side, attached to the sandbox's network namespace,
 with `CAP_SYS_ADMIN` (to enter that namespace) and the network capabilities
@@ -141,9 +154,13 @@ Wayland clients.
   modules.
 - **System files:** `/usr`, `/etc`, and `/sys` are readable, as for any
   process of your user.
-- **Shares:** anything listed in `rw`, `ro`, or a mount is readable (and
+- **Mounts:** anything a mount lists is readable (and
   writable if so configured) with your own permissions. Supervisors accept
   any client of your user, so a share that exposes `$XDG_RUNTIME_DIR/psbox`
   (or the session bus) gives the sandbox control of every sandbox and of
   your account (see [Mounts](configuration.md#mounts)).
-- **`dbus = "host"` and `network = "host"`:** as described above.
+- **`dbus.mode: 'host'` and `network.mode: 'host'`:** as described above.
+- **Configs:** psbox refuses a config that reads a file this sandbox can
+  write, but not one another sandbox can write; see
+  [What a config may read](configuration.md#what-a-config-may-read) for
+  the limits of that check.

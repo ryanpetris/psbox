@@ -6,6 +6,11 @@
 //! listed interfaces pass, interfaces that could run host commands or act
 //! silently are refused or forced interactive, and host file paths are
 //! never handed to the sandbox as-is.
+//!
+//! A connection without a portal identity (see `identity.rs`) reaches only
+//! the portals that need none: settings, opening links, realtime
+//! priority, inhibiting, and the monitors. To it the others, the file
+//! chooser among them, do not exist, so toolkits use their own dialogs.
 
 use std::path::{Path, PathBuf};
 
@@ -74,6 +79,30 @@ const METHODS: [(&str, &[&str]); 19] = [
     ),
 ];
 
+/// The portals a connection without a portal identity reaches, and their
+/// forwarded methods.
+const UNIDENTIFIED: [(&str, &[&str]); 7] = [
+    ("org.freedesktop.portal.Settings", &["ReadAll", "Read", "ReadOne"]),
+    ("org.freedesktop.portal.OpenURI", &["OpenURI", "SchemeSupported"]),
+    (
+        "org.freedesktop.portal.Realtime",
+        &["MakeThreadRealtimeWithPID", "MakeThreadHighPriorityWithPID"],
+    ),
+    (
+        "org.freedesktop.portal.Inhibit",
+        &["Inhibit", "CreateMonitor", "QueryEndResponse"],
+    ),
+    (
+        "org.freedesktop.portal.NetworkMonitor",
+        &["GetAvailable", "GetMetered", "GetConnectivity", "GetStatus", "CanReach"],
+    ),
+    ("org.freedesktop.portal.MemoryMonitor", &[]),
+    ("org.freedesktop.portal.PowerProfileMonitor", &[]),
+];
+
+/// The portal object as a connection without a portal identity sees it.
+pub const UNIDENTIFIED_INTROSPECTION: &str = include_str!("assets/portal-unidentified.xml");
+
 /// The methods of `org.freedesktop.Notifications` that are forwarded.
 const NOTIFICATIONS_METHODS: [&str; 4] = ["Notify", "CloseNotification", "GetCapabilities", "GetServerInformation"];
 
@@ -129,7 +158,7 @@ pub fn service_for(dest: &str, gateway_unique: &str, path: &str) -> Option<&'sta
 /// Whether a signal arriving on a client's host connection is passed to the
 /// client: only portal and notification signals, on their own objects. A
 /// host process can send a signal straight to any connection, so this is
-/// what keeps other services (including `dbus-talk` ones, whose signals
+/// what keeps other services (including `dbus.talk` ones, whose signals
 /// are not forwarded) out.
 pub fn signal_forwarded(path: &str, iface: &str) -> bool {
     let portal_object = path == PORTAL_PATH || path.starts_with(&format!("{PORTAL_PATH}/"));
@@ -158,6 +187,10 @@ pub enum Verdict {
         file: Option<FileRequest>,
     },
     Deny(String),
+    /// Answer as if the interface did not exist.
+    Missing(String),
+    /// Answer an introspection with [`UNIDENTIFIED_INTROSPECTION`].
+    Introspect,
 }
 
 fn forward() -> Verdict {
@@ -172,14 +205,15 @@ fn introspection(iface: &str) -> bool {
     iface == "org.freedesktop.DBus.Introspectable" || iface == "org.freedesktop.DBus.Peer"
 }
 
-/// Decides what to do with a method call addressed to a gateway name.
-pub fn check(policy: &Policy, msg: &Message) -> Verdict {
+/// Decides what to do with a method call addressed to a gateway name, on a
+/// connection with a portal identity (`identified`) or without.
+pub fn check(policy: &Policy, identified: bool, msg: &Message) -> Verdict {
     let dest = msg.destination.as_deref().unwrap_or_default();
     let path = msg.path.as_deref().unwrap_or_default();
     let iface = msg.interface.as_deref().unwrap_or_default();
     let member = msg.member.as_deref().unwrap_or_default();
     match dest {
-        PORTAL_NAME if path == PORTAL_PATH => check_portal(policy, msg, iface, member),
+        PORTAL_NAME if path == PORTAL_PATH => check_portal(policy, identified, msg, iface, member),
         PORTAL_NAME if path.starts_with(REQUEST_PREFIX) => match (iface, member) {
             ("org.freedesktop.portal.Request", "Close") => forward(),
             _ => deny("only org.freedesktop.portal.Request.Close on request objects"),
@@ -202,20 +236,23 @@ pub fn check(policy: &Policy, msg: &Message) -> Verdict {
 
 /// The forwarded methods of `iface` under `policy`, or `None` when the
 /// interface is not forwarded at all.
-fn portal_methods(policy: &Policy, iface: &str) -> Option<&'static [&'static str]> {
+fn portal_methods(policy: &Policy, identified: bool, iface: &str) -> Option<&'static [&'static str]> {
     let gated = match iface {
         "org.freedesktop.portal.Camera" => policy.camera,
         "org.freedesktop.portal.Realtime" => policy.realtime,
         _ => true,
     };
-    METHODS
-        .iter()
+    let list: &[(&str, &[&str])] = if identified { &METHODS } else { &UNIDENTIFIED };
+    list.iter()
         .find(|(name, _)| *name == iface)
         .filter(|_| gated)
         .map(|(_, methods)| *methods)
 }
 
-fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Verdict {
+fn check_portal(policy: &Policy, identified: bool, msg: &Message, iface: &str, member: &str) -> Verdict {
+    if iface == "org.freedesktop.DBus.Introspectable" && !identified {
+        return Verdict::Introspect;
+    }
     if introspection(iface) {
         return forward();
     }
@@ -225,11 +262,13 @@ fn check_portal(policy: &Policy, msg: &Message, iface: &str, member: &str) -> Ve
             .ok()
             .and_then(|a| a.first().and_then(|v| v.as_str().map(str::to_string)));
         return match (member, target) {
-            ("Get" | "GetAll", Some(t)) if portal_methods(policy, &t).is_some() => forward(),
+            ("Get" | "GetAll", Some(t)) if portal_methods(policy, identified, &t).is_some() => forward(),
+            ("Get" | "GetAll", Some(t)) if !identified => Verdict::Missing(format!("no interface {t}")),
             _ => deny("property access not allowed"),
         };
     }
-    match portal_methods(policy, iface) {
+    match portal_methods(policy, identified, iface) {
+        None if !identified => return Verdict::Missing(format!("no interface {iface}")),
         None => return deny(format!("{iface} is not forwarded")),
         Some(methods) if !methods.contains(&member) => return deny(format!("{iface}.{member} is not forwarded")),
         Some(_) => {}
@@ -460,7 +499,11 @@ mod tests {
     }
 
     fn portal(iface: &str, member: &str, args: &[Value]) -> Verdict {
-        check(&Policy::default(), &call(PORTAL_NAME, PORTAL_PATH, iface, member, args))
+        check(
+            &Policy::default(),
+            true,
+            &call(PORTAL_NAME, PORTAL_PATH, iface, member, args),
+        )
     }
 
     #[test]
@@ -488,7 +531,7 @@ mod tests {
             Verdict::Deny(_)
         ));
         let on = |path: String, iface: &str, member: &str| {
-            check(&Policy::default(), &call(PORTAL_NAME, &path, iface, member, &[]))
+            check(&Policy::default(), true, &call(PORTAL_NAME, &path, iface, member, &[]))
         };
         let request = format!("{REQUEST_PREFIX}1_5/t");
         assert_eq!(
@@ -511,6 +554,7 @@ mod tests {
         let notifications = |member: &str| {
             check(
                 &Policy::default(),
+                true,
                 &call(
                     NOTIFICATIONS_NAME,
                     NOTIFICATIONS_PATH,
@@ -549,7 +593,7 @@ mod tests {
             "AccessCamera",
             &[opts()],
         );
-        assert_eq!(check(&with_camera, &m), forward());
+        assert_eq!(check(&with_camera, true, &m), forward());
     }
 
     #[test]
@@ -561,6 +605,7 @@ mod tests {
         let rt = |member: &str, args: &[Value]| {
             check(
                 &with_realtime,
+                true,
                 &call(
                     PORTAL_NAME,
                     PORTAL_PATH,
@@ -584,7 +629,7 @@ mod tests {
             "MakeThreadRealtimeWithPID",
             &args,
         );
-        assert!(matches!(check(&Policy::default(), &without), Verdict::Deny(_)));
+        assert!(matches!(check(&Policy::default(), true, &without), Verdict::Deny(_)));
         // Its properties are readable when it is forwarded.
         let prop = call(
             PORTAL_NAME,
@@ -596,8 +641,8 @@ mod tests {
                 Value::Str("MaxRealtimePriority".into()),
             ],
         );
-        assert_eq!(check(&with_realtime, &prop), forward());
-        assert!(matches!(check(&Policy::default(), &prop), Verdict::Deny(_)));
+        assert_eq!(check(&with_realtime, true, &prop), forward());
+        assert!(matches!(check(&Policy::default(), true, &prop), Verdict::Deny(_)));
     }
 
     #[test]
@@ -754,7 +799,7 @@ mod tests {
             "Close",
             &[],
         );
-        assert_eq!(check(&p, &req), forward());
+        assert_eq!(check(&p, true, &req), forward());
         let bad = call(
             PORTAL_NAME,
             "/org/freedesktop/portal/documents",
@@ -762,7 +807,7 @@ mod tests {
             "Add",
             &[],
         );
-        assert!(matches!(check(&p, &bad), Verdict::Deny(_)));
+        assert!(matches!(check(&p, true, &bad), Verdict::Deny(_)));
         let other = call(
             "org.freedesktop.systemd1",
             "/org/freedesktop/systemd1",
@@ -770,7 +815,7 @@ mod tests {
             "StartTransientUnit",
             &[],
         );
-        assert!(matches!(check(&p, &other), Verdict::Deny(_)));
+        assert!(matches!(check(&p, true, &other), Verdict::Deny(_)));
     }
 
     #[test]
@@ -795,7 +840,7 @@ mod tests {
             "Notify",
             &args,
         );
-        let Verdict::Forward { args: Some(a), .. } = check(&Policy::default(), &m) else {
+        let Verdict::Forward { args: Some(a), .. } = check(&Policy::default(), true, &m) else {
             panic!("expected forward")
         };
         assert_eq!(a[6].dict_get("image-path"), None);
@@ -888,5 +933,68 @@ mod tests {
         assert!(!activation_allowed("org.freedesktop.systemd1"));
         assert!(activation_allowed("ca.desrt.dconf"));
         assert!(activation_allowed("org.gtk.vfs.Daemon"));
+    }
+
+    #[test]
+    fn unidentified_connections_reach_only_portals_needing_no_identity() {
+        let unidentified = |iface: &str, member: &str, args: &[Value]| {
+            check(
+                &Policy {
+                    realtime: true,
+                    ..Policy::default()
+                },
+                false,
+                &call(PORTAL_NAME, PORTAL_PATH, iface, member, args),
+            )
+        };
+        let settings = [
+            Value::Str("org.freedesktop.appearance".into()),
+            Value::Str("color-scheme".into()),
+        ];
+        assert_eq!(
+            unidentified("org.freedesktop.portal.Settings", "ReadOne", &settings),
+            forward()
+        );
+        let open = [Value::Str("".into()), Value::Str("https://example.com".into()), opts()];
+        assert_eq!(
+            unidentified("org.freedesktop.portal.OpenURI", "OpenURI", &open),
+            forward()
+        );
+        let fd = [Value::Str("".into()), Value::Fd(0), opts()];
+        assert!(matches!(
+            unidentified("org.freedesktop.portal.OpenURI", "OpenFile", &fd),
+            Verdict::Deny(_)
+        ));
+        assert_eq!(
+            unidentified(
+                "org.freedesktop.portal.Inhibit",
+                "Inhibit",
+                &[Value::Str("".into()), Value::U32(8), opts()]
+            ),
+            forward()
+        );
+        // To it the file chooser does not exist, properties and all.
+        assert!(matches!(
+            unidentified("org.freedesktop.portal.FileChooser", "OpenFile", &[]),
+            Verdict::Missing(_)
+        ));
+        let version = [
+            Value::Str("org.freedesktop.portal.FileChooser".into()),
+            Value::Str("version".into()),
+        ];
+        assert!(matches!(
+            unidentified("org.freedesktop.DBus.Properties", "Get", &version),
+            Verdict::Missing(_)
+        ));
+        assert_eq!(
+            unidentified("org.freedesktop.DBus.Introspectable", "Introspect", &[]),
+            Verdict::Introspect
+        );
+        assert!(UNIDENTIFIED_INTROSPECTION.contains("org.freedesktop.portal.Settings"));
+        assert!(!UNIDENTIFIED_INTROSPECTION.contains("FileChooser"));
+        assert!(matches!(
+            unidentified("org.freedesktop.portal.Notification", "AddNotification", &[]),
+            Verdict::Missing(_)
+        ));
     }
 }

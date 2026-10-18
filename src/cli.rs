@@ -1,9 +1,9 @@
 //! The commands that report rather than run something in a sandbox: `list`,
-//! `status`, `mount`, `umount`, `stop`, `install`, `devices`, `check`, and
-//! `completions`.
+//! `status`, `config`, `mount`, `umount`, `stop`, `install`, `devices`,
+//! `check`, and `completions`.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::devices::{self, HostPaths};
 use crate::plan::{HostEnv, Identity, Plan, find_in_path, resolve_network};
 use crate::protocol::{Request, Response};
-use crate::spec::{DeviceClass, MountMode, Network, Spec, Tokens};
+use crate::spec::{AppSpec, DeviceClass, MountMode, Network, Spec};
 use crate::systemd::{self, Systemd};
 use crate::ui::{self, BOLD, CYAN, Cell, DIM, GREEN, RED, Table, YELLOW, paint};
 use crate::{client, install, sys};
@@ -33,25 +33,23 @@ struct SandboxInfo {
     network: Option<Network>,
     /// `network` is `host` only because pasta is not installed.
     network_fallback: bool,
-    commands: Vec<String>,
+    apps: Vec<String>,
     tasks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 /// One line about a config error: where and what, without the source
-/// excerpt TOML errors carry.
+/// excerpt.
 fn error_summary(e: &anyhow::Error) -> String {
     if let Some(c) = e.downcast_ref::<crate::spec::ConfigError>() {
         return c.summary();
     }
-    let text = e.root_cause().to_string();
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let first = lines.next().unwrap_or_default();
-    match (first.strip_prefix("TOML parse error at "), text.lines().last()) {
-        (Some(at), Some(what)) if what != first => format!("{at}: {what}"),
-        _ => first.to_string(),
-    }
+    let text = format!("{e:#}");
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn list(json: bool) -> Result<i32> {
@@ -66,7 +64,7 @@ pub fn list(json: bool) -> Result<i32> {
         })
         .collect();
     let mut sandboxes = Vec::new();
-    for (name, spec) in Spec::load_all(&host.config_dir)? {
+    for (name, spec) in Spec::load_all(&host)? {
         let mut instances = Vec::new();
         let mut running_tasks = Vec::new();
         for key in &running {
@@ -81,20 +79,22 @@ pub fn list(json: bool) -> Result<i32> {
         instances.sort();
         running_tasks.sort();
         let (mut network, mut network_fallback) = (None, false);
-        let (commands, tasks, error) = match spec {
+        let (apps, tasks, error) = match spec {
             Ok(s) => {
-                let mut commands: Vec<String> = s.command.keys().cloned().collect();
-                if commands.is_empty() {
-                    commands.push(name.clone());
-                }
+                let apps: Vec<String> = s
+                    .app
+                    .iter()
+                    .filter(|(_, a)| matches!(a, AppSpec::Application(_)))
+                    .map(|(k, _)| k.clone())
+                    .collect();
                 let error = match resolve_network(s.network, host.pasta) {
                     Some((n, fallback)) => {
                         (network, network_fallback) = (Some(n), fallback);
                         None
                     }
-                    None => Some("network = \"isolated\" needs pasta, which is not installed".into()),
+                    None => Some("network.mode 'isolated' needs pasta, which is not installed".into()),
                 };
-                (commands, s.task.keys().cloned().collect(), error)
+                (apps, s.task.keys().cloned().collect(), error)
             }
             Err(e) => (Vec::new(), Vec::new(), Some(error_summary(&e))),
         };
@@ -110,7 +110,7 @@ pub fn list(json: bool) -> Result<i32> {
             running_tasks,
             network,
             network_fallback,
-            commands,
+            apps,
             tasks,
             error,
         });
@@ -127,14 +127,14 @@ pub fn list(json: bool) -> Result<i32> {
         );
         return Ok(0);
     }
-    let mut table = Table::new(&["SANDBOX", "STATE", "NETWORK", "COMMANDS", "TASKS"]).flex(3);
+    let mut table = Table::new(&["SANDBOX", "STATE", "NETWORK", "APPS", "TASKS"]).flex(3);
     for s in &sandboxes {
         let name = Cell::styled(BOLD, &s.name);
         let mut network = Cell::new(s.network.map(|n| n.to_string()).unwrap_or_default());
         if s.network_fallback {
             network = network.then(YELLOW, " (no pasta)");
         }
-        let commands = Cell::new(s.commands.join(", "));
+        let commands = Cell::new(s.apps.join(", "));
         let tasks = Cell::new(s.tasks.join(", "));
         match (&s.error, s.state) {
             (Some(e), _) => table.marked_row(
@@ -163,15 +163,6 @@ pub fn list(json: bool) -> Result<i32> {
     }
     table.print();
     Ok(0)
-}
-
-fn mode_name(mode: MountMode) -> &'static str {
-    match mode {
-        MountMode::Ro => "read-only",
-        MountMode::Rw => "read-write",
-        MountMode::Overlay => "overlay",
-        MountMode::Empty => "empty",
-    }
 }
 
 pub fn status(id: &Identity, json: bool) -> Result<i32> {
@@ -226,7 +217,7 @@ pub fn status(id: &Identity, json: bool) -> Result<i32> {
         mounts.row(vec![
             Cell::styled(CYAN, ui::tilde(&m.host)),
             Cell::styled(CYAN, ui::tilde(&m.at)),
-            Cell::styled(DIM, mode_name(m.mode)),
+            Cell::styled(DIM, m.mode.to_string()),
         ]);
     }
     let mut devices = Table::new(&["CLASS", "DEVICE", "PATH"]);
@@ -254,19 +245,54 @@ pub fn status(id: &Identity, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// `path` made absolute against the current directory, unless it starts
-/// with a path token.
+/// `path` made absolute: `~` against the home, anything relative against
+/// the current directory.
 fn absolute(path: &str) -> Result<String> {
-    if path.starts_with('/') || path.starts_with('~') || path.starts_with('@') {
-        return Ok(path.to_string());
-    }
-    Ok(std::env::current_dir()?.join(path).to_string_lossy().into_owned())
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))
+    };
+    let p = match path.strip_prefix('~') {
+        Some("") => home()?,
+        Some(rest) if rest.starts_with('/') => home()?.join(&rest[1..]),
+        _ => std::env::current_dir()?.join(path),
+    };
+    Ok(p.to_string_lossy().into_owned())
+}
+
+/// Prints a sandbox's config (or a task's) as psbox sees it: evaluated,
+/// with every default filled in.
+pub fn config(sandbox: &str, task: Option<&str>) -> Result<i32> {
+    let host = HostEnv::from_process()?;
+    let spec = Spec::load(sandbox, &host)?;
+    let json = match task {
+        None => spec.to_json(),
+        Some(t) => match spec.task.get(t) {
+            Some(task) => {
+                let mut json = task.spec.to_json();
+                if let Some(o) = json.as_object_mut() {
+                    o.remove("app");
+                    o.remove("task");
+                    o.insert("run".into(), serde_json::json!(task.command));
+                    o.insert("app".into(), serde_json::json!(task.app));
+                }
+                json
+            }
+            None => bail!("{sandbox} has no task named {t}"),
+        },
+    };
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(0)
 }
 
 pub fn mount(id: &Identity, host: &str, at: Option<String>, ro: bool) -> Result<i32> {
     let host = absolute(host)?;
-    let mode = if ro { MountMode::Ro } else { MountMode::Rw };
-    let dst = at.clone().unwrap_or_else(|| host.clone());
+    let mode = if ro { MountMode::ReadOnly } else { MountMode::ReadWrite };
+    let dst = match &at {
+        Some(at) => absolute(at)?,
+        None => host.clone(),
+    };
     client::request(
         id,
         Request::Mount {
@@ -284,7 +310,7 @@ pub fn mount(id: &Identity, host: &str, at: Option<String>, ro: bool) -> Result<
         "mounted {}{place} in {} {}",
         ui::code(ui::tilde(&host)),
         paint(BOLD, id.describe()),
-        paint(DIM, format!("({})", mode_name(mode)))
+        paint(DIM, format!("({mode})"))
     ));
     Ok(0)
 }
@@ -318,7 +344,7 @@ pub fn task(sandbox: &str, task: &str, args: Vec<String>, create_dirs: bool) -> 
         sandbox: sandbox.into(),
         task: task.into(),
     };
-    let code = client::run(&id, Some(task.into()), args, false, create_dirs)?;
+    let code = client::run(&id, None, args, false, create_dirs)?;
     if let Err(e) = refresh_after_task(sandbox, task) {
         ui::warning(format!(
             "running instances of {sandbox} may not show what the task changed ({e:#}); {} restarts them",
@@ -330,7 +356,7 @@ pub fn task(sandbox: &str, task: &str, args: Vec<String>, create_dirs: bool) -> 
 
 fn refresh_after_task(sandbox: &str, task: &str) -> Result<()> {
     let host = HostEnv::from_process()?;
-    let hosts = writable_hosts(&Spec::load(sandbox, &host.config_dir)?, sandbox, task, &host)?;
+    let hosts = writable_hosts(&Spec::load(sandbox, &host)?, task);
     if hosts.is_empty() {
         return Ok(());
     }
@@ -355,20 +381,23 @@ fn refresh_after_task(sandbox: &str, task: &str) -> Result<()> {
     Ok(())
 }
 
-/// The host directories behind a task's `writable` mounts.
-fn writable_hosts(spec: &Spec, sandbox: &str, task: &str, host: &HostEnv) -> Result<Vec<String>> {
+/// The host paths a task can write through its mounts, with symlinks
+/// resolved: running instances refresh the overlays whose source overlaps
+/// one of them.
+fn writable_hosts(spec: &Spec, task: &str) -> Vec<String> {
     let Some(t) = spec.task.get(task) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
-    let tokens = Tokens {
-        home: &host.home,
-        root: &host.root,
-        name: sandbox,
-    };
-    t.writable
-        .iter()
-        .filter_map(|name| spec.mount.get(name)?.host.as_deref())
-        .map(|h| Ok(tokens.expand(h)?.to_string_lossy().into_owned()))
+    let sources: Vec<PathBuf> = t
+        .spec
+        .mount
+        .values()
+        .filter(|m| m.mode == MountMode::ReadWrite)
+        .filter_map(|m| m.source.clone())
+        .collect();
+    crate::spec::canonical(&sources)
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
         .collect()
 }
 
@@ -459,7 +488,7 @@ pub fn install(dry_run: bool, verbose: bool) -> Result<i32> {
     let mut code = 0;
     let mut specs = Vec::new();
     let mut failed = Vec::new();
-    for (name, spec) in Spec::load_all(&host.config_dir)? {
+    for (name, spec) in Spec::load_all(&host)? {
         match spec {
             Ok(s) => specs.push((name, s)),
             Err(e) => {
@@ -494,9 +523,12 @@ pub fn install(dry_run: bool, verbose: bool) -> Result<i32> {
         anstream::eprintln!();
     }
     let failed: Vec<String> = failed.into_iter().map(|(name, _)| name).collect();
-    let dirs = install::Dirs::from_env(&host);
+    let dirs = install::Dirs::for_host(&host);
     let exe = std::env::current_exe()?;
-    let generation = install::generate(&specs, &host, &dirs, &exe);
+    let generation = install::generate(&specs, &dirs, &exe);
+    for (sandbox, entry, note) in &generation.notes {
+        ui::warning(format!("{} {entry} · {note}", paint(BOLD, sandbox)));
+    }
     if !generation.warnings.is_empty() {
         let n = generation.warnings.len();
         let (entries, them) = match n {
@@ -525,8 +557,9 @@ pub fn install(dry_run: bool, verbose: bool) -> Result<i32> {
             .any(|(_, _, p)| p.starts_with("no host entry"))
         {
             ui::fix(format!(
-                "install the app, or write the entry in the config with {}",
-                ui::code("desktop.entry")
+                "install the app, or build the entry from {} without {}",
+                ui::code("keys"),
+                ui::code("source-id")
             ));
         }
         anstream::eprintln!();
@@ -738,7 +771,7 @@ pub fn devices(all: bool, json: bool) -> Result<i32> {
         notes.push(format!("no {names} found"));
     }
     if all {
-        notes.push("grant one USB device with usb:VENDOR:PRODUCT (its ID)".into());
+        notes.push("grant one USB device by adding its ID to devices.usb".into());
     } else if others > 0 {
         notes.push(format!("{others} other devices: psbox devices --all"));
     }
@@ -759,7 +792,7 @@ enum Level {
 /// starting anything.
 pub fn check_sandbox(name: &str) -> Result<i32> {
     let host = HostEnv::from_process()?;
-    let spec = Spec::load(name, &host.config_dir)?;
+    let spec = Spec::load(name, &host)?;
     let mut ids = vec![Identity::Instance {
         sandbox: name.into(),
         instance: None,
@@ -848,10 +881,14 @@ pub fn check() -> Result<i32> {
         Err(e) => (Level::Fail, "user namespaces", format!("cannot create one: {e}")),
     });
 
-    items.push(if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        (Level::Ok, "cgroup v2", "unified hierarchy".into())
-    } else {
-        (Level::Fail, "cgroup v2", "not mounted at /sys/fs/cgroup".into())
+    items.push(match sys::cgroup::nsdelegate() {
+        Ok(true) => (Level::Ok, "cgroup v2", "unified hierarchy, with nsdelegate".into()),
+        Ok(false) => (
+            Level::Fail,
+            "cgroup v2",
+            "mounted without nsdelegate, which keeps each launch in its cgroup".into(),
+        ),
+        Err(e) => (Level::Fail, "cgroup v2", format!("{e:#}")),
     });
 
     let units = [systemd::socket_unit(""), systemd::service_unit("")];
@@ -882,7 +919,7 @@ pub fn check() -> Result<i32> {
     });
 
     for (tool, level, needed) in [
-        ("dbus-daemon", Level::Fail, "dbus = \"portal\" (the default)"),
+        ("dbus-daemon", Level::Fail, "dbus.mode 'portal' (the default)"),
         ("xwayland-satellite", Level::Warn, "X11 apps (xwayland)"),
         ("Xwayland", Level::Warn, "X11 apps (xwayland)"),
     ] {
@@ -896,7 +933,7 @@ pub fn check() -> Result<i32> {
         None => (
             Level::Warn,
             "pasta",
-            "not installed: sandboxes without network fall back to the host network".into(),
+            "not installed: the automatic network falls back to the host network".into(),
         ),
     });
 
@@ -1014,39 +1051,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_tasks_writable_hosts_are_expanded() {
-        let host = HostEnv {
-            uid: 1000,
-            gid: 1000,
-            user: "u".into(),
-            home: "/home/u".into(),
-            runtime_dir: "/run/user/1000".into(),
-            wayland_socket: None,
-            session_bus: None,
-            config_dir: "/home/u/.config/psbox".into(),
-            root: "/home/u/Sandbox".into(),
-            pasta: true,
-            exe: "/usr/bin/psbox".into(),
-        };
-        let spec = Spec::parse(
-            "[mount.bin]\nhost = \"@self.bin/\"\nat = \"~/.bin\"\nmode = \"overlay\"\n\
-             [mount.data]\nhost = \"~/data\"\nmode = \"ro\"\n\
-             [task.update]\nexec = [\"x\"]\nwritable = [\"bin\"]\n\
-             [task.check]\nexec = [\"x\"]\n",
-        )
-        .unwrap();
-        let hosts = writable_hosts(&spec, "app", "update", &host).unwrap();
-        assert_eq!(hosts.len(), 1);
-        assert_eq!(Path::new(&hosts[0]), Path::new("/home/u/Sandbox/app.bin"));
-        assert!(writable_hosts(&spec, "app", "check", &host).unwrap().is_empty());
-    }
-
-    #[test]
     fn config_errors_fit_on_one_line() {
-        let toml_error = Spec::parse("broken = = toml").unwrap_err();
-        let summary = error_summary(&toml_error);
-        assert!(summary.starts_with("line 1, column"), "{summary}");
-        assert!(!summary.contains('\n') && !summary.contains('|'), "{summary}");
+        let e = anyhow::Error::from(crate::spec::ConfigError {
+            name: Some("app".into()),
+            file: None,
+            problem: crate::spec::ConfigProblem::Parse {
+                location: Some("app.jsonnet:1:3".into()),
+                message: "boom".into(),
+                excerpt: vec!["1 |{ boom }".into(), "  |  ^".into()],
+            },
+        });
+        assert_eq!(error_summary(&e), "app.jsonnet:1:3: boom");
         assert_eq!(error_summary(&anyhow::anyhow!("plain")), "plain");
     }
 }

@@ -9,14 +9,18 @@ See `AGENTS.md`, "Dependencies and licenses", before adding or updating one.
 
 | Crate | Version | License | Direct |
 | --- | --- | --- | --- |
+| `allocator-api2` | 0.2.21 | MIT OR Apache-2.0 |  |
 | `anstream` | 1.0.0 | MIT OR Apache-2.0 | yes |
 | `anstyle` | 1.0.14 | MIT OR Apache-2.0 | yes |
 | `anstyle-parse` | 1.0.0 | MIT OR Apache-2.0 |  |
 | `anstyle-query` | 1.1.5 | MIT OR Apache-2.0 |  |
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 | yes |
+| `arraydeque` | 0.5.1 | MIT OR Apache-2.0 |  |
 | `arrayref` | 0.3.9 | BSD-2-Clause |  |
 | `arrayvec` | 0.7.8 | MIT OR Apache-2.0 |  |
 | `bitflags` | 2.13.2 | MIT OR Apache-2.0 |  |
+| `block-buffer` | 0.10.4 | MIT OR Apache-2.0 |  |
+| `bumpalo` | 3.20.3 | MIT OR Apache-2.0 |  |
 | `bytemuck` | 1.25.2 | Zlib OR Apache-2.0 OR MIT |  |
 | `bytemuck_derive` | 1.12.1 | Zlib OR Apache-2.0 OR MIT |  |
 | `cc` | 1.8.0 | MIT OR Apache-2.0 |  |
@@ -27,21 +31,30 @@ See `AGENTS.md`, "Dependencies and licenses", before adding or updating one.
 | `clap_derive` | 4.6.7 | MIT OR Apache-2.0 |  |
 | `clap_lex` | 1.1.1 | MIT OR Apache-2.0 |  |
 | `colorchoice` | 1.0.5 | MIT OR Apache-2.0 |  |
+| `cpufeatures` | 0.2.17 | MIT OR Apache-2.0 |  |
+| `crypto-common` | 0.1.7 | MIT OR Apache-2.0 |  |
 | `cursor-icon` | 1.2.0 | MIT OR Apache-2.0 OR Zlib |  |
+| `digest` | 0.10.7 | MIT OR Apache-2.0 |  |
 | `downcast-rs` | 1.2.1 | MIT/Apache-2.0 |  |
 | `equivalent` | 1.0.2 | Apache-2.0 OR MIT |  |
 | `errno` | 0.3.14 | MIT OR Apache-2.0 |  |
 | `find-msvc-tools` | 0.1.14 | MIT OR Apache-2.0 |  |
+| `foldhash` | 0.1.5 | Zlib |  |
+| `foldhash` | 0.2.0 | Zlib |  |
 | `font-types` | 0.12.7 | MIT OR Apache-2.0 |  |
-| `hashbrown` | 0.17.1 | MIT OR Apache-2.0 |  |
+| `generic-array` | 0.14.7 | MIT |  |
+| `hashbrown` | 0.15.5 | MIT OR Apache-2.0 |  |
+| `hashbrown` | 0.16.1 | MIT OR Apache-2.0 |  |
+| `hashlink` | 0.10.0 | MIT OR Apache-2.0 |  |
 | `heck` | 0.5.0 | MIT OR Apache-2.0 |  |
-| `indexmap` | 2.14.2 | Apache-2.0 OR MIT |  |
 | `is_executable` | 1.0.6 | MIT OR Apache-2.0 |  |
 | `is_terminal_polyfill` | 1.70.2 | MIT OR Apache-2.0 |  |
 | `itoa` | 1.0.18 | MIT OR Apache-2.0 |  |
+| `keccak` | 0.1.6 | Apache-2.0 OR MIT |  |
 | `libc` | 0.2.190 | MIT OR Apache-2.0 | yes |
 | `linux-raw-sys` | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |  |
 | `log` | 0.4.34 | MIT OR Apache-2.0 |  |
+| `md-5` | 0.10.6 | MIT OR Apache-2.0 |  |
 | `memchr` | 2.8.3 | Unlicense OR MIT |  |
 | `memmap2` | 0.9.11 | MIT OR Apache-2.0 |  |
 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 |  |
@@ -50,13 +63,17 @@ See `AGENTS.md`, "Dependencies and licenses", before adding or updating one.
 | `quick-xml` | 0.41.0 | MIT |  |
 | `quote` | 1.0.47 | MIT OR Apache-2.0 |  |
 | `read-fonts` | 0.41.0 | MIT OR Apache-2.0 |  |
+| `rsjsonnet-lang` | 0.5.0 | MIT OR Apache-2.0 | yes |
 | `rustix` | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |  |
+| `saphyr-parser` | 0.0.6 | MIT OR Apache-2.0 |  |
 | `sctk-adwaita` | 0.12.0 | MIT | yes |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | yes |
 | `serde_core` | 1.0.229 | MIT OR Apache-2.0 |  |
 | `serde_derive` | 1.0.229 | MIT OR Apache-2.0 |  |
 | `serde_json` | 1.0.154 | MIT OR Apache-2.0 | yes |
-| `serde_spanned` | 1.1.2 | MIT OR Apache-2.0 |  |
+| `sha1` | 0.10.7 | MIT OR Apache-2.0 |  |
+| `sha2` | 0.10.9 | MIT OR Apache-2.0 |  |
+| `sha3` | 0.10.9 | MIT OR Apache-2.0 |  |
 | `shlex` | 2.0.1 | MIT OR Apache-2.0 |  |
 | `skrifa` | 0.44.0 | MIT OR Apache-2.0 |  |
 | `smallvec` | 1.16.3 | MIT OR Apache-2.0 |  |
@@ -68,12 +85,10 @@ See `AGENTS.md`, "Dependencies and licenses", before adding or updating one.
 | `thiserror-impl` | 2.0.21 | MIT OR Apache-2.0 |  |
 | `tiny-skia` | 0.12.0 | BSD-3-Clause |  |
 | `tiny-skia-path` | 0.12.0 | BSD-3-Clause |  |
-| `toml` | 1.1.8+spec-1.1.0 | MIT OR Apache-2.0 | yes |
-| `toml_datetime` | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |  |
-| `toml_parser` | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 |  |
-| `toml_writer` | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |  |
+| `typenum` | 1.20.1 | MIT OR Apache-2.0 |  |
 | `unicode-ident` | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |  |
 | `utf8parse` | 0.2.2 | Apache-2.0 OR MIT |  |
+| `version_check` | 0.9.5 | MIT OR Apache-2.0 |  |
 | `wayland-backend` | 0.3.17 | MIT | yes |
 | `wayland-client` | 0.31.15 | MIT | yes |
 | `wayland-csd-frame` | 0.3.0 | MIT |  |
@@ -84,7 +99,6 @@ See `AGENTS.md`, "Dependencies and licenses", before adding or updating one.
 | `wayland-protocols-wlr` | 0.3.12 | MIT |  |
 | `wayland-scanner` | 0.31.11 | MIT |  |
 | `wayland-sys` | 0.31.11 | MIT |  |
-| `winnow` | 1.0.4 | MIT |  |
 | `xcursor` | 0.3.11 | MIT |  |
 | `xkeysym` | 0.2.1 | MIT OR Apache-2.0 OR Zlib |  |
 | `zmij` | 1.0.23 | MIT |  |

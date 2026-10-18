@@ -1,0 +1,137 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- What psbox's gateway shows of /org/freedesktop/portal/desktop to a
+     process without a portal identity: the portals it forwards for one. -->
+<node>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.portal.Settings">
+    <method name="ReadAll">
+      <arg type="as" name="namespaces" direction="in"/>
+      <arg type="a{sa{sv}}" name="value" direction="out"/>
+    </method>
+    <method name="Read">
+      <arg type="s" name="namespace" direction="in"/>
+      <arg type="s" name="key" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="ReadOne">
+      <arg type="s" name="namespace" direction="in"/>
+      <arg type="s" name="key" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <signal name="SettingChanged">
+      <arg type="s" name="namespace"/>
+      <arg type="s" name="key"/>
+      <arg type="v" name="value"/>
+    </signal>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.OpenURI">
+    <method name="OpenURI">
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="uri" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="SchemeSupported">
+      <arg type="s" name="scheme" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="b" name="supported" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.Realtime">
+    <method name="MakeThreadRealtimeWithPID">
+      <arg type="t" name="process" direction="in"/>
+      <arg type="t" name="thread" direction="in"/>
+      <arg type="u" name="priority" direction="in"/>
+    </method>
+    <method name="MakeThreadHighPriorityWithPID">
+      <arg type="t" name="process" direction="in"/>
+      <arg type="t" name="thread" direction="in"/>
+      <arg type="i" name="priority" direction="in"/>
+    </method>
+    <property name="MaxRealtimePriority" type="i" access="read"/>
+    <property name="MinNiceLevel" type="i" access="read"/>
+    <property name="RTTimeUSecMax" type="x" access="read"/>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.Inhibit">
+    <method name="Inhibit">
+      <arg type="s" name="window" direction="in"/>
+      <arg type="u" name="flags" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="CreateMonitor">
+      <arg type="s" name="window" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="QueryEndResponse">
+      <arg type="o" name="session_handle" direction="in"/>
+    </method>
+    <signal name="StateChanged">
+      <arg type="o" name="session_handle"/>
+      <arg type="a{sv}" name="state"/>
+    </signal>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.NetworkMonitor">
+    <method name="GetAvailable">
+      <arg type="b" name="available" direction="out"/>
+    </method>
+    <method name="GetMetered">
+      <arg type="b" name="metered" direction="out"/>
+    </method>
+    <method name="GetConnectivity">
+      <arg type="u" name="connectivity" direction="out"/>
+    </method>
+    <method name="GetStatus">
+      <arg type="a{sv}" name="status" direction="out"/>
+    </method>
+    <method name="CanReach">
+      <arg type="s" name="hostname" direction="in"/>
+      <arg type="u" name="port" direction="in"/>
+      <arg type="b" name="reachable" direction="out"/>
+    </method>
+    <signal name="changed"/>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.MemoryMonitor">
+    <signal name="LowMemoryWarning">
+      <arg type="y" name="level"/>
+    </signal>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.PowerProfileMonitor">
+    <property name="power-saver-enabled" type="b" access="read"/>
+    <property name="version" type="u" access="read"/>
+  </interface>
+</node>

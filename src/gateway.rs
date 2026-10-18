@@ -6,10 +6,15 @@
 //! sessions) and the portal request paths it derives from the caller map
 //! one-to-one onto the paths the client predicted from its own name. That
 //! connection, opened by the connector (see `connector.rs`) in the
-//! sandbox's PID namespace, registers the client's app id with the host
-//! portal before its first call.
+//! sandbox's PID namespace, registers the client's portal identity (see
+//! `identity.rs`) with the host portal before anything else is sent on it,
+//! and its portal calls then go to the portal instance that accepted that.
+//! A portal that restarts knows nothing of the registration, so the next
+//! portal call registers again (activating the new portal) and calls wait
+//! for the answer. A connection without an identity, or whose registration
+//! fails, gets the portals that need none (see `portal.rs`).
 //!
-//! Each `dbus-talk` name gets its own private-bus connection that owns it,
+//! Each `dbus.talk` name gets its own private-bus connection that owns it,
 //! so calls addressed to that connection's unique name (as GDBus proxies
 //! do) are unambiguous, and replies come from the connection the bus
 //! expects them from. Calls to those names are forwarded unfiltered through
@@ -23,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 
-use crate::dbus::conn::Undecodable;
+use crate::dbus::conn::{BUS_NAME, BUS_PATH, Undecodable};
 use crate::dbus::message::{self, Message};
 use crate::dbus::{Conn, Value};
 use crate::portal::{self, FileRequest, GATEWAY_NAMES, Policy, Verdict};
@@ -33,8 +38,8 @@ const PRIMARY_OWNER: u32 = 1;
 
 /// What the gateway needs from the supervisor.
 pub trait Host: Send + Sync {
-    /// The app id for a process (pid as seen inside the sandbox).
-    fn app_id_for_pid(&self, sandbox_pid: u32) -> Option<String>;
+    /// The portal identity of the process behind `pidfd`, if it has one.
+    fn identity(&self, pidfd: OwnedFd) -> Option<String>;
     /// What may reach the host, from the sandbox's current config.
     fn policy(&self) -> Policy;
     /// A new socket connected to the host bus, opened from inside the
@@ -49,7 +54,7 @@ pub trait Host: Send + Sync {
 }
 
 /// The private-bus connection a call came in on, and its reply goes out
-/// on: the portal connection, or the connection of one `dbus-talk` name.
+/// on: the portal connection, or the connection of one `dbus.talk` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Via {
     Portal,
@@ -65,7 +70,27 @@ struct Pending {
     opens: bool,
 }
 
-/// The private-bus connection that owns one `dbus-talk` name.
+/// A client's standing with the host portal.
+#[derive(Default)]
+struct PortalState {
+    /// The identity registered, while the client has one.
+    app_id: Option<String>,
+    /// The unique name of the portal instance that accepted it.
+    owner: Option<String>,
+    /// The serial of a `Register` sent again after the portal changed,
+    /// until its reply.
+    registering: Option<u32>,
+    /// While the calls held for that reply are passed on: later calls wait
+    /// behind them, so the portal sees every call in order.
+    draining: bool,
+    /// Portal calls held until that reply.
+    held: Vec<Held>,
+}
+
+/// A portal call waiting for a `Register` reply.
+type Held = (Message, Vec<OwnedFd>, Via);
+
+/// The private-bus connection that owns one `dbus.talk` name.
 struct Talk {
     name: String,
     conn: Conn,
@@ -93,6 +118,7 @@ struct Client {
     /// The host's current owners of the gateway names (well-known name to
     /// unique name): only their signals reach the client.
     owners: Mutex<HashMap<String, String>>,
+    portal: Mutex<PortalState>,
 }
 
 impl Client {
@@ -252,9 +278,45 @@ impl Gateway {
     }
 
     fn forward_call(self: &Arc<Self>, msg: Message, fds: Vec<OwnedFd>, via: Via) -> Result<()> {
+        self.forward(msg, fds, via, false).map(|_| ())
+    }
+
+    /// Passes a call on. `from_held` is a held call being passed on in
+    /// order: when the portal has to be registered with again, it is handed
+    /// back rather than held behind later calls.
+    fn forward(self: &Arc<Self>, msg: Message, fds: Vec<OwnedFd>, via: Via, from_held: bool) -> Result<Option<Held>> {
         let sender = msg.sender.clone().context("call without sender")?;
+        let client = self.client(&sender)?;
+        let to_portal = via == Via::Portal && msg.destination.as_deref() == Some(portal::PORTAL_NAME);
+        let mut destination = msg.destination.clone();
+        if to_portal {
+            let mut state = client.portal.lock().unwrap();
+            if !from_held && (state.registering.is_some() || state.draining) {
+                state.held.push((msg, fds, via));
+                return Ok(None);
+            }
+            if let Some(app_id) = state.app_id.clone() {
+                let current = client.owners.lock().unwrap().get(portal::PORTAL_NAME).cloned();
+                match (&state.owner, &current) {
+                    (Some(owner), Some(current)) if owner == current => destination = Some(owner.clone()),
+                    // The portal that accepted the registration is gone:
+                    // register again, which starts a new one, and hold the
+                    // call until it answers.
+                    _ => {
+                        let serial = client.host.send(&register(&app_id), &[])?;
+                        state.registering = Some(serial);
+                        if from_held {
+                            return Ok(Some((msg, fds, via)));
+                        }
+                        state.held.push((msg, fds, via));
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let identified = client.portal.lock().unwrap().app_id.is_some();
         let verdict = match via {
-            Via::Portal => portal::check(&self.host.policy(), &msg),
+            Via::Portal => portal::check(&self.host.policy(), identified, &msg),
             // The user listed this name: calls to it pass unchanged.
             Via::Talk(_) => Verdict::Forward { args: None, file: None },
         };
@@ -268,17 +330,28 @@ impl Gateway {
                     msg.path.as_deref().unwrap_or("?"),
                 ));
                 self.reply_error(via, &msg, "org.freedesktop.DBus.Error.AccessDenied", &why);
-                return Ok(());
+                return Ok(None);
+            }
+            Verdict::Missing(why) => {
+                self.reply_error(via, &msg, "org.freedesktop.DBus.Error.UnknownInterface", &why);
+                return Ok(None);
+            }
+            Verdict::Introspect => {
+                if msg.expects_reply() {
+                    let mut reply = Message::method_return(&msg);
+                    reply.set_body(&[Value::Str(portal::UNIDENTIFIED_INTROSPECTION.into())]);
+                    self.conn(via).send(&reply, &[])?;
+                }
+                return Ok(None);
             }
         };
-        let client = self.client(&sender)?;
         let mut out = Message {
             kind: message::METHOD_CALL,
             flags: msg.flags,
             path: msg.path.clone(),
             interface: msg.interface.clone(),
             member: msg.member.clone(),
-            destination: msg.destination.clone(),
+            destination,
             signature: msg.signature.clone(),
             body: msg.body.clone(),
             ..Default::default()
@@ -309,7 +382,7 @@ impl Gateway {
                 },
             );
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The host connection for `sender`, created on first use.
@@ -324,19 +397,20 @@ impl Gateway {
         let host = self
             .host
             .connect_host()
-            .and_then(Conn::over)
+            .and_then(|sock| Conn::over(sock, None))
             .context("connect to host bus")?;
-        if let Some(app_id) = self.app_id(sender) {
-            let register = Message::method_call(
-                portal::PORTAL_NAME,
-                portal::PORTAL_PATH,
-                portal::REGISTRY_IFACE,
-                "Register",
-                &[Value::Str(app_id.clone()), Value::Dict("s".into(), "v".into(), vec![])],
-            );
-            if let Err(e) = host.call(&register) {
-                self.host
-                    .log(&format!("dbus gateway: register {app_id} with the host portal: {e}"));
+        // Registered before anything else goes out on the connection, and
+        // waited for: the portal identifies a connection on its first call.
+        let mut portal_state = PortalState::default();
+        if let Some(app_id) = self.identity(sender) {
+            match host.call(&register(&app_id)) {
+                Ok(reply) => {
+                    portal_state.owner = reply.sender.clone();
+                    portal_state.app_id = Some(app_id);
+                }
+                Err(e) => self.host.log(&format!(
+                    "dbus gateway: registering {app_id} with the host portal failed ({e}); {sender} gets the portals that need no identity"
+                )),
             }
         }
         // Subscribed before asking, so no change of owner falls in between.
@@ -369,6 +443,7 @@ impl Gateway {
             open_requests: Mutex::new(HashSet::new()),
             gone: std::sync::atomic::AtomicBool::new(false),
             owners: Mutex::new(owners),
+            portal: Mutex::new(portal_state),
         });
         self.clients.lock().unwrap().insert(sender.into(), client.clone());
         // A call can be read on one gateway connection after the caller's
@@ -396,17 +471,79 @@ impl Gateway {
             .is_some_and(|a| a.first() == Some(&Value::Bool(true)))
     }
 
-    fn app_id(&self, sender: &str) -> Option<String> {
+    /// The portal identity of the client `sender`, through a pidfd for the
+    /// process that opened its connection.
+    fn identity(&self, sender: &str) -> Option<String> {
         let control = self.control.lock().unwrap();
-        let reply = control
-            .bus_call("GetConnectionUnixProcessID", &[Value::Str(sender.into())])
+        let (reply, fds) = control
+            .call_fds(&Message::method_call(
+                BUS_NAME,
+                BUS_PATH,
+                BUS_NAME,
+                "GetConnectionCredentials",
+                &[Value::Str(sender.into())],
+            ))
             .ok()?;
-        let pid = reply.args().ok()?.first()?.as_u32()?;
-        self.host.app_id_for_pid(pid)
+        drop(control);
+        let pidfd = fds.into_iter().nth(process_fd(&reply.args().ok()?)?)?;
+        self.host.identity(pidfd)
+    }
+
+    /// Handles the reply to a `Register` sent again after the portal
+    /// changed, then passes on the calls held for it.
+    fn registered(self: &Arc<Self>, client: &Client, reply: &Message) {
+        {
+            let mut state = client.portal.lock().unwrap();
+            state.registering = None;
+            state.draining = true;
+            match reply.kind {
+                message::METHOD_RETURN => state.owner = reply.sender.clone(),
+                _ => {
+                    self.host.log(&format!(
+                        "dbus gateway: registering {} again with the host portal failed; {} gets the portals that need no identity",
+                        state.app_id.as_deref().unwrap_or("?"),
+                        client.name
+                    ));
+                    state.app_id = None;
+                    state.owner = None;
+                }
+            }
+        }
+        // Calls that arrive meanwhile join the held ones, until none are
+        // left; if the portal changes again, the rest wait for the next
+        // reply, in order.
+        loop {
+            let batch = {
+                let mut state = client.portal.lock().unwrap();
+                let batch = std::mem::take(&mut state.held);
+                if batch.is_empty() {
+                    state.draining = false;
+                    return;
+                }
+                batch
+            };
+            let mut rest = batch.into_iter();
+            while let Some((msg, fds, via)) = rest.next() {
+                match self.forward(msg.clone(), fds, via, true) {
+                    Ok(None) => {}
+                    Ok(Some(call)) => {
+                        let mut state = client.portal.lock().unwrap();
+                        let later = std::mem::take(&mut state.held);
+                        state.held = std::iter::once(call).chain(rest).chain(later).collect();
+                        state.draining = false;
+                        return;
+                    }
+                    Err(e) => {
+                        self.host.log(&format!("dbus gateway: {e:#}"));
+                        self.reply_error(via, &msg, "org.freedesktop.DBus.Error.Failed", &format!("{e:#}"));
+                    }
+                }
+            }
+        }
     }
 
     /// Relays replies and signals from one client's host connection.
-    fn serve_host(&self, client: &Client) {
+    fn serve_host(self: &Arc<Self>, client: &Client) {
         loop {
             let (msg, fds) = match client.host.recv() {
                 Ok(m) => m,
@@ -438,7 +575,12 @@ impl Gateway {
                     return;
                 }
             };
+            let registering = client.portal.lock().unwrap().registering;
             let r = match msg.kind {
+                message::METHOD_RETURN | message::ERROR if registering.is_some() && msg.reply_serial == registering => {
+                    self.registered(client, &msg);
+                    Ok(())
+                }
                 message::METHOD_RETURN | message::ERROR => self.relay_reply(client, msg, fds),
                 message::SIGNAL if msg.sender.as_deref() == Some(crate::dbus::conn::BUS_NAME) => {
                     if msg.is(crate::dbus::conn::BUS_NAME, "NameOwnerChanged")
@@ -615,6 +757,17 @@ impl Gateway {
     }
 }
 
+/// A host portal registration of `app_id`.
+fn register(app_id: &str) -> Message {
+    Message::method_call(
+        portal::PORTAL_NAME,
+        portal::PORTAL_PATH,
+        portal::REGISTRY_IFACE,
+        "Register",
+        &[Value::Str(app_id.into()), Value::Dict("s".into(), "v".into(), vec![])],
+    )
+}
+
 /// Applies a `NameOwnerChanged(name, old, new)` to the gateway names'
 /// owners; other names are ignored.
 fn owner_changed(owners: &mut HashMap<String, String>, args: &[Value]) {
@@ -699,14 +852,35 @@ pub fn host_bus_address() -> io::Result<String> {
     Ok(format!("unix:path={rt}/bus"))
 }
 
+/// The index, among the reply's descriptors, of the `ProcessFD` in a
+/// `GetConnectionCredentials` reply.
+fn process_fd(args: &[Value]) -> Option<usize> {
+    match args.first()?.dict_get("ProcessFD")? {
+        Value::Fd(i) => Some(*i as usize),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn finds_the_process_fd_in_credentials() {
+        let creds = |entries: Vec<(Value, Value)>| vec![Value::Dict("s".into(), "v".into(), entries)];
+        let entry = |k: &str, v: Value| (Value::Str(k.into()), Value::Variant(Box::new(v)));
+        let reply = creds(vec![
+            entry("ProcessID", Value::U32(3)),
+            entry("ProcessFD", Value::Fd(1)),
+        ]);
+        assert_eq!(process_fd(&reply), Some(1));
+        assert_eq!(process_fd(&creds(vec![entry("ProcessID", Value::U32(3))])), None);
+    }
+
     struct FakeHost;
 
     impl Host for FakeHost {
-        fn app_id_for_pid(&self, _: u32) -> Option<String> {
+        fn identity(&self, _: OwnedFd) -> Option<String> {
             None
         }
         fn policy(&self) -> Policy {

@@ -1,9 +1,0 @@
-# A browser. The built-in profile adds the camera, security keys, a shared
-# ~/Downloads/, and keeps web links in the browser; the host network lets
-# it cast and reach services on localhost.
-extends = ["browser"]
-network = "host"
-
-[command.firefox]
-exec = ["firefox"]
-desktop = {}

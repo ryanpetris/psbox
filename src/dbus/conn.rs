@@ -37,6 +37,8 @@ pub struct Conn {
     read: Mutex<ReadState>,
     serial: AtomicU32,
     unique: String,
+    /// When calls on the connection stop waiting for their reply.
+    deadline: Option<std::time::Instant>,
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -89,7 +91,7 @@ pub fn unescape(v: &str) -> Vec<u8> {
 }
 
 /// Opens a stream to the first usable `unix:` entry of a D-Bus address.
-fn open_address(address: &str) -> io::Result<OwnedFd> {
+fn open_address(address: &str, timeout: Option<std::time::Duration>) -> io::Result<OwnedFd> {
     let mut last = invalid(format!("no usable unix address in {address:?}"));
     for entry in address.split(';') {
         let Some(params) = entry.strip_prefix("unix:") else {
@@ -97,8 +99,8 @@ fn open_address(address: &str) -> io::Result<OwnedFd> {
         };
         for kv in params.split(',') {
             let r = match kv.split_once('=') {
-                Some(("path", v)) => stream_connect(&unescape(v), false),
-                Some(("abstract", v)) => stream_connect(&unescape(v), true),
+                Some(("path", v)) => stream_connect(&unescape(v), false, timeout),
+                Some(("abstract", v)) => stream_connect(&unescape(v), true, timeout),
                 _ => continue,
             };
             match r {
@@ -113,17 +115,25 @@ fn open_address(address: &str) -> io::Result<OwnedFd> {
 impl Conn {
     /// Connects to a bus address, authenticates, and says `Hello`.
     pub fn connect(address: &str) -> io::Result<Self> {
-        Self::over(open_address(address)?)
+        Self::over(open_address(address, None)?, None)
+    }
+
+    /// As [`Conn::connect`], failing once `timeout` has passed: connecting,
+    /// authenticating, and every call on the connection.
+    pub fn connect_timeout(address: &str, timeout: std::time::Duration) -> io::Result<Self> {
+        let deadline = std::time::Instant::now() + timeout;
+        Self::over(open_address(address, Some(timeout))?, Some(deadline))
     }
 
     /// Connects to a bus socket path.
     pub fn connect_path(path: &Path) -> io::Result<Self> {
-        Self::over(stream_connect(path.as_os_str().as_bytes(), false)?)
+        Self::over(stream_connect(path.as_os_str().as_bytes(), false, None)?, None)
     }
 
     /// Authenticates over a socket already connected to a bus, and says
-    /// `Hello`.
-    pub fn over(sock: OwnedFd) -> io::Result<Self> {
+    /// `Hello`. With a `deadline`, calls stop waiting for replies once it
+    /// passes.
+    pub fn over(sock: OwnedFd, deadline: Option<std::time::Instant>) -> io::Result<Self> {
         auth(&sock)?;
         let mut conn = Self {
             sock,
@@ -131,6 +141,7 @@ impl Conn {
             read: Mutex::new(ReadState::default()),
             serial: AtomicU32::new(1),
             unique: String::new(),
+            deadline,
         };
         let reply = conn.call(&Message::method_call(BUS_NAME, BUS_PATH, BUS_NAME, "Hello", &[]))?;
         conn.unique = reply
@@ -222,11 +233,19 @@ impl Conn {
     /// collect what other peers send it. Only for setup and for queries on
     /// a connection that no reader owns.
     pub fn call(&self, msg: &Message) -> io::Result<Message> {
+        self.call_fds(msg).map(|(reply, _)| reply)
+    }
+
+    /// As [`Conn::call`], with the descriptors the reply carries.
+    pub fn call_fds(&self, msg: &Message) -> io::Result<(Message, Vec<OwnedFd>)> {
         let serial = self.send(msg, &[])?;
         let mut st = self.read.lock().unwrap();
         loop {
-            let reply = match self.read_one(&mut st) {
-                Ok((reply, _)) if reply.reply_serial == Some(serial) => reply,
+            if self.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let (reply, fds) = match self.read_one(&mut st) {
+                Ok((reply, fds)) if reply.reply_serial == Some(serial) => (reply, fds),
                 Ok(other) => {
                     if other.0.sender.as_deref() == Some(BUS_NAME) {
                         st.backlog.push_back(other);
@@ -249,7 +268,7 @@ impl Conn {
                     text.unwrap_or_default()
                 )));
             }
-            return Ok(reply);
+            return Ok((reply, fds));
         }
     }
 
@@ -437,6 +456,7 @@ mod tests {
             read: Mutex::new(ReadState::default()),
             serial: AtomicU32::new(1),
             unique: String::new(),
+            deadline: None,
         };
 
         // A big-endian call whose body claims to be a string but is not,
@@ -482,6 +502,7 @@ mod tests {
             read: Mutex::new(ReadState::default()),
             serial: AtomicU32::new(1),
             unique: String::new(),
+            deadline: None,
         };
 
         let mut changed = Message::method_call("x", BUS_PATH, BUS_NAME, "NameOwnerChanged", &[]);

@@ -7,12 +7,24 @@ use crate::plan::{HostEnv, Identity, Plan};
 use crate::protocol::{Request, Response};
 use crate::spec::Spec;
 
-/// A sandbox config, and when it parses, the plan built from it.
+/// An evaluated sandbox config (the JSON Jsonnet evaluation yields), and
+/// when it is valid, the plans built from it.
 pub fn config(data: &[u8]) {
-    let Ok(text) = std::str::from_utf8(data) else {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) else {
         return;
     };
-    let Ok(spec) = Spec::parse(text) else {
+    let tasks: std::collections::BTreeMap<String, serde_json::Value> = value
+        .get("task")
+        .and_then(|t| t.as_object())
+        .map(|t| t.iter().map(|(k, _)| (k.clone(), value.clone())).collect())
+        .unwrap_or_default();
+    let host_entry = |id: &str| id == "app";
+    let ctx = crate::spec::Context {
+        name: Some("app"),
+        storage: Some("/home/u/Sandbox/app".into()),
+        host_entry: &host_entry,
+    };
+    let Ok(spec) = Spec::from_json(&value, &tasks, &ctx) else {
         return;
     };
     let host = HostEnv {
@@ -62,7 +74,8 @@ pub fn dbus_message(data: &[u8]) {
         realtime: true,
         ..crate::portal::Policy::default()
     };
-    let _ = crate::portal::check(&policy, &msg);
+    let _ = crate::portal::check(&policy, true, &msg);
+    let _ = crate::portal::check(&policy, false, &msg);
     let encoded = msg.encode(1);
     let _ = Message::parse(&encoded);
 }

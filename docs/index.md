@@ -10,10 +10,10 @@ setup. Then:
 | Page | Concern |
 | --- | --- |
 | [Install](install.md) | Requirements, release archives, building from source, units, completions |
-| [Configuration](configuration.md) | Sandbox configs, paths and tokens, mounts, devices, network, profiles, tasks, desktop entries |
+| [Configuration](configuration.md) | Sandbox configs in Jsonnet, the psbox library, mounts, devices, network, profiles, apps and desktop entries, portal identity, tasks |
 | [CLI](cli.md) | Commands, output, the startup check, unnamed sandboxes |
 | [Isolation](isolation.md) | What a sandbox can and cannot reach |
-| [Architecture](architecture.md) | Supervisors, units, the sandbox root, live changes, devices, D-Bus, Xwayland, network |
+| [Architecture](architecture.md) | Supervisors, units, cgroups, plans, the sandbox root, live changes, devices, D-Bus, portal identity, Xwayland, network |
 | [Development](development.md) | Checks, fuzzing, headless GUI tests, verification status |
 | [Release](release.md) | Static builds, archives, workflows, packaging |
 | [Dependencies](dependencies.md) | Crates and their licenses |

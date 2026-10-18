@@ -15,8 +15,10 @@ mod desktop;
 mod devices;
 mod forker;
 mod gateway;
+mod identity;
 mod inject;
 mod install;
+mod jsonnet;
 mod plan;
 mod portal;
 mod protocol;
@@ -74,13 +76,16 @@ const STYLES: Styles = Styles::styled()
 const EXAMPLES: &str = "\x1b[1;32mExamples:\x1b[0m
   psbox run firefox -- https://example.com
   psbox run code -i work
-  psbox sandbox --home-tmpfs --bind . -- ./build.sh
+  psbox sandbox --bind . -- ./build.sh
   psbox mount firefox ~/Music --ro";
 
 /// The commands of `psbox --help`, in groups.
 const GROUPS: &[(&str, &[&str])] = &[
     ("Run", &["run", "sandbox", "task"]),
-    ("Running sandboxes", &["list", "status", "mount", "umount", "stop"]),
+    (
+        "Running sandboxes",
+        &["list", "status", "config", "mount", "umount", "stop"],
+    ),
     ("Setup", &["install", "devices", "check", "completions"]),
 ];
 
@@ -105,33 +110,34 @@ impl Target {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a command in a sandbox, starting it if needed.
+    /// Run an app in a sandbox, starting it if needed.
     Run {
         #[command(flatten)]
         target: Target,
-        /// Command defined in the sandbox config.
+        /// The app to run (default: the app named after the sandbox).
         #[arg(short, long)]
-        command: Option<String>,
-        /// Treat the arguments as the whole command line (the command only
-        /// supplies environment and app id).
+        app: Option<String>,
+        /// Treat the arguments as the whole command line (the app only
+        /// supplies its environment and portal identity).
         #[arg(long)]
         exec: bool,
-        /// Also create missing directories marked with a trailing `/`
+        /// Also create the missing sources of mounts with `create: true`
         /// outside the sandbox root.
         #[arg(long)]
         create_dirs: bool,
-        /// Arguments appended to the command.
+        /// Arguments appended to the app's command.
         #[arg(last = true)]
         args: Vec<String>,
     },
     /// Run a command in a new unnamed sandbox that ends when it exits.
     #[command(after_help = "\x1b[1;32mExamples:\x1b[0m
-  psbox sandbox --home-tmpfs --network none -- ./untrusted-tool
-  psbox sandbox --home ~/work/client --bind ~/Downloads -- bash")]
+  psbox sandbox -c network=null -c display=null -- ./untrusted-tool
+  psbox sandbox -c home.mode=path -c home.path=~/work/client --bind ~/Downloads -- bash
+  psbox sandbox --profile browser --app-id org.mozilla.firefox -- firefox")]
     Sandbox {
         #[command(flatten)]
         options: Box<unnamed::Options>,
-        /// Also create missing directories marked with a trailing `/`
+        /// Also create the missing sources of mounts with `create: true`
         /// outside the sandbox root.
         #[arg(long)]
         create_dirs: bool,
@@ -144,7 +150,7 @@ enum Cmd {
         #[arg(add = ArgValueCandidates::new(sandbox_names))]
         sandbox: String,
         task: String,
-        /// Also create missing directories marked with a trailing `/`
+        /// Also create the missing sources of mounts with `create: true`
         /// outside the sandbox root.
         #[arg(long)]
         create_dirs: bool,
@@ -157,6 +163,14 @@ enum Cmd {
         /// Print JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// A sandbox's config as psbox sees it, every default filled in.
+    Config {
+        #[arg(add = ArgValueCandidates::new(sandbox_names))]
+        sandbox: String,
+        /// One of its tasks' config instead.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// Processes, mounts, and devices of a running sandbox.
     Status {
@@ -235,8 +249,8 @@ enum Cmd {
     #[command(hide = true)]
     OpenUri { uri: String },
     /// Pass xwayland-satellite's Wayland connection (descriptor 3) through
-    /// to the compositor, drawing title bars for its windows (`xwayland =
-    /// "builtin"`).
+    /// to the compositor, drawing title bars for its windows (the builtin
+    /// Xwayland mode).
     #[command(hide = true)]
     Decorations {
         /// The supervisor key, for log lines.
@@ -351,11 +365,11 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Run {
             target,
-            command,
+            app,
             exec,
             create_dirs,
             args,
-        } => client::run(&target.identity(), command, args, exec, create_dirs),
+        } => client::run(&target.identity(), app, args, exec, create_dirs),
         Cmd::Task {
             sandbox,
             task,
@@ -372,6 +386,7 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
             client::sandbox(&settings, command, create_dirs)
         }
         Cmd::List { json } => cli::list(json),
+        Cmd::Config { sandbox, task } => cli::config(&sandbox, task.as_deref()),
         Cmd::Status { target, json } => cli::status(&target.identity(), json),
         Cmd::Mount { target, host, at, ro } => cli::mount(&target.identity(), &host, at, ro),
         Cmd::Umount { target, at } => cli::umount(&target.identity(), at),

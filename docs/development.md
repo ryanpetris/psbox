@@ -32,7 +32,7 @@ the parsers that read input psbox does not control:
 
 | Target | Input |
 | --- | --- |
-| `config` | A sandbox config, and the plan built from it |
+| `config` | An evaluated sandbox config (its JSON), validated, and the plan built from it |
 | `protocol` | A request or response on a supervisor socket |
 | `dbus_message` | A D-Bus message from a sandbox client: parsed, its arguments decoded, checked against the portal policy, and encoded again |
 | `desktop_entry` | A host desktop entry, rewritten as `install` does |
@@ -77,12 +77,12 @@ Verified on Linux 7.2 with GNOME, beyond the unit tests:
 | --- | --- |
 | Root built from a plan: read-only `/usr`, `/etc`, `/sys`; private `/tmp`, `/var/tmp`, runtime dir; private home | Works |
 | `/dev`: read-only tmpfs with base nodes, private `devpts` and `/dev/shm` | Works; `touch /dev/x` gives `EROFS` |
-| Mount modes `ro`, `rw`, `overlay` (writes discarded), `empty` (mask) | Work |
+| Mount modes `read-only`, `read-write`, `overlay` (writes discarded), `empty` (mask) | Work |
 | Agentless spawn: the supervisor is the real parent; exit codes and signals pass through | Works |
 | Spawned processes: no capabilities, `NoNewPrivs`, seccomp filter | Works |
 | `psbox sandbox`: tmpfs or given home, `--bind SRC:DST`, `--ro-bind`, `--env`, `--no-display`, exit status, no units or settings left behind | Works |
 | Startup check: every missing path, setting, and config error at once; `--create-dirs` and directories created in the sandbox root | Works |
-| `dbus = "host"`: host session and system buses reachable | Works |
+| `dbus.mode: 'host'`: host session and system buses reachable | Works |
 | Nested `bwrap` (glycin image loaders through gdk-pixbuf); psbox mounts stay locked in nested namespaces | Works |
 | Landlock abstract-socket scope: host abstract sockets unreachable | `EPERM` |
 | Processes started separately in one sandbox reach each other's abstract sockets and signal each other | Works |
@@ -101,28 +101,28 @@ Verified on Linux 7.2 with GNOME, beyond the unit tests:
 | Shares through symlinks (read-write, read-only, overlay, live mount); a symlink to a missing path reported | Works |
 | Network modes `isolated` (DNS and HTTPS; host loopback unreachable; gigabit throughput through pasta), `none`, `host` | Work |
 | Network default with and without pasta: `isolated`; `host (no pasta)`, the `check` warning, and the startup report | Works |
-| Live config: share added and removed under a running process; env change on the next process; `home` change restarts when idle and warns while busy; a live mount beneath a changed share attached again | Works |
+| Live config: mount added and removed under a running process; env change on the next process; `home` change restarts when idle and warns while busy; a live mount beneath a changed mount attached again | Works |
 | Forwarded socket appearing late, and replaced by a restarted server | Re-attached |
 | Tasks and named instances | Work; tasks stop when done and return the exit code |
 | Desktop entries copied and inline, launched with `gio launch` | Grouped under their entries in GNOME |
 | Xwayland on demand: `glxgears`, `xdpyinfo`, GTK apps with `GDK_BACKEND=x11`, with the host network while the host's Xwayland holds `:0` and `:1` | Work on display `:28787`; no abstract sockets |
-| `xwayland = "builtin"` on headless GNOME Shell (pointer input through Mutter's RemoteDesktop API): `xev` gets an Adwaita title bar; its maximize, restore, minimize, and close buttons, a drag on the title bar, and a drag on the right edge each work, with the X11 window resized to match | Work |
+| `xwayland.mode: 'builtin'` on headless GNOME Shell (pointer input through Mutter's RemoteDesktop API): `xev` gets an Adwaita title bar; its maximize, restore, minimize, and close buttons, a drag on the title bar, and a drag on the right edge each work, with the X11 window resized to match | Work |
 | `builtin` with VLC on Qt's X11 backend: its menu bar's menus open directly below their items; a GTK app with `GDK_BACKEND=x11` keeps its own header bar, with no frame added | Work |
-| `xwayland-scale` on headless GNOME Shell at 150% (2880x1920): the X screen is 2880x1920, 3840x2560, and 1920x1280 for `native`, `round-up`, and `compositor`; REAPER draws at the right size with `round-up` and `compositor` and small with `native`; VLC (Qt 5) is the right size with `round-up` and `compositor`; maximize fills the screen and menus open under their items with `round-up` and `compositor`; switching the display from 150% to 200% under `round-up` with an X11 app running takes the X screen from 3840x2560 to 2880x1920; title bars sharp at 150% | Work |
+| `xwayland.scale` on headless GNOME Shell at 150% (2880x1920): the X screen is 2880x1920, 3840x2560, and 1920x1280 for `native`, `round-up`, and `compositor`; REAPER draws at the right size with `round-up` and `compositor` and small with `native`; VLC (Qt 5) is the right size with `round-up` and `compositor`; maximize fills the screen and menus open under their items with `round-up` and `compositor`; switching the display from 150% to 200% under `round-up` with an X11 app running takes the X screen from 3840x2560 to 2880x1920; title bars sharp at 150% | Work |
 | Static builds for amd64 and arm64 (arm64 run under qemu) | Work |
 | Overlay refresh after an update task: a running instance sees the new version on a fresh overlay, while a process whose working directory is in the old overlay keeps the old files | Works |
 | `profiles/` created, removed, and created again while a sandbox runs | Reloads each time |
-| Gateway against two private `dbus-daemon`s: a `dbus-talk` name called by name and by its unique name, an unlisted name unreachable, a big-endian call served and the gateway still serving afterwards | Works |
-| `dbus-talk` on the session bus: a host name called by name and by its unique name, alongside the portal; an unlisted name never reaches the host | Works |
+| Gateway against two private `dbus-daemon`s: a `dbus.talk` name called by name and by its unique name, an unlisted name unreachable, a big-endian call served and the gateway still serving afterwards | Works |
+| `dbus.talk` on the session bus: a host name called by name and by its unique name, alongside the portal; an unlisted name never reaches the host | Works |
 | Realtime with `audio`: `MakeThreadRealtimeWithPID` and `MakeThreadHighPriorityWithPID` on sandbox processes; an id not in the sandbox refused by the host portal | Works (`SCHED_RR` and nice -10 on the host) |
 | The connector from inside the sandbox: ptrace, `pidfd_getfd`, and its `fd`, `maps`, `root`, and `environ` entries | Refused |
 | The connector's `mountinfo` and `net/tcp` from inside the sandbox | The sandbox's own |
 | Signals that dump core (`SIGQUIT`, `SIGSEGV`) sent to the connector from inside the sandbox | Ignored; core limit at most one byte |
 | The connector killed with `SIGKILL`, or stopped with `SIGSTOP`, from inside the sandbox | Reaped, and replaced on the next call (after five seconds when stopped) |
-| Links from a sandbox with the default `[open-urls]`: `gio mime` and `xdg-mime` (GNOME and no desktop) report the sandbox's handler, and `xdg-open https://...` opens the link in the default browser's sandbox through `psbox run`, with the caller's activation token in the portal call; a `file://` link refused | Works |
-| Links with `https` kept in the sandbox (`--open-urls https=sandbox`): the host's browser entry stays the `https` default; `mailto` still goes to the sandbox's handler | Works |
+| Links from a sandbox with the default `links`: `gio mime` and `xdg-mime` (GNOME and no desktop) report the sandbox's handler, and `xdg-open https://...` opens the link in the default browser's sandbox through `psbox run`, with the caller's activation token in the portal call; a `file://` link refused | Works |
+| Links with `https` kept in the sandbox (`-c links.https=sandbox`): the host's browser entry stays the `https` default; `mailto` still goes to the sandbox's handler | Works |
 | An OpenURI request that shows the app chooser (`ask`), from a `gdbus call` that exits right away | The request stays open on the host until answered or the sandbox stops |
-| `psbox open-uri` with `dbus = "portal"` and `dbus = "host"`: waits for the portal's `Response`, exit status 0 when the link opened and 1 otherwise | Works |
+| `psbox open-uri` with `dbus.mode` `portal` and `host`: waits for the portal's `Response`, exit status 0 when the link opened and 1 otherwise | Works |
 | Portal methods from inside a sandbox: `Settings.ReadOne`, `OpenURI.SchemeSupported`, `NetworkMonitor.GetConnectivity`, a property read; an unlisted `Settings.Write` | Forwarded; the unlisted method refused and logged |
 | `psbox check` on Linux 7.2 | Kernel and user namespaces reported from the real kernel and a real namespace |
 

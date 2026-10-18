@@ -32,24 +32,24 @@ psbox check
 
 ### 2. Configure a sandbox
 
-Create `~/.config/psbox/sandboxes/firefox.toml`:
+Create `~/.config/psbox/sandboxes/firefox.jsonnet`:
 
-```toml
-extends = ["browser"]
-network = "host"
+```jsonnet
+local psbox = import 'psbox';
 
-[command.firefox]
-exec = ["firefox"]
-desktop = {}
+psbox.profiles.browser + {
+  network: { mode: 'host' },
+}
 ```
 
-The private home is `~/Sandbox/firefox`. The built-in `browser` profile
-adds the camera, security keys, and a shared `~/Downloads`, and lets the
-browser handle its own web links. Links other sandboxes open go to the
-host's default browser, so they reach this sandbox once it is installed as
-that.
+The home is `~/Sandbox/firefox`. The built-in `browser` profile adds the
+camera, security keys, and a shared `~/Downloads`, and lets the browser
+handle its own web links. The sandbox's default app, `firefox`, runs
+`firefox` and takes over the host's `firefox.desktop`. Links other
+sandboxes open go to the host's default browser, so they reach this
+sandbox once it is installed as that.
 
-### 3. Install launchers and run
+### 3. Install desktop entries and run
 
 ```sh
 psbox install

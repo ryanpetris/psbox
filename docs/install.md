@@ -9,7 +9,7 @@
 | Unprivileged user namespaces | Each supervisor creates its own user namespace (an AppArmor restriction on them must allow psbox) |
 | cgroup v2 | The `supervisor/`, `infra/`, and `workload/` cgroups inside each unit |
 | A systemd user session | Socket-activated supervisor units |
-| `dbus-daemon` | The private session bus (`dbus = "portal"`, the default) |
+| `dbus-daemon` | The private session bus (`dbus.mode: 'portal'`, the default) |
 | `pasta` (package `passt`), optional | Isolated networking; without it, sandboxes that do not set `network` use the host network |
 | `xwayland-satellite` and `Xwayland`, optional | X11 apps (`xwayland`) |
 
@@ -67,7 +67,7 @@ overrides packaged units. See [development.md](development.md).
 
 ## First sandbox
 
-Sandbox configs live in `$XDG_CONFIG_HOME/psbox/sandboxes/<name>.toml`
+Sandbox configs live in `$XDG_CONFIG_HOME/psbox/sandboxes/<name>.jsonnet`
 (see [configuration.md](configuration.md)). [examples/](../examples/) has
 configs for several applications. Then:
 

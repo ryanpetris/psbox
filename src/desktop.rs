@@ -1,5 +1,5 @@
-//! Desktop entry files: parsing, `Exec` quoting, and the rewrite that makes
-//! an entry launch through psbox.
+//! Desktop entry files: parsing, value escaping, `Exec` quoting, and the
+//! rewrite that makes an entry launch through psbox.
 
 use std::path::Path;
 
@@ -36,6 +36,17 @@ pub struct Entry {
 pub const MAIN: &str = "Desktop Entry";
 
 impl Entry {
+    /// An empty entry: just the `[Desktop Entry]` section.
+    pub fn new() -> Self {
+        Entry {
+            preamble: Vec::new(),
+            sections: vec![Section {
+                name: MAIN.into(),
+                lines: Vec::new(),
+            }],
+        }
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         let mut entry = Entry {
             preamble: Vec::new(),
@@ -142,6 +153,42 @@ impl Entry {
         }
     }
 
+    /// Removes `key` and every translation of it (`key[de]`).
+    pub fn remove_all(&mut self, section: &str, key: &str) {
+        if let Some(s) = self.sections.iter_mut().find(|s| s.name == section) {
+            s.lines.retain(|l| match l {
+                Line::Key(k, _) => k != key && !(k.starts_with(key) && k[key.len()..].starts_with('[')),
+                Line::Other(_) => true,
+            });
+        }
+    }
+
+    pub fn has_section(&self, section: &str) -> bool {
+        self.sections.iter().any(|s| s.name == section)
+    }
+
+    /// Adds an empty `section` at the end, unless there is one.
+    pub fn add_section(&mut self, section: &str) {
+        if !self.has_section(section) {
+            self.sections.push(Section {
+                name: section.into(),
+                lines: Vec::new(),
+            });
+        }
+    }
+
+    pub fn remove_section(&mut self, section: &str) {
+        self.sections.retain(|s| s.name != section);
+    }
+
+    /// The names of the `[Desktop Action <name>]` sections, in order.
+    pub fn actions(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .filter_map(|s| s.name.strip_prefix(ACTION_PREFIX).map(String::from))
+            .collect()
+    }
+
     /// Names of the main section and every `[Desktop Action ...]` section.
     pub fn exec_sections(&self) -> Vec<String> {
         self.sections
@@ -150,6 +197,39 @@ impl Entry {
             .map(|s| s.name.clone())
             .collect()
     }
+}
+
+/// The section name of an action is this followed by its name.
+pub const ACTION_PREFIX: &str = "Desktop Action ";
+
+/// A string value escaped as the Desktop Entry specification asks: `\\`,
+/// `\n`, `\t`, `\r`, and `\s` for a leading space. Other control
+/// characters cannot be written.
+pub fn escape(value: &str) -> Result<String> {
+    let mut out = String::new();
+    for (i, c) in value.chars().enumerate() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            ' ' if i == 0 => out.push_str("\\s"),
+            c if c.is_control() => bail!("{value:?} contains a control character"),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// A list value: each item escaped, `;` in an item as `\;`, and every item
+/// followed by `;`.
+pub fn escape_list(items: &[String]) -> Result<String> {
+    let mut out = String::new();
+    for item in items {
+        out.push_str(&escape(item)?.replace(';', "\\;"));
+        out.push(';');
+    }
+    Ok(out)
 }
 
 /// Splits an `Exec` value into arguments, following the Desktop Entry
@@ -247,29 +327,44 @@ pub fn launch_for(exec: &str, remove_args: &[String]) -> Result<Launch> {
     }
 }
 
-/// How an entry starts its sandbox command.
+/// How an entry starts its sandbox app.
 pub struct Target<'a> {
     pub psbox: &'a Path,
     pub sandbox: &'a str,
-    pub command: &'a str,
+    pub app: &'a str,
 }
 
-/// Rewrites `entry` so every `Exec` launches through psbox, and applies the
-/// rules every installed entry needs: no `TryExec` (the program may only
-/// exist inside the sandbox) and no D-Bus activation (which would start the
-/// app on the host, outside the sandbox).
+impl Target<'_> {
+    /// `psbox run <sandbox> --app <app>`.
+    pub fn command(&self) -> Vec<String> {
+        vec![
+            self.psbox.to_string_lossy().into_owned(),
+            "run".into(),
+            self.sandbox.into(),
+            "--app".into(),
+            self.app.into(),
+        ]
+    }
+
+    /// The `Exec` value that runs the app with `args`.
+    pub fn exec(&self, args: &[String]) -> String {
+        let mut cmd = self.command();
+        if !args.is_empty() {
+            cmd.push("--".into());
+            cmd.extend(args.iter().cloned());
+        }
+        join_exec(&cmd)
+    }
+}
+
+/// Rewrites every `Exec` of `entry` (as copied from the host) to launch
+/// through psbox.
 pub fn rewrite(entry: &mut Entry, target: &Target<'_>, remove_args: &[String]) -> Result<()> {
     for section in entry.exec_sections() {
         let Some(exec) = entry.get(&section, "Exec").map(str::to_string) else {
             continue;
         };
-        let mut cmd = vec![
-            target.psbox.to_string_lossy().into_owned(),
-            "run".into(),
-            target.sandbox.into(),
-            "--command".into(),
-            target.command.into(),
-        ];
+        let mut cmd = target.command();
         match launch_for(&exec, remove_args)? {
             Launch::Command(args) => {
                 cmd.push("--".into());
@@ -282,10 +377,34 @@ pub fn rewrite(entry: &mut Entry, target: &Target<'_>, remove_args: &[String]) -
             }
         }
         entry.set(&section, "Exec", &join_exec(&cmd));
+    }
+    Ok(())
+}
+
+/// Applies the rules every installed entry needs: an `Exec` that runs the
+/// app (with `%U` when it opens files of a `MimeType`), no `TryExec` (the
+/// program may exist only inside the sandbox), no D-Bus activation (which
+/// would start the app on the host), `Type=Application`, not `Hidden`, and
+/// `Actions` naming the action sections there are.
+pub fn finish(entry: &mut Entry, target: &Target<'_>) {
+    if entry.get(MAIN, "Exec").is_none() {
+        let args: Vec<String> = match entry.get(MAIN, "MimeType") {
+            Some(_) => vec!["%U".into()],
+            None => Vec::new(),
+        };
+        entry.set(MAIN, "Exec", &target.exec(&args));
+    }
+    for section in entry.exec_sections() {
         entry.remove(&section, "TryExec");
     }
+    entry.set(MAIN, "Type", "Application");
+    entry.remove(MAIN, "Hidden");
     entry.set(MAIN, "DBusActivatable", "false");
-    Ok(())
+    let actions = entry.actions();
+    match actions.is_empty() {
+        true => entry.remove(MAIN, "Actions"),
+        false => entry.set(MAIN, "Actions", &format!("{};", actions.join(";"))),
+    }
 }
 
 /// A minimal entry that hides a host autostart entry with the same id.
@@ -313,7 +432,7 @@ mod tests {
         Target {
             psbox: Path::new("/usr/bin/psbox"),
             sandbox: "firefox",
-            command: "firefox",
+            app: "firefox",
         }
     }
 
@@ -330,17 +449,73 @@ mod tests {
     #[test]
     fn rewrites_exec_lines_and_rules() {
         let mut e = Entry::parse(FIREFOX).unwrap();
+        e.set(MAIN, "Hidden", "true");
         rewrite(&mut e, &target(), &[]).unwrap();
+        finish(&mut e, &target());
         assert_eq!(
             e.get(MAIN, "Exec"),
-            Some("/usr/bin/psbox run firefox --command firefox -- %u")
+            Some("/usr/bin/psbox run firefox --app firefox -- %u")
         );
         assert_eq!(
             e.get("Desktop Action new-window", "Exec"),
-            Some("/usr/bin/psbox run firefox --command firefox -- --new-window %u")
+            Some("/usr/bin/psbox run firefox --app firefox -- --new-window %u")
         );
         assert_eq!(e.get(MAIN, "TryExec"), None);
         assert_eq!(e.get(MAIN, "DBusActivatable"), Some("false"));
+        assert_eq!(e.get(MAIN, "Type"), Some("Application"));
+        assert_eq!(e.get(MAIN, "Hidden"), None);
+        assert_eq!(e.get(MAIN, "Actions"), Some("new-window;"));
+        let mut exact = Entry::parse("[Desktop Entry]\nExec=/opt/app/run %F\n").unwrap();
+        rewrite(&mut exact, &target(), &[]).unwrap();
+        assert_eq!(
+            exact.get(MAIN, "Exec"),
+            Some("/usr/bin/psbox run firefox --app firefox --exec -- /opt/app/run %F")
+        );
+    }
+
+    #[test]
+    fn finish_writes_exec_and_actions() {
+        let mut e = Entry::new();
+        e.set(MAIN, "MimeType", "text/plain;");
+        e.set(MAIN, "Actions", "gone;");
+        finish(&mut e, &target());
+        assert_eq!(
+            e.get(MAIN, "Exec"),
+            Some("/usr/bin/psbox run firefox --app firefox -- %U")
+        );
+        assert_eq!(e.get(MAIN, "Actions"), None, "no action sections, no Actions");
+        let mut plain = Entry::new();
+        finish(&mut plain, &target());
+        assert_eq!(
+            plain.get(MAIN, "Exec"),
+            Some("/usr/bin/psbox run firefox --app firefox")
+        );
+        assert_eq!(
+            target().exec(&["a b".into()]),
+            "/usr/bin/psbox run firefox --app firefox -- \"a b\""
+        );
+    }
+
+    #[test]
+    fn escapes_values() {
+        assert_eq!(escape("a\\b\nc\td").unwrap(), "a\\\\b\\nc\\td");
+        assert_eq!(escape(" lead").unwrap(), "\\slead");
+        assert!(escape("bell\u{7}").is_err());
+        assert_eq!(escape_list(&["Game".into(), "a;b".into()]).unwrap(), "Game;a\\;b;");
+        assert_eq!(escape_list(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn sections_and_translations() {
+        let mut e = Entry::parse("[Desktop Entry]\nName=A\nName[de]=B\nNameX=C\n[Desktop Action x]\nName=X\n").unwrap();
+        e.remove_all(MAIN, "Name");
+        assert_eq!(e.get(MAIN, "Name"), None);
+        assert_eq!(e.get(MAIN, "Name[de]"), None);
+        assert_eq!(e.get(MAIN, "NameX"), Some("C"));
+        assert_eq!(e.actions(), ["x"]);
+        e.add_section("Desktop Action y");
+        e.remove_section("Desktop Action x");
+        assert_eq!(e.actions(), ["y"]);
     }
 
     #[test]

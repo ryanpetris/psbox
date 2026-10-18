@@ -1,4 +1,4 @@
-//! Title bars for X11 windows, for `xwayland = "builtin"`.
+//! Title bars for X11 windows, for `xwayland.mode: 'builtin'`.
 //!
 //! `psbox decorations` runs inside the sandbox between `xwayland-satellite`
 //! (the bridge, in this module's names) and the host compositor.
@@ -76,7 +76,7 @@ fn serve(key: &str, scale: XwaylandScale) -> Result<()> {
         _ if has_xdg_output => scale,
         _ => {
             eprintln!(
-                "psbox[{key}]: decorations: the compositor has no zxdg_output_manager_v1, which xwayland-scale = \"{scale}\" needs; X11 apps scale as with \"native\""
+                "psbox[{key}]: decorations: the compositor has no zxdg_output_manager_v1, which xwayland.scale \"{scale}\" needs; X11 apps scale as with \"native\""
             );
             XwaylandScale::Native
         }
