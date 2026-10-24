@@ -18,6 +18,7 @@ fn denied_syscalls() -> Vec<libc::c_long> {
         libc::SYS_swapoff,
         libc::SYS_acct,
         libc::SYS_quotactl,
+        libc::SYS_quotactl_fd,
         // Profiling and tracing interfaces with a large attack surface.
         libc::SYS_perf_event_open,
         libc::SYS_bpf,
@@ -41,7 +42,7 @@ const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 /// The i386 numbers of the denied syscalls, by x86_64 number. i386 has no
 /// `kexec_file_load`.
 #[cfg(target_arch = "x86_64")]
-const I386_NUMBERS: [(libc::c_long, u32); 14] = [
+const I386_NUMBERS: [(libc::c_long, u32); 15] = [
     (libc::SYS_keyctl, 288),
     (libc::SYS_add_key, 286),
     (libc::SYS_request_key, 287),
@@ -54,6 +55,7 @@ const I386_NUMBERS: [(libc::c_long, u32); 14] = [
     (libc::SYS_swapoff, 115),
     (libc::SYS_acct, 51),
     (libc::SYS_quotactl, 131),
+    (libc::SYS_quotactl_fd, 443),
     (libc::SYS_perf_event_open, 336),
     (libc::SYS_bpf, 357),
 ];
