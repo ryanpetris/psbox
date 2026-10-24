@@ -237,6 +237,7 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
     let root_rw = fds.pop().expect("two fds");
 
     let forker = Forker::start(init_pidfd.as_raw_fd()).context("start forker thread")?;
+    let seccomp = seccomp::program(plan.allow_32bit);
     let sup = Arc::new(Supervisor {
         forker,
         plan: RwLock::new(Arc::new(plan)),
@@ -247,7 +248,7 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         init_pidfd,
         root_rw,
         dev_rw,
-        seccomp: seccomp::program(),
+        seccomp,
         state: Mutex::new(State::default()),
         mounting: Mutex::new(()),
         connector: Mutex::new(None),

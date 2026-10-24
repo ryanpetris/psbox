@@ -58,7 +58,7 @@ function(ctx) {
   // The full default of each section, for writing one out again after a
   // profile removed it: `dbus: psbox.defaults.dbus + { mode: 'host' }`.
   defaults:: {
-    sandbox: { 'idle-timeout': 60 },
+    sandbox: { 'idle-timeout': 60, '32-bit': false },
     home:
       if ctx.name == null then { mode: 'temporary' }
       else { mode: 'path', path: lib.storage, cache: 'temporary' },

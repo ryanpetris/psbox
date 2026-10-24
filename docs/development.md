@@ -80,6 +80,7 @@ Verified on Linux 7.2 with GNOME, beyond the unit tests:
 | Mount modes `read-only`, `read-write`, `overlay` (writes discarded), `empty` (mask) | Work |
 | Agentless spawn: the supervisor is the real parent; exit codes and signals pass through | Works |
 | Spawned processes: no capabilities, `NoNewPrivs`, seccomp filter | Works |
+| 32-bit programs (`/usr/lib32/ld-linux.so.2`): killed by `SIGSYS` by default, run with `sandbox.32-bit=true` | Works |
 | `psbox sandbox`: tmpfs or given home, `--bind SRC:DST`, `--ro-bind`, `--env`, `--no-display`, exit status, no units or settings left behind | Works |
 | Startup check: every missing path, setting, and config error at once; `--create-dirs` and directories created in the sandbox root | Works |
 | `dbus.mode: 'host'`: host session and system buses reachable | Works |

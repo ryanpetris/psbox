@@ -281,7 +281,7 @@ pub fn run_init(plan: &Plan, new_root: &Path, chan: Seqpacket) -> ! {
         log("drop capabilities", &e);
         std::process::exit(1);
     }
-    let filter = crate::sys::seccomp::program();
+    let filter = crate::sys::seccomp::program(plan.allow_32bit);
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut _,

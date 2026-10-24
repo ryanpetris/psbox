@@ -84,7 +84,7 @@ Plain objects are equally valid: `psbox.mount.readOnly('/srv/games')` is
 
 | Section | Default | Meaning |
 | --- | --- | --- |
-| `sandbox` | `{ 'idle-timeout': 60 }` | Seconds without workload before the sandbox stops |
+| `sandbox` | `{ 'idle-timeout': 60, '32-bit': false }` | `idle-timeout`: seconds without workload before the sandbox stops. `'32-bit': true` lets 32-bit x86 programs run, at the cost of more kernel exposure (see [seccomp](isolation.md#namespaces-and-processes)) |
 | `home` | `{ mode: 'path', path: psbox.storage, cache: 'temporary' }` | `mode: 'path'` binds `path` read-write as the home; `'temporary'` is an empty tmpfs; `null` is no home. `cache: 'temporary'` hides `~/.cache`, `'persistent'` keeps it (path mode only) |
 | `devices` | `gpu` and `audio` on | [Device classes](#devices), each `true` or `false`, and `usb` |
 | `dbus` | `{ mode: 'portal', talk: [] }` | `portal`: a private session bus with the host gateway; `host`: the host session and system buses, unfiltered; `null`: no session bus. `talk`: [host bus names](#host-bus-names) (portal mode) |
@@ -606,7 +606,7 @@ source leaves the sandbox unchanged; a mount that still fails to apply
 marks the sandbox for a restart.
 
 Changes to `home`, `home.cache`, `dbus`, `dbus.talk`, `links`, `xwayland`,
-`xwayland.scale`, `network`, or overlay mounts need a restart: nothing is
-applied live, the sandbox stops as soon as it is idle, and until then
-`psbox run` warns and `psbox status` shows the pending restart. A change
-that fails the startup check is not applied.
+`xwayland.scale`, `network`, `sandbox.32-bit`, or overlay mounts need a
+restart: nothing is applied live, the sandbox stops as soon as it is idle,
+and until then `psbox run` warns and `psbox status` shows the pending
+restart. A change that fails the startup check is not applied.

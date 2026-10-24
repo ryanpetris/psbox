@@ -404,6 +404,8 @@ pub struct Plan {
     /// unnamed sandbox's `--app-id` (set by the supervisor).
     pub exec_identity: Option<String>,
     pub idle_timeout: Duration,
+    /// i386 system calls pass the seccomp filter (x86_64 only).
+    pub allow_32bit: bool,
     /// `None`: no session bus.
     pub dbus: Option<DbusMode>,
     /// The private session bus, when the sandbox has one.
@@ -748,6 +750,9 @@ pub fn diff(old: &Plan, new: &Plan) -> Change {
     }
     if old.network != new.network {
         c.restart.push("network".into());
+    }
+    if old.allow_32bit != new.allow_32bit {
+        c.restart.push("sandbox.32-bit".into());
     }
     if old.open_urls != new.open_urls && old.dbus == new.dbus {
         c.restart.push("links".into());
@@ -1148,6 +1153,7 @@ impl Plan {
             apps,
             default_app,
             idle_timeout: Duration::from_secs(spec.idle_timeout),
+            allow_32bit: spec.allow_32bit,
             dbus,
             dbus_talk: match &bus {
                 Some(_) => spec.dbus.as_ref().map(|d| d.talk.clone()).unwrap_or_default(),
@@ -1912,6 +1918,9 @@ mod tests {
 
         let c = diff(&base, &with("{ dbus: null, xwayland: {} }"));
         assert_eq!(c.restart, vec!["dbus", "xwayland"]);
+
+        let c = diff(&base, &with("{ sandbox+: { '32-bit': true } }"));
+        assert_eq!(c.restart, vec!["sandbox.32-bit"]);
 
         let c = diff(
             &base,

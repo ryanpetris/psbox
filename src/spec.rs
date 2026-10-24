@@ -22,6 +22,8 @@ use crate::plan::HostEnv;
 pub struct Spec {
     /// Seconds with no workload before the sandbox stops.
     pub idle_timeout: u64,
+    /// `sandbox.'32-bit'`: 32-bit x86 programs may run.
+    pub allow_32bit: bool,
     /// `None`: no home.
     pub home: Option<Home>,
     /// The device classes that are on.
@@ -877,7 +879,7 @@ impl Spec {
             })
             .collect();
         json!({
-            "sandbox": { "idle-timeout": self.idle_timeout },
+            "sandbox": { "idle-timeout": self.idle_timeout, "32-bit": self.allow_32bit },
             "home": home,
             "devices": devices,
             "dbus": match &self.dbus {
@@ -1157,10 +1159,12 @@ fn parse_config(c: &mut Checker, v: &Value, tasks: &BTreeMap<String, Value>, ctx
 
     // sandbox
     let mut idle_timeout = 60;
+    let mut allow_32bit = false;
     if let Some(v) = get("sandbox")
         && let Some(m) = c.object("sandbox", v)
     {
-        c.known("sandbox", m, &["idle-timeout"]);
+        c.known("sandbox", m, &["idle-timeout", "32-bit"]);
+        allow_32bit = c.bool("sandbox", m, "32-bit", false);
         match m.get("idle-timeout") {
             None => {}
             Some(n) => match n.as_u64() {
@@ -1382,6 +1386,7 @@ fn parse_config(c: &mut Checker, v: &Value, tasks: &BTreeMap<String, Value>, ctx
 
     Spec {
         idle_timeout,
+        allow_32bit,
         home,
         devices,
         dbus,
@@ -1943,6 +1948,7 @@ mod tests {
     fn an_empty_config_gets_the_defaults() {
         let s = parse("{}").unwrap();
         assert_eq!(s.idle_timeout, 60);
+        assert!(!s.allow_32bit);
         assert_eq!(
             s.home,
             Some(Home::Path {
@@ -2012,7 +2018,7 @@ mod tests {
         let p = problems(
             "{ home: { mode: 'temporary', cache: 'persistent' }, dbus: { mode: 'host', talk: ['org.a.B'] },
                xwayland: { mode: 'xwayland-satellite', scale: 'native' }, network: { mode: 'none' },
-               devices+: { webcam: true }, sandbox+: { 'idle-timeout': -1 }, extra: {} }",
+               devices+: { webcam: true }, sandbox+: { 'idle-timeout': -1, '32-bit': 'yes' }, extra: {} }",
         );
         assert!(has(&p, "home.cache", "with mode \"temporary\""), "{p:?}");
         assert!(has(&p, "dbus.talk", "with mode \"host\""), "{p:?}");
@@ -2020,6 +2026,7 @@ mod tests {
         assert!(p.iter().any(|(k, _)| k == "network.mode"), "{p:?}");
         assert!(p.iter().any(|(k, _)| k == "devices.webcam"), "{p:?}");
         assert!(has(&p, "sandbox.idle-timeout", "whole number"), "{p:?}");
+        assert!(has(&p, "sandbox.32-bit", "expected a boolean"), "{p:?}");
         assert!(p.iter().any(|(k, _)| k == "extra"), "{p:?}");
     }
 

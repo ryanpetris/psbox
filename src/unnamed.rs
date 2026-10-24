@@ -95,6 +95,7 @@ fn want(key: &[String]) -> (Want, bool) {
     let k: Vec<&str> = key.iter().map(String::as_str).collect();
     match k.as_slice() {
         ["sandbox", "idle-timeout"] => (Want::Number, false),
+        ["sandbox", "32-bit"] => (Want::Bool, false),
         ["home" | "dbus" | "network" | "display" | "xwayland"] => (Want::Json, true),
         ["home", "path"] => (Want::Path, false),
         [
@@ -367,8 +368,10 @@ mod tests {
             "environment.N=1.0",
             "environment.Q=\"null\"",
             "network.mode=host",
+            "sandbox.32-bit=true",
         ]))
         .unwrap();
+        assert!(s.allow_32bit);
         assert_eq!(
             s.home,
             Some(Home::Path {

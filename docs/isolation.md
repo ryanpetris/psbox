@@ -52,8 +52,14 @@ unmounted to reveal what they cover or remounted read-write.
   module loading and removal, `reboot`, `swapon`/`swapoff`, `acct`,
   `quotactl`, `perf_event_open`, `bpf`, and the terminal-injection ioctls
   `TIOCSTI` and `TIOCLINUX`. On x86_64 the x32 ABI is refused entirely, and
-  any other architecture's system calls kill the process. The sandbox's own
-  PID 1 has the same filter.
+  any other architecture's system calls kill the process, so 32-bit
+  programs cannot run. `sandbox: { '32-bit': true }` admits i386 system
+  calls on x86_64, with the same deny-list. Any process in such a sandbox
+  can then reach the kernel's 32-bit compatibility layer, including the
+  32-bit ioctl translation of every device the sandbox has, which is
+  separate code from the native paths and has a history of its own bugs.
+  It has no effect on aarch64, where 32-bit ARM programs always stay
+  killed. The sandbox's own PID 1 has the same filter.
 
 ## Landlock scopes
 
