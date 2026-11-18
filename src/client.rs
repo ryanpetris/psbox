@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::plan::{HostEnv, Identity, Plan};
-use crate::protocol::{self, NoIdentity, Request, Response, Unidentified};
+use crate::protocol::{self, Hotplug, NoIdentity, Request, Response, Unidentified};
 use crate::spec::Spec;
 use crate::sys::cvt_int;
 use crate::sys::fd::{Seqpacket, poll_readable};
@@ -195,14 +195,13 @@ pub fn run(id: &Identity, app: Option<String>, args: Vec<String>, exec: bool, cr
                         restart_pending,
                         network_fallback,
                         unidentified,
+                        hotplug,
                         ..
                     },
                     _,
                 )) => {
                     let who = ui::paint(ui::BOLD, id.describe());
-                    if network_fallback {
-                        warn_network_fallback(id);
-                    }
+                    warn_limits(id, network_fallback, &hotplug);
                     if let Some(Unidentified { id: app_id, reason }) = unidentified {
                         ui::warning(format!(
                             "{who} runs without a portal identity {}",
@@ -249,20 +248,55 @@ pub fn run(id: &Identity, app: Option<String>, args: Vec<String>, exec: bool, cr
 }
 
 /// Warns that a sandbox with the automatic network uses the host network
-/// because pasta is not installed.
-pub fn warn_network_fallback(id: &Identity) {
-    ui::warning(format!(
-        "{} is using the host network {}",
-        ui::paint(ui::BOLD, id.describe()),
-        ui::paint(ui::DIM, "· pasta isn't installed")
-    ));
-    ui::fix(format!(
-        "install pasta for isolated networking, or {} to silence this",
-        match id {
-            Identity::Unnamed { .. } => format!("pass {}", ui::code("-c network.mode=host")),
-            _ => format!("set {}", ui::code("network: { mode: 'host' }")),
+/// because pasta is not installed, and why apps may not be told about
+/// device changes.
+pub fn warn_limits(id: &Identity, network_fallback: bool, hotplug: &[Hotplug]) {
+    if let Some((message, fix)) = limits(id, network_fallback, hotplug) {
+        ui::warning(message);
+        if let Some(fix) = fix {
+            ui::fix(fix);
         }
-    ));
+    }
+}
+
+/// The warning for [`warn_limits`] and what to do about it. One warning
+/// covers both when the host network is the reason.
+fn limits(id: &Identity, network_fallback: bool, hotplug: &[Hotplug]) -> Option<(String, Option<String>)> {
+    let who = ui::paint(ui::BOLD, id.describe());
+    if network_fallback {
+        // With the host network, `hotplug` is empty or names only that, and
+        // choosing the host network would not silence a device warning.
+        let (reason, fix) = match hotplug.is_empty() {
+            true => (
+                "pasta isn't installed",
+                format!(
+                    "install pasta for isolated networking, or {} to silence this",
+                    match id {
+                        Identity::Unnamed { .. } => format!("pass {}", ui::code("-c network.mode=host")),
+                        _ => format!("set {}", ui::code("network: { mode: 'host' }")),
+                    }
+                ),
+            ),
+            false => (
+                "pasta isn't installed and apps may miss device changes",
+                "install pasta for isolated networking".into(),
+            ),
+        };
+        let message = format!(
+            "{who} is using the host network {}",
+            ui::paint(ui::DIM, format!("· {reason}"))
+        );
+        return Some((message, Some(fix)));
+    }
+    if hotplug.is_empty() {
+        return None;
+    }
+    let reasons: Vec<String> = hotplug.iter().map(|gap| gap.describe()).collect();
+    let message = format!(
+        "apps in {who} may miss device changes {}",
+        ui::paint(ui::DIM, format!("· {}", reasons.join(" and ")))
+    );
+    Some((message, None))
 }
 
 /// Blocks the signals forwarded to the sandboxed process and returns a
@@ -314,7 +348,7 @@ mod tests {
         let (a, b) = Seqpacket::pair().unwrap();
         // A reply from a version whose `Spawned` lacks a field this one has.
         a.send(
-            br#"{"Spawned":{"pid":1,"restart_pending":[],"network_fallback":false}}"#,
+            br#"{"type":"spawned","pid":1,"restart_pending":[],"network_fallback":false,"unidentified":null}"#,
             &[],
         )
         .unwrap();
@@ -326,5 +360,58 @@ mod tests {
         assert_eq!(e.to_string(), "firefox is running an older version of psbox");
         let fixed = e.downcast_ref::<ui::Fixed>().unwrap();
         assert!(fixed.fix.contains("psbox stop firefox"));
+    }
+
+    #[test]
+    fn limits_combine_the_network_fallback_and_device_notifications() {
+        let named = Identity::Instance {
+            sandbox: "firefox".into(),
+            instance: None,
+        };
+        let unnamed = Identity::Unnamed { id: "0".into() };
+        let plain = |id, fallback, hotplug: &[Hotplug]| {
+            limits(id, fallback, hotplug).map(|(message, fix)| (ui::plain(&message), fix.map(|f| ui::plain(&f))))
+        };
+
+        assert_eq!(plain(&named, false, &[]), None);
+        assert_eq!(
+            plain(&named, true, &[]),
+            Some((
+                "firefox is using the host network · pasta isn't installed".into(),
+                Some("install pasta for isolated networking, or set network: { mode: 'host' } to silence this".into())
+            ))
+        );
+        assert!(
+            plain(&unnamed, true, &[])
+                .unwrap()
+                .1
+                .unwrap()
+                .contains("pass -c network.mode=host")
+        );
+        assert_eq!(
+            plain(&named, true, &[Hotplug::HostNetwork]),
+            Some((
+                "firefox is using the host network · pasta isn't installed and apps may miss device changes".into(),
+                Some("install pasta for isolated networking".into())
+            ))
+        );
+        assert_eq!(
+            plain(&named, false, &[Hotplug::HostNetwork]),
+            Some((
+                "apps in firefox may miss device changes · it shares the host network".into(),
+                None
+            ))
+        );
+        assert_eq!(
+            plain(&named, false, &[Hotplug::NoSender]).unwrap().0,
+            "apps in firefox may miss device changes · its device event sender couldn't be set up"
+        );
+        assert_eq!(
+            plain(&named, false, &[Hotplug::NoControl, Hotplug::OldSystemd { major: 249 }]),
+            Some((
+                "apps in firefox may miss device changes · /run/udev/control isn't visible in the sandbox and the host's systemd 249 is older than 252".into(),
+                None
+            ))
+        );
     }
 }

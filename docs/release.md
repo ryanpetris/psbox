@@ -80,11 +80,13 @@ make install DESTDIR="$pkgdir" PREFIX=/usr
 
 ## Tags and workflows
 
-- `.github/workflows/ci.yml` runs `make check` and `make release` on pull
-  requests and pushes to `master` or `main`.
+- `.github/workflows/ci.yml` runs `make check`, `make test/devices`, and
+  `make release` on pull requests and pushes to `master` or `main`. The
+  native device test has its own `ubuntu-24.04` job shared with the release
+  workflow. It checks the kernel, libudev, and namespace prerequisites.
 - `.github/workflows/release.yml` runs on a `v*` tag: it checks that the tag
   is `v` plus `MAJOR.MINOR.PATCH` and sets `PSBOX_VERSION` from it, runs
-  `make check` on the tagged commit, and only when that passes builds the
+  `make check` and `make test/devices` on the tagged commit, then builds the
   archives and the source archive (`make dist`, `make source`),
   the Arch package for x86_64 in an `archlinux` container, and the Debian
   packages for amd64 and arm64 in `debian:13` containers. It publishes all

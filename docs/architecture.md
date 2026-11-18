@@ -129,18 +129,94 @@ swaps the whole tree in the same way; if any part fails, nothing changes.
 
 ## Devices
 
-One inotify watch on `/run/udev/data`: a new or renamed entry means udev has
-finished with the device. Matching devices are attached at
-`/dev/.psbox/c<maj>-<min>` and then published by atomically renaming a
-symlink into place (with their udev symlinks, such as `by-path` links), so
-an app watching `/dev` never sees a half-ready node. The cloned node is
-checked against the expected `st_rdev` before it is attached. Removed
-devices are unpublished the same way. Devices are handled one at a time, so
-the watcher and a config reload never act on the same device at once. A
-device whose links cannot all be created is removed again; if its node
-cannot be detached, the device stays recorded and the next event for it
-tries again; until one succeeds, the sandbox restarts when idle, since the
-node is still reachable.
+The supervisor subscribes to processed host udev events on
+`NETLINK_KOBJECT_UEVENT` multicast group 2 before entering its user
+namespace or enumerating devices. The monitor requires a userspace
+multicast sender and kernel-supplied credentials. The host network
+namespace's kernel requires `CAP_NET_ADMIN` to send to group 2. The
+credential UID can be unmapped in the supervisor's user namespace. The
+monitor ignores block devices and parent events without device nodes.
+
+Each processed character-device event prompts a fresh read of that
+device number. The supervisor checks the current udev database, sysfs,
+the host node, and the configured classes. Failed events can prompt
+withdrawal but cannot publish or add links. The supervisor also checks
+the union of host and recorded keys before accepting clients, after a live
+config reload, and once per batch of malformed, truncated, or lost trusted
+events. The watcher logs the first such batch. These scans are best effort.
+They skip publication while a device has a processing or worker failure
+marker and do not wait for the host udev queue. Udev can write the database
+before it finishes with a device, so a scan can publish a valid node before
+udev has set its final permissions.
+
+The supervisor checks that a cloned node is still the expected character
+device and inode, and rechecks its eligibility before attaching it at
+`/dev/.psbox/c<maj>-<min>`. It publishes the node and its matching host
+aliases before sending add. Udev database entries claim aliases. The
+supervisor exposes a claim only if the host alias resolves to the verified
+node. Unsupported or reserved alias names are skipped. An event can also
+prompt a check of the current target or prior owner of an affected alias.
+A failed hint can withdraw an alias from its prior owner. Changes to an
+input event node also recheck hidraw nodes that depend on its gamepad
+classification.
+Scans restore missing links for the current target. If the device name,
+filesystem, and inode are unchanged and policy still allows the device,
+the supervisor keeps its mount and updates links and cached metadata
+without sending a notification.
+A replacement with the same device number removes the old mount and
+sends remove before attaching the replacement. An absent, invalid, or
+disallowed device is withdrawn. The watcher and config reloads share one
+reconcile lock. Supervisor status uses a snapshot of that state.
+
+The init tries to create a nonblocking, close-on-exec netlink sender in its
+private network namespace. The ready handshake includes the root and device
+mount handles and explicitly reports whether it carries the sender. If
+sender setup fails, init logs the error, and launches and device mounts
+remain available. Init closes its copy before dropping capabilities. The
+supervisor sends through that socket using its capabilities in the owning
+user namespace, without joining the network namespace per event. Apps
+inherit neither the socket nor capabilities. Trusted infrastructure, such
+as pasta and the connector, can also hold capabilities. With private
+networking, init checks `/run/udev/control` after pivoting into the sandbox
+root and reports whether it is visible. If lookup fails, init logs the
+error and reports the path as unavailable. Libudev requires that path to
+subscribe when `/dev` is a private tmpfs. When the sender is available, the
+supervisor logs an unavailable path and still sends to raw netlink listeners.
+Host networking uses neither the sender nor the lookup.
+Private-namespace notifications target libudev 252 or newer. Older versions
+can reject the sender's identity.
+
+Notifications use the 40-byte libudev header, including subsystem and
+device-type hashes and tag bloom bits, followed by NUL-separated properties.
+Generated identity, action, tags, exposed aliases, and a nonzero local
+sequence number describe the published device. The supervisor retains public
+properties from sysfs and the udev database, including `PRODUCT`, `BUSNUM`,
+`LIBINPUT_*`, and `WL_SEAT`, and omits internal properties and event bookkeeping.
+Current sysfs supplies optional identity such as `DEVTYPE` and `DRIVER`.
+`UDEV_DATABASE_VERSION=1` preserves the distinction between `TAGS` and
+`CURRENT_TAGS`. Packets larger than 8192 bytes and all send errors are
+reported. A send failure leaves a valid mount in place. Remove notifications
+use cached metadata even when host sysfs and database records are gone.
+
+Failed link publication rolls back the mount and any links already made.
+The supervisor sends remove only for a device that was fully published
+and whose cleanup succeeded, even if sending its add failed. If cleanup
+fails, the supervisor logs the error, keeps the record, and tries again
+when a later event or scan checks that key. It cannot attach another node
+for that key until cleanup succeeds. A failed detach can leave the old
+device reachable through its hidden mount. Status lists that path once
+the public name has been removed. Open device descriptors may remain
+usable even after a successful detach.
+
+The supervisor logs a watch failure and keeps serving launches and running
+workloads. After the watcher stops, live config reloads can still reconcile
+devices.
+
+The wire format and ordering follow the primary descriptions in
+[systemd's device monitor](https://github.com/systemd/systemd/blob/v252/src/libsystemd/sd-device/device-monitor.c),
+[udev worker](https://github.com/systemd/systemd/blob/main/src/udev/udev-worker.c),
+[Linux device registration](https://github.com/torvalds/linux/blob/master/drivers/base/core.c),
+and [Linux netlink](https://github.com/torvalds/linux/blob/master/net/netlink/af_netlink.c).
 
 ## D-Bus
 
@@ -339,10 +415,13 @@ see the host's `/run/systemd/resolve` for name lookups.
 | `cli.rs`, `ui.rs` | Reporting commands and terminal output |
 | `client.rs`, `unnamed.rs` | The client side of `run`, `task`, and `sandbox` |
 | `jsonnet.rs`, `spec.rs`, `plan.rs` | Evaluating and validating configs; plans and the startup check |
-| `supervisor.rs` | The supervisor: start, spawn, live changes, devices, idle |
+| `supervisor.rs` | Supervisor startup, process launches, live config changes, and idle shutdown |
+| `supervisor/device.rs` | Device mounts, links, and notifications when the published devices change |
 | `root.rs`, `spawn.rs`, `forker.rs`, `inject.rs` | The sandbox root, spawning, and joining the sandbox's namespaces |
 | `sys/` | Namespaces, the mount API, Landlock, seccomp, cgroups, inotify, file descriptors |
 | `bus.rs`, `gateway.rs`, `connector.rs`, `portal.rs`, `identity.rs`, `dbus/` | The private bus, the gateway and its connector, the portal policy, portal identities, and the D-Bus wire format |
-| `devices.rs`, `x11.rs`, `desktop.rs`, `install.rs`, `systemd.rs`, `protocol.rs` | Device classes, Xwayland, desktop entries, the user manager, and the client protocol |
+| `devices.rs`, `devices/udev.rs` | Device discovery and classification, netlink sockets, and the libudev message format |
+| `systemd.rs` | The systemd user manager and host version lookup |
+| `x11.rs`, `desktop.rs`, `install.rs`, `protocol.rs` | Xwayland, desktop entries, and the client protocol |
 | `decorations/` | `psbox decorations`: the Wayland proxy between satellite and the compositor, and the title bars it draws |
 | `fuzz.rs` | Entry points for the fuzz targets (built only for them) |

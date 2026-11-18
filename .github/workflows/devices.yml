@@ -1,0 +1,30 @@
+name: Device integration
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  devices:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check native prerequisites
+        run: |
+          dpkg --compare-versions "$(uname -r | cut -d- -f1)" ge 6.5
+          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libudev1)" ge 252
+          probe=(unshare --map-current-user --keep-caps --net --mount-proc --pid --fork true)
+          if ! "${probe[@]}" && [[ $(sysctl -n kernel.apparmor_restrict_unprivileged_userns) == 1 ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          "${probe[@]}"
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Run native libudev fixture
+        run: make test/devices

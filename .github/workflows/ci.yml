@@ -13,6 +13,9 @@ permissions:
   contents: read
 
 jobs:
+  devices:
+    uses: ./.github/workflows/devices.yml
+
   check:
     name: check
     runs-on: ubuntu-latest

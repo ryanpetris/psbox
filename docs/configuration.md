@@ -203,6 +203,17 @@ runs is published into its `/dev`, and removed when it goes away. `psbox
 devices` lists the devices the classes match; `psbox devices --all` lists
 every device with the IDs `usb` needs.
 
+In a private network namespace, psbox sends a udev notification after it
+publishes or removes a device. On the host network, an app can receive a
+host notification before psbox has published the node. Libudev from
+systemd 251 or older can also ignore psbox notifications. When a device
+class other than `audio` is enabled, `run`, `sandbox`, `task`, and
+`psbox check <sandbox>` warn about host networking or an old systemd
+version detected by `/usr/bin/systemctl --version`. An app that bundles an
+older libudev can miss events even on a newer host. `run`, `sandbox`, and
+`task` also warn when the running sandbox's event sender couldn't be set
+up or `/run/udev/control` isn't visible in it.
+
 The `gamepad` exclusions exist because udev marks some keyboard interfaces
 as joysticks (such as a keyboard's "System Control" interface) and grants
 them `uaccess`. `audio` passes the host sockets through unfiltered:
@@ -218,9 +229,13 @@ modules (see [isolation.md](isolation.md)).
 | `{ mode: 'host' }` | The host network namespace (host abstract sockets stay unreachable) |
 | `null` | Its own network namespace with only loopback |
 
-The automatic fallback warns from `run`, `sandbox`, and `task` (and in the
-sandbox's log): install pasta, or set `network: { mode: 'host' }`. `list`
-and `status` show the mode in use, `host (no pasta)` for the fallback.
+The automatic fallback warns from `run`, `sandbox`, `task`, and
+`psbox check <sandbox>` (and in the sandbox's log): install pasta, or set
+`network: { mode: 'host' }`. With a device class other than `audio` on,
+apps on the host network may also miss device changes
+(see [Devices](#devices)), so the warning says so and suggests only
+installing pasta. `list` and `status` show the mode in use,
+`host (no pasta)` for the fallback.
 
 Use `host` for apps that need the local network or incoming connections:
 LAN discovery (casting, Steam Remote Play), hosting, and logins that

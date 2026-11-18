@@ -133,7 +133,8 @@ A named set of host devices a sandbox may use: `gpu`, `camera`,
 ## Published device
 
 A device node of a granted class made visible in a running sandbox's `/dev`,
-added and removed as the device comes and goes.
+along with its device links. With private networking, psbox notifies
+libudev listeners after publication and after removal.
 
 ## Profile
 

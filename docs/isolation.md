@@ -84,6 +84,15 @@ on each node still apply: a node your session cannot open is no more
 accessible inside. Each node is checked against the expected device number
 before it is published.
 
+With private networking, the supervisor sends a udev add in the sandbox's
+network namespace after it mounts the node and creates its links. It sends
+remove after it unlinks the names and detaches the mount. Apps can listen
+with libudev 252 or newer when `/run/udev/control` is visible. They lack
+the network capability needed to send those multicast messages themselves.
+With host networking, psbox still updates `/dev` and sends no publication
+events. A host udev event reflects host state and can arrive before the
+sandbox node is ready.
+
 ## D-Bus
 
 With the private bus (`dbus.mode: 'portal'`, the default), the sandbox has

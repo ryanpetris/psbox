@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::devices::{self, HostPaths};
 use crate::plan::{HostEnv, Identity, Plan, find_in_path, resolve_network};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Hotplug, Request, Response};
 use crate::spec::{AppSpec, DeviceClass, MountMode, Network, Spec};
 use crate::systemd::{self, Systemd};
 use crate::ui::{self, BOLD, CYAN, Cell, DIM, GREEN, RED, Table, YELLOW, paint};
@@ -806,6 +806,7 @@ pub fn check_sandbox(name: &str) -> Result<i32> {
     // are named once instead of repeating the same report.
     let mut first: Option<Vec<crate::plan::Problem>> = None;
     let mut same = Vec::new();
+    let systemd_major = std::cell::OnceCell::new();
     for id in &ids {
         let checked = Plan::build(id, &spec, &host).and_then(|plan| {
             plan.preflight(id, false)?;
@@ -814,9 +815,12 @@ pub fn check_sandbox(name: &str) -> Result<i32> {
         match checked {
             Ok(plan) => {
                 ui::done(format!("{} can start", paint(BOLD, id.describe())));
-                if plan.network_fallback {
-                    client::warn_network_fallback(id);
-                }
+                // The sender and /run/udev/control are known only once the
+                // sandbox runs, so the check assumes both are there.
+                let hotplug = Hotplug::gaps(!plan.node_classes.is_empty(), plan.network, true, true, || {
+                    *systemd_major.get_or_init(systemd::version_major)
+                });
+                client::warn_limits(id, plan.network_fallback, &hotplug);
             }
             Err(e) => {
                 code = 1;

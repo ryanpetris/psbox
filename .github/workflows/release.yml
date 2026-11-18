@@ -9,6 +9,9 @@ permissions:
   contents: read
 
 jobs:
+  devices:
+    uses: ./.github/workflows/devices.yml
+
   version:
     name: version
     runs-on: ubuntu-latest
@@ -41,7 +44,7 @@ jobs:
 
   archives:
     name: archives
-    needs: [version, check]
+    needs: [version, check, devices]
     runs-on: ubuntu-latest
     env:
       PSBOX_VERSION: ${{ needs.version.outputs.version }}
@@ -66,7 +69,7 @@ jobs:
 
   arch:
     name: arch package
-    needs: [version, check]
+    needs: [version, check, devices]
     runs-on: ubuntu-latest
     container: archlinux:latest
     env:
@@ -92,7 +95,7 @@ jobs:
 
   deb:
     name: debian package (${{ matrix.arch }})
-    needs: [version, check]
+    needs: [version, check, devices]
     strategy:
       matrix:
         include:

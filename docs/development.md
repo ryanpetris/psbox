@@ -25,6 +25,26 @@ cargo-deny`). Both musl targets link with Rust's own `rust-lld`
 manager. After moving the checkout, run it again, and `target/debug/psbox
 install` to rewrite desktop entries that name the old path.
 
+## Native device monitor test
+
+Run `make test/devices` as an ordinary user. The fixture needs Linux 6.5 or
+newer, unprivileged user, PID, mount, and network namespaces, read-write
+access to `/dev/null`, `unshare` with `--keep-caps`, GNU `timeout`, Python 3 with
+`ctypes`, and `libudev.so.1` from systemd 252 or newer. The 6.5 minimum
+applies to this fixture. The distribution packages run the ordinary Cargo
+test suite.
+
+The sender receives a processed event on a private test network, reads
+fixture sysfs and udev records, and publishes a bind mount
+of `/dev/null` as a gamepad. A capability-free libudev monitor opens the
+event node and its alias on add. It checks the subsystem, properties,
+current and historical tags, and the cached remove after detach. A forced
+detach failure leaves the listener running until cleanup succeeds. Separate
+network namespaces keep both directions of test traffic off the host.
+
+This test covers device publication and monitor delivery. Physical input
+and RetroArch controller discovery require a real controller and application.
+
 ## Fuzzing
 
 `fuzz/` is a separate crate (its own workspace) with libFuzzer targets for
@@ -37,6 +57,7 @@ the parsers that read input psbox does not control:
 | `dbus_message` | A D-Bus message from a sandbox client: parsed, its arguments decoded, checked against the portal policy, and encoded again |
 | `desktop_entry` | A host desktop entry, rewritten as `install` does |
 | `wayland_message` | A Wayland request from xwayland-satellite, parsed as `psbox decorations` does and written back |
+| `udev` | A processed udev notification or a device record from the host udev database |
 
 The targets call `psbox::fuzz`, which is compiled only with `--cfg fuzzing`
 (set by cargo-fuzz). With a nightly toolchain and `cargo-fuzz`:

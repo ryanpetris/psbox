@@ -28,8 +28,73 @@ pub struct RootHandles {
     pub dev_rw: OwnedFd,
 }
 
+/// Init's mount handles and any private-network notification support.
+pub struct Ready {
+    pub handles: RootHandles,
+    pub sender: Option<crate::devices::Sender>,
+    pub udev_control: bool,
+}
+
+impl Ready {
+    pub fn send(&self, chan: &Seqpacket) -> Result<()> {
+        let mut fds = vec![self.handles.root_rw.as_fd(), self.handles.dev_rw.as_fd()];
+        if let Some(sender) = &self.sender {
+            fds.push(sender.0.as_fd());
+        }
+        let msg: &[u8] = match (self.sender.is_some(), self.udev_control) {
+            (false, false) => b"ready",
+            (false, true) => b"ready:udev",
+            (true, false) => b"ready:sender",
+            (true, true) => b"ready:sender:udev",
+        };
+        chan.send(msg, &fds)?;
+        Ok(())
+    }
+
+    pub fn receive(chan: &Seqpacket, private_network: bool) -> Result<Self> {
+        let mut buf = [0u8; 4096];
+        let (n, mut fds) = chan.recv(&mut buf)?.context("sandbox init exited during setup")?;
+        let msg = std::str::from_utf8(&buf[..n]).context("invalid init reply")?;
+        let (has_sender, udev_control) = match msg {
+            "ready" => (false, false),
+            "ready:udev" => (false, true),
+            "ready:sender" => (true, false),
+            "ready:sender:udev" => (true, true),
+            _ => anyhow::bail!("sandbox init failed: {}", msg.strip_prefix("error: ").unwrap_or(msg)),
+        };
+        if (!private_network && (has_sender || udev_control)) || fds.len() != 2 + usize::from(has_sender) {
+            anyhow::bail!("invalid sandbox init ready reply");
+        }
+        let sender = if has_sender {
+            Some(crate::devices::Sender(fds.pop().expect("three descriptors")))
+        } else {
+            None
+        };
+        let dev_rw = fds.pop().expect("two mount descriptors");
+        let root_rw = fds.pop().expect("root descriptor");
+        Ok(Self {
+            handles: RootHandles { root_rw, dev_rw },
+            sender,
+            udev_control,
+        })
+    }
+}
+
 /// Device nodes every sandbox gets.
 const BASE_NODES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
+const DEV_DIRS: [&str; 3] = ["pts", "shm", ".psbox"];
+const DEV_LINKS: [(&str, &str); 5] = [
+    ("ptmx", "pts/ptmx"),
+    ("fd", "/proc/self/fd"),
+    ("stdin", "/proc/self/fd/0"),
+    ("stdout", "/proc/self/fd/1"),
+    ("stderr", "/proc/self/fd/2"),
+];
+
+pub fn reserved_dev_name(name: &str) -> bool {
+    let first = name.split('/').next().expect("first path component");
+    BASE_NODES.contains(&first) || DEV_DIRS.contains(&first) || DEV_LINKS.iter().any(|(name, _)| *name == first)
+}
 
 fn rel(dst: &Path) -> &Path {
     dst.strip_prefix("/").unwrap_or(dst)
@@ -209,7 +274,7 @@ fn dev(root: std::os::fd::BorrowedFd<'_>, new_root: &Path, dst: &Path) -> Result
             make_point(dev.as_fd(), Path::new(node), PointKind::File)?.as_fd(),
         )?;
     }
-    for dir in ["pts", "shm", ".psbox"] {
+    for dir in DEV_DIRS {
         fs::create_dir(dev_path.join(dir))?;
     }
     let pts = FsContext::new("devpts")?;
@@ -219,13 +284,7 @@ fn dev(root: std::os::fd::BorrowedFd<'_>, new_root: &Path, dst: &Path) -> Result
     attach(pts.as_fd(), open_dir(&dev_path.join("pts"))?.as_fd())?;
     let shm = tmpfs(0o1777, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
     attach(shm.as_fd(), open_dir(&dev_path.join("shm"))?.as_fd())?;
-    for (name, target) in [
-        ("ptmx", "pts/ptmx"),
-        ("fd", "/proc/self/fd"),
-        ("stdin", "/proc/self/fd/0"),
-        ("stdout", "/proc/self/fd/1"),
-        ("stderr", "/proc/self/fd/2"),
-    ] {
+    for (name, target) in DEV_LINKS {
         symlink(target, dev_path.join(name))?;
     }
 
@@ -250,23 +309,47 @@ pub fn run_init(plan: &Plan, new_root: &Path, chan: Seqpacket) -> ! {
     // and the same Landlock domain and seccomp filter as they do.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
     let log = |what: &str, e: &dyn std::fmt::Display| eprintln!("psbox[{}]: init: {what}: {e}", plan.key);
-    let setup = || -> Result<RootHandles> {
+    let setup = || -> Result<Ready> {
+        let private_network = plan.network != Network::Host;
         let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWIPC;
-        if plan.network != Network::Host {
+        if private_network {
             flags |= libc::CLONE_NEWNET;
         }
         ns::unshare(flags).context("unshare namespaces")?;
-        if plan.network != Network::Host {
+        if private_network {
             loopback_up().context("bring up loopback")?;
         }
         ns::set_propagation(Path::new("/"), libc::MS_PRIVATE).context("make / private")?;
+        let sender = if private_network {
+            match crate::devices::Sender::new() {
+                Ok(sender) => Some(sender),
+                Err(e) => {
+                    log("create private udev sender", &e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let handles = build(plan, new_root)?;
         ns::pivot_into(new_root).context("pivot_root")?;
-        Ok(handles)
+        let udev_control = private_network
+            && match Path::new("/run/udev/control").try_exists() {
+                Ok(exists) => exists,
+                Err(e) => {
+                    log("check sandbox udev control path", &e);
+                    false
+                }
+            };
+        Ok(Ready {
+            handles,
+            sender,
+            udev_control,
+        })
     };
     match setup() {
         Ok(h) => {
-            if let Err(e) = chan.send(b"ready", &[h.root_rw.as_fd(), h.dev_rw.as_fd()]) {
+            if let Err(e) = h.send(&chan) {
                 log("report ready", &e);
                 std::process::exit(1);
             }
@@ -319,5 +402,92 @@ fn reap() -> ! {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             libc::sigwaitinfo(&set, &mut info);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn ready_handshake_preserves_handles_notification_facts_and_cloexec() {
+        for (private, sender, control) in [
+            (false, false, false),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let handles = RootHandles {
+                root_rw: fs::File::open("/").unwrap().into(),
+                dev_rw: fs::File::open("/dev").unwrap().into(),
+            };
+            let ready = Ready {
+                handles,
+                sender: sender.then(|| crate::devices::Sender(fs::File::open("/dev/null").unwrap().into())),
+                udev_control: control,
+            };
+            let (a, b) = Seqpacket::pair().unwrap();
+            ready.send(&a).unwrap();
+            let received = Ready::receive(&b, private).unwrap();
+            assert_eq!(received.udev_control, control);
+            assert_eq!(received.sender.is_some(), sender);
+            let mounts = [
+                (ready.handles.root_rw.as_fd(), received.handles.root_rw.as_fd()),
+                (ready.handles.dev_rw.as_fd(), received.handles.dev_rw.as_fd()),
+            ];
+            let sender_fds = ready
+                .sender
+                .as_ref()
+                .zip(received.sender.as_ref())
+                .map(|(source, dest)| (source.0.as_fd(), dest.0.as_fd()));
+            for (source, dest) in mounts.into_iter().chain(sender_fds) {
+                let a = fs::File::from(source.try_clone_to_owned().unwrap()).metadata().unwrap();
+                let b = fs::File::from(dest.try_clone_to_owned().unwrap()).metadata().unwrap();
+                assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+                // SAFETY: F_GETFD reads flags of a live descriptor.
+                assert_ne!(
+                    unsafe { libc::fcntl(dest.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ready_handshake_validates_flags_and_exact_fd_count() {
+        let file = fs::File::open("/dev/null").unwrap();
+        for private in [false, true] {
+            for (msg, expected_count) in [
+                ("ready", Some(2)),
+                ("ready:udev", private.then_some(2)),
+                ("ready:sender", private.then_some(3)),
+                ("ready:sender:udev", private.then_some(3)),
+                ("ready:udev:sender", None),
+                ("ready:sender:sender", None),
+                ("ready:unknown", None),
+            ] {
+                for count in 0..=4 {
+                    let (a, b) = Seqpacket::pair().unwrap();
+                    a.send(msg.as_bytes(), &vec![file.as_fd(); count]).unwrap();
+                    assert_eq!(
+                        Ready::receive(&b, private).is_ok(),
+                        expected_count == Some(count),
+                        "{msg}, {count} descriptors, private network {private}"
+                    );
+                }
+            }
+        }
+        let (a, b) = Seqpacket::pair().unwrap();
+        a.send(b"error: root setup failed", &[]).unwrap();
+        assert!(
+            Ready::receive(&b, true)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("root setup failed")
+        );
     }
 }

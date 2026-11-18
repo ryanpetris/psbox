@@ -46,10 +46,9 @@ confirms each one (see [configuration.md](configuration.md#paths)). Other
 sources are never created; the startup check says so when `--create-dirs`
 was given.
 
-`run`, `task`, and `sandbox` print nothing of their own (stdio belongs to
-the command), only warnings: a sandbox on the host-network fallback, one
-still running an older config, or an app running without a portal
-identity.
+`run`, `task`, and `sandbox` leave stdout to the command. Warnings on
+stderr cover the host-network fallback, [device hotplug limitations](configuration.md#devices),
+a sandbox still running an older config, and apps running without a portal identity.
 
 ## The startup check
 

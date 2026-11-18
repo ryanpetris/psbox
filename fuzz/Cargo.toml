@@ -49,3 +49,10 @@ path = "fuzz_targets/wayland_message.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "udev"
+path = "fuzz_targets/udev.rs"
+test = false
+doc = false
+bench = false

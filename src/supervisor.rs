@@ -7,20 +7,22 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::bus;
 use crate::connector::Connector;
-use crate::devices::{self, Change, HostPaths};
+use crate::devices::{self, HostPaths};
 use crate::forker::Forker;
 use crate::gateway::{self, Gateway};
 use crate::inject;
 use crate::plan::{HostEnv, Identity, Mount, PORTAL_ENV, Plan, client_env_allowed};
 use crate::portal::Policy;
-use crate::protocol::{self, LiveMount, NoIdentity, Process, PublishedDevice, Request, Response, Status, Unidentified};
+use crate::protocol::{
+    self, Hotplug, LiveMount, NoIdentity, Process, PublishedDevice, Request, Response, Status, Unidentified,
+};
 use crate::root;
 use crate::spawn::{self, Exit, SpawnJob};
 use crate::spec::{DbusMode, DeviceClass, MountMode, Network, Spec, XwaylandMode};
@@ -31,6 +33,9 @@ use crate::sys::{self, cvt_int, landlock, mount, ns, path_cstr, process, seccomp
 use crate::systemd::{self, Systemd};
 use crate::x11;
 
+mod device;
+use device::{DeviceEvents, DeviceState};
+
 /// How long an unnamed sandbox or task waits for its first command once its
 /// client has gone.
 const UNSERVED_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,16 +45,6 @@ struct Prepared {
     tree: OwnedFd,
     dst: PathBuf,
     kind: PointKind,
-}
-
-#[derive(Clone)]
-struct Published {
-    names: Vec<String>,
-    hidden: String,
-    classes: Vec<String>,
-    /// All links are in place. A device whose publishing failed and could
-    /// not be undone stays recorded as incomplete until it is cleaned up.
-    complete: bool,
 }
 
 /// One launch: what it ran under, while its cgroup exists.
@@ -64,7 +59,8 @@ struct Launch {
 struct State {
     clients: usize,
     mounts: Vec<LiveMount>,
-    devices: BTreeMap<(u32, u32), Published>,
+    /// Display snapshot; mount ownership lives under the reconcile lock.
+    devices: Vec<PublishedDevice>,
     /// Processes started for an app (host pid -> app name).
     spawned: HashMap<i32, String>,
     /// Launches by number (`workload/launch-<n>`).
@@ -77,10 +73,8 @@ struct State {
     /// Why the sandbox needs a restart: config changes that cannot apply
     /// live, and the entries of `unapplied`. The sandbox stops when idle.
     pending_restart: Vec<String>,
-    /// Changes the supervisor could not make: mounts a reload failed to
-    /// apply, and devices it could not remove. The running sandbox no
-    /// longer matches its plan, so each stays a restart reason until the
-    /// sandbox stops or, for a device, a later attempt removes it.
+    /// Mounts a reload failed to apply. Each stays a restart reason until
+    /// the sandbox stops.
     unapplied: Vec<String>,
     /// Forwarded host sockets currently attached (sandbox paths).
     sockets: HashSet<PathBuf>,
@@ -97,6 +91,13 @@ struct Supervisor {
     init_pidfd: OwnedFd,
     root_rw: OwnedFd,
     dev_rw: OwnedFd,
+    device_events: Mutex<DeviceEvents>,
+    device_sender_present: bool,
+    /// libudev checks this path before subscribing when /dev is not devtmpfs.
+    udev_control_visible: bool,
+    /// The host's systemd major version, asked for on the first launch
+    /// that needs it.
+    systemd_major: OnceLock<Option<u32>>,
     seccomp: Vec<libc::sock_filter>,
     state: Mutex<State>,
     /// Held while the sandbox's mounts change (live mounts, config reloads,
@@ -105,10 +106,9 @@ struct Supervisor {
     mounting: Mutex<()>,
     /// Opens the gateway's host bus connections; started on first use.
     connector: Mutex<Option<Connector>>,
-    /// Held while one device is reconciled, so the device watcher and
-    /// config reloads never publish or remove the same device at once, and
-    /// a reload's reconcile sees what the watcher did with the old plan.
-    reconciling: Mutex<()>,
+    /// Serializes the device watcher and config reloads, and owns the
+    /// mount records they reconcile.
+    reconciling: Mutex<DeviceState>,
     started: std::time::SystemTime,
     /// The X display number, when the sandbox has Xwayland.
     display: Option<u32>,
@@ -199,6 +199,14 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
 
     let cg = Cgroups::setup()?;
 
+    let device_watcher = match devices::Watcher::new() {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            eprintln!("psbox[{name}]: cannot watch processed host udev events: {e}");
+            None
+        }
+    };
+
     ns::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS).context("unshare")?;
     ns::write_self_maps(host.uid, host.gid).context("write id maps")?;
     ns::set_propagation(Path::new("/"), libc::MS_SLAVE).context("make / a slave")?;
@@ -214,6 +222,7 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         Some(c) => c,
         None => {
             drop(sup_end);
+            drop(device_watcher);
             // SAFETY: the init never returns to code that uses the listener.
             unsafe { libc::close(listener.as_raw_fd()) };
             root::run_init(&plan, &new_root, init_end);
@@ -225,16 +234,13 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
     if !poll_readable(&[sup_end.as_fd()], 15_000)?[0] {
         bail!("sandbox init did not report within 15s");
     }
-    let mut buf = [0u8; 4096];
-    let (n, mut fds) = sup_end
-        .recv(&mut buf)?
-        .ok_or_else(|| anyhow!("sandbox init exited during setup"))?;
-    let msg = String::from_utf8_lossy(&buf[..n]).into_owned();
-    if msg != "ready" || fds.len() != 2 {
-        bail!("sandbox init failed: {}", msg.strip_prefix("error: ").unwrap_or(&msg));
+    let ready = root::Ready::receive(&sup_end, plan.network != Network::Host)?;
+    let root::RootHandles { root_rw, dev_rw } = ready.handles;
+    let device_sender_present = ready.sender.is_some();
+    let udev_control_visible = ready.udev_control;
+    if device_sender_present && !udev_control_visible {
+        eprintln!("psbox[{name}]: /run/udev/control is absent in the sandbox; libudev monitors may not subscribe");
     }
-    let dev_rw = fds.pop().expect("two fds");
-    let root_rw = fds.pop().expect("two fds");
 
     let forker = Forker::start(init_pidfd.as_raw_fd()).context("start forker thread")?;
     let seccomp = seccomp::program(plan.allow_32bit);
@@ -248,16 +254,21 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         init_pidfd,
         root_rw,
         dev_rw,
+        device_events: Mutex::new(DeviceEvents::new(ready.sender)),
+        device_sender_present,
+        udev_control_visible,
+        systemd_major: OnceLock::new(),
         seccomp,
         state: Mutex::new(State::default()),
         mounting: Mutex::new(()),
         connector: Mutex::new(None),
-        reconciling: Mutex::new(()),
+        reconciling: Mutex::new(DeviceState::default()),
         started: std::time::SystemTime::now(),
         display,
         bus_identity: Mutex::new(None),
         config_json: Mutex::new(config_json),
     });
+    sup.update_devices(&HostPaths::system(), None);
     eprintln!("psbox[{name}]: sandbox ready (init pid {pid})");
 
     {
@@ -268,9 +279,9 @@ fn start(id: &Identity, listener: &Seqpacket) -> Result<()> {
         let s = sup.clone();
         std::thread::spawn(move || s.watch_idle());
     }
-    {
+    if let Some(watcher) = device_watcher {
         let s = sup.clone();
-        std::thread::spawn(move || s.watch_devices());
+        std::thread::spawn(move || s.watch_devices(watcher));
     }
     if sup.plan().bus.is_some() {
         sup.start_bus().context("start session bus")?;
@@ -477,6 +488,7 @@ impl Supervisor {
         } else {
             PathBuf::from("/")
         };
+        let hotplug = self.hotplug(&plan);
         let n = {
             let mut st = self.state.lock().unwrap();
             st.next_launch += 1;
@@ -533,8 +545,9 @@ impl Supervisor {
             &Response::Spawned {
                 pid: child.pid,
                 restart_pending,
-                network_fallback: self.plan().network_fallback,
+                network_fallback: plan.network_fallback,
                 unidentified,
+                hotplug,
             },
             &[],
         )?;
@@ -811,6 +824,17 @@ impl Supervisor {
         )?;
         eprintln!("psbox[{}]: started decorations (pid {})", self.key(), child.pid);
         Ok(Some(child))
+    }
+
+    /// Why apps may miss device changes under the launch's plan.
+    fn hotplug(&self, plan: &Plan) -> Vec<Hotplug> {
+        Hotplug::gaps(
+            !plan.node_classes.is_empty(),
+            plan.network,
+            self.device_sender_present,
+            self.udev_control_visible,
+            || *self.systemd_major.get_or_init(systemd::version_major),
+        )
     }
 
     /// Starts `pasta` attached to the sandbox's network namespace: outbound
@@ -1130,7 +1154,6 @@ impl Supervisor {
                 }
             }
         }
-        let classes_changed = old.node_classes != new.node_classes;
         *self.plan.write().unwrap() = Arc::new(new);
 
         // Live mounts (`psbox mount`, the file chooser) beneath a detached
@@ -1166,9 +1189,7 @@ impl Supervisor {
             st.unapplied.extend(failed);
             st.pending_restart = st.unapplied.clone();
         }
-        if classes_changed {
-            self.reconcile_all(&HostPaths::system());
-        }
+        self.update_devices(&HostPaths::system(), None);
         if change.is_empty() {
             eprintln!("psbox[{}]: config reloaded", self.key());
         } else {
@@ -1482,15 +1503,7 @@ impl Supervisor {
             process_count: procs.len(),
             clients: state.clients,
             mounts: state.mounts.clone(),
-            devices: state
-                .devices
-                .values()
-                .map(|p| PublishedDevice {
-                    node: p.names[0].clone(),
-                    links: p.names[1..].to_vec(),
-                    classes: p.classes.clone(),
-                })
-                .collect(),
+            devices: state.devices.clone(),
         }
     }
 
@@ -1584,171 +1597,6 @@ impl Supervisor {
             let _ = Systemd::connect().and_then(|s| s.stop(&systemd::socket_unit(&self.key())));
         }
         std::process::exit(code)
-    }
-
-    fn watch_devices(&self) {
-        let host = HostPaths::system();
-        let watcher = match devices::Watcher::new(&host) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("psbox[{}]: cannot watch {}: {e}", self.key(), host.udev_data.display());
-                return;
-            }
-        };
-        self.reconcile_all(&host);
-        loop {
-            let changes = match watcher.next() {
-                Ok(c) => c,
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                Err(e) => {
-                    eprintln!("psbox[{}]: device watch failed: {e}", self.key());
-                    return;
-                }
-            };
-            for change in changes {
-                match change {
-                    Change::Updated(maj, min) | Change::Removed(maj, min) => self.reconcile(&host, maj, min),
-                    Change::Rescan => self.reconcile_all(&host),
-                }
-            }
-        }
-    }
-
-    fn reconcile_all(&self, host: &HostPaths) {
-        let mut keys = devices::scan(host);
-        keys.extend(self.state.lock().unwrap().devices.keys().copied());
-        keys.sort();
-        keys.dedup();
-        for (maj, min) in keys {
-            self.reconcile(host, maj, min);
-        }
-    }
-
-    /// Publishes or unpublishes one device so `/dev` matches the host and
-    /// the configured classes.
-    fn reconcile(&self, host: &HostPaths, maj: u32, min: u32) {
-        let _reconciling = self.reconciling.lock().unwrap();
-        let dev = devices::read_device(host, maj, min);
-        let classes = dev
-            .as_ref()
-            .map(|d| devices::classify(d, &self.plan().node_classes))
-            .unwrap_or_default();
-        // A failed publish is cleaned up before anything else.
-        let incomplete = self
-            .state
-            .lock()
-            .unwrap()
-            .devices
-            .get(&(maj, min))
-            .is_some_and(|p| !p.complete);
-        if incomplete && let Err(e) = self.unpublish(maj, min) {
-            eprintln!("psbox[{}]: device {maj}:{min}: {e:#}", self.key());
-            return;
-        }
-        let published = self.state.lock().unwrap().devices.contains_key(&(maj, min));
-        let r = match (dev, classes.is_empty(), published) {
-            (Some(d), false, false) => self.publish(&d, &classes),
-            (_, true, true) | (None, _, true) => self.unpublish(maj, min),
-            _ => Ok(()),
-        };
-        if let Err(e) = r {
-            eprintln!("psbox[{}]: device {maj}:{min}: {e:#}", self.key());
-        }
-    }
-
-    fn publish(&self, dev: &devices::Device, classes: &[crate::spec::DeviceClass]) -> Result<()> {
-        let node = devices::host_node(dev);
-        let tree = mount::clone_tree(&node, false).with_context(|| format!("clone {}", node.display()))?;
-        // The node must be the device udev described, not a replacement.
-        // SAFETY: fstat on a valid fd into a local buffer.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        cvt_int(unsafe { libc::fstat(tree.as_raw_fd(), &mut st) })?;
-        if st.st_mode & libc::S_IFMT != libc::S_IFCHR || st.st_rdev != libc::makedev(dev.major, dev.minor) {
-            bail!("{} is not character device {}:{}", node.display(), dev.major, dev.minor);
-        }
-        mount::set_attr_fd(tree.as_fd(), false, MOUNT_ATTR_NOSUID, 0)?;
-
-        let hidden = devices::hidden_name(dev.major, dev.minor);
-        let hidden_rel = Path::new(".psbox").join(&hidden);
-        mount::make_point(self.dev_rw.as_fd(), &hidden_rel, PointKind::File)?;
-        inject::attach(
-            self.init_pidfd.as_fd(),
-            tree.as_fd(),
-            &Path::new("/dev").join(&hidden_rel),
-        )
-        .context("attach node")?;
-
-        // Recorded as soon as the node is attached, so a failure from here
-        // on can always be undone by `unpublish`.
-        let mut names = vec![dev.devname.clone()];
-        names.extend(dev.links.iter().cloned());
-        let class_names: Vec<String> = classes.iter().map(|c| c.to_string()).collect();
-        self.state.lock().unwrap().devices.insert(
-            (dev.major, dev.minor),
-            Published {
-                names: names.clone(),
-                hidden: hidden.clone(),
-                classes: class_names.clone(),
-                complete: false,
-            },
-        );
-        for name in &names {
-            if let Err(e) = publish_link(self.dev_rw.as_fd(), name, &devices::link_target(name, &hidden)) {
-                if let Err(undo) = self.unpublish(dev.major, dev.minor) {
-                    eprintln!("psbox[{}]: device {}:{}: {undo:#}", self.key(), dev.major, dev.minor);
-                }
-                return Err(e).with_context(|| format!("link /dev/{name}"));
-            }
-        }
-        if let Some(p) = self.state.lock().unwrap().devices.get_mut(&(dev.major, dev.minor)) {
-            p.complete = true;
-        }
-        eprintln!(
-            "psbox[{}]: published /dev/{} ({})",
-            self.key(),
-            dev.devname,
-            class_names.join(", ")
-        );
-        Ok(())
-    }
-
-    /// Removes a published (or partly published) device. Its record stays
-    /// until the node is detached: if that fails, the next event for the
-    /// device tries again, and the sandbox stops when idle, since the node
-    /// is still reachable.
-    fn unpublish(&self, maj: u32, min: u32) -> Result<()> {
-        let Some(p) = self.state.lock().unwrap().devices.get_mut(&(maj, min)).map(|p| {
-            // From here on the links are going: if the node stays, the
-            // next reconcile cleans up before it decides anything.
-            p.complete = false;
-            p.clone()
-        }) else {
-            return Ok(());
-        };
-        for name in &p.names {
-            let _ = unlink_if_ours(self.dev_rw.as_fd(), name, &devices::link_target(name, &p.hidden));
-        }
-        let hidden_rel = Path::new(".psbox").join(&p.hidden);
-        let reason = format!("removing /dev/{} ({maj}:{min})", p.names[0]);
-        if let Err(e) = inject::detach(self.init_pidfd.as_fd(), &Path::new("/dev").join(&hidden_rel)) {
-            let mut st = self.state.lock().unwrap();
-            if !st.unapplied.contains(&reason) {
-                st.unapplied.push(reason.clone());
-                st.pending_restart.push(reason);
-            }
-            return Err(e).context("detach node");
-        }
-        {
-            let mut st = self.state.lock().unwrap();
-            st.devices.remove(&(maj, min));
-            st.unapplied.retain(|r| *r != reason);
-            st.pending_restart.retain(|r| *r != reason);
-        }
-        let c = path_cstr(&hidden_rel)?;
-        // SAFETY: valid dirfd and path.
-        unsafe { libc::unlinkat(self.dev_rw.as_raw_fd(), c.as_ptr(), 0) };
-        eprintln!("psbox[{}]: removed /dev/{}", self.key(), p.names[0]);
-        Ok(())
     }
 }
 
@@ -2004,46 +1852,6 @@ impl ConfigWatch {
         }
         relevant
     }
-}
-
-/// Atomically creates or replaces `/dev/<name>` as a symlink to `target`.
-/// The device is already attached at the target, so the first event an app
-/// sees for `name` refers to a working node.
-fn publish_link(dev: BorrowedFd<'_>, name: &str, target: &str) -> io::Result<()> {
-    let path = Path::new(name);
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        mount::make_point(dev, parent, PointKind::Dir)?;
-    }
-    let tmp = path_cstr(&Path::new(".psbox").join(format!(".link-{}", name.replace('/', "_"))))?;
-    let target = path_cstr(Path::new(target))?;
-    let dst = path_cstr(path)?;
-    // SAFETY: valid dirfd and C strings.
-    unsafe {
-        libc::unlinkat(dev.as_raw_fd(), tmp.as_ptr(), 0);
-        cvt_int(libc::symlinkat(target.as_ptr(), dev.as_raw_fd(), tmp.as_ptr()))?;
-        cvt_int(libc::renameat(
-            dev.as_raw_fd(),
-            tmp.as_ptr(),
-            dev.as_raw_fd(),
-            dst.as_ptr(),
-        ))?;
-    }
-    Ok(())
-}
-
-fn unlink_if_ours(dev: BorrowedFd<'_>, name: &str, target: &str) -> io::Result<()> {
-    let c = path_cstr(Path::new(name))?;
-    let mut buf = [0u8; 4096];
-    // SAFETY: reading the link into a local buffer.
-    let n = unsafe { libc::readlinkat(dev.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if &buf[..n as usize] == target.as_bytes() {
-        // SAFETY: valid dirfd and path.
-        cvt_int(unsafe { libc::unlinkat(dev.as_raw_fd(), c.as_ptr(), 0) })?;
-    }
-    Ok(())
 }
 
 impl gateway::Host for Supervisor {

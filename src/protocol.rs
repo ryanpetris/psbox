@@ -84,19 +84,83 @@ impl NoIdentity {
     }
 }
 
+/// Why apps in a sandbox with device classes backed by `/dev` nodes may not
+/// be told when the supervisor publishes or removes a device. libudev
+/// learns about devices from netlink messages the supervisor sends in the
+/// sandbox's own network namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Hotplug {
+    /// The sandbox shares the host network, where the supervisor sends
+    /// nothing.
+    HostNetwork,
+    /// The supervisor has no sender in the sandbox's network.
+    NoSender,
+    /// `/run/udev/control` is not visible in the sandbox, and libudev
+    /// monitors need it to subscribe.
+    NoControl,
+    /// The detected host systemd version predates libudev's support for
+    /// notifications from the same user.
+    OldSystemd { major: u32 },
+}
+
+impl Hotplug {
+    /// What keeps device notifications from apps: `nodes` says whether a
+    /// device class backed by `/dev` nodes is on, `sender` and `control`
+    /// what the sandbox init reported, and `systemd` gives the host's
+    /// systemd major version, asked for only when it matters.
+    pub fn gaps(
+        nodes: bool,
+        network: Network,
+        sender: bool,
+        control: bool,
+        systemd: impl FnOnce() -> Option<u32>,
+    ) -> Vec<Hotplug> {
+        if !nodes {
+            return Vec::new();
+        }
+        if network == Network::Host {
+            return vec![Hotplug::HostNetwork];
+        }
+        if !sender {
+            return vec![Hotplug::NoSender];
+        }
+        let mut gaps = Vec::new();
+        if !control {
+            gaps.push(Hotplug::NoControl);
+        }
+        if let Some(major) = systemd().filter(|&major| major < 252) {
+            gaps.push(Hotplug::OldSystemd { major });
+        }
+        gaps
+    }
+
+    /// Why apps may miss device changes, as a sentence fragment.
+    pub fn describe(self) -> String {
+        match self {
+            Hotplug::HostNetwork => "it shares the host network".into(),
+            Hotplug::NoSender => "its device event sender couldn't be set up".into(),
+            Hotplug::NoControl => "/run/udev/control isn't visible in the sandbox".into(),
+            Hotplug::OldSystemd { major } => format!("the host's systemd {major} is older than 252"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Response {
     /// `restart_pending` lists what waits for a restart (config changes that
-    /// cannot apply live, and mounts or devices that could not be changed);
+    /// cannot apply live, and mounts that could not be changed);
     /// `network_fallback` is set when the sandbox uses the host network
     /// only because pasta is not installed; `unidentified` is set when a
-    /// launch with an app id runs without a portal identity.
+    /// launch with an app id runs without a portal identity; `hotplug`
+    /// says why apps may miss device changes.
     Spawned {
         pid: i32,
         restart_pending: Vec<String>,
         network_fallback: bool,
         unidentified: Option<Unidentified>,
+        hotplug: Vec<Hotplug>,
     },
     Exited {
         code: Option<i32>,
@@ -173,6 +237,37 @@ pub fn recv<T: DeserializeOwned>(sock: &Seqpacket) -> io::Result<Option<(T, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotplug_gaps_need_node_classes_and_name_the_first_cause() {
+        let probed = std::cell::Cell::new(false);
+        let gaps = |nodes, network, sender, control, major: Option<u32>| {
+            Hotplug::gaps(nodes, network, sender, control, || {
+                probed.set(true);
+                major
+            })
+        };
+
+        assert!(gaps(false, Network::Host, false, false, Some(249)).is_empty());
+        assert_eq!(
+            gaps(true, Network::Host, false, false, Some(249)),
+            [Hotplug::HostNetwork]
+        );
+        assert_eq!(
+            gaps(true, Network::Isolated, false, false, Some(249)),
+            [Hotplug::NoSender]
+        );
+        assert!(!probed.get());
+
+        assert_eq!(
+            gaps(true, Network::Loopback, true, false, Some(251)),
+            [Hotplug::NoControl, Hotplug::OldSystemd { major: 251 }]
+        );
+        assert_eq!(gaps(true, Network::Isolated, true, false, None), [Hotplug::NoControl]);
+        assert!(gaps(true, Network::Isolated, true, true, Some(252)).is_empty());
+        assert!(gaps(true, Network::Isolated, true, true, None).is_empty());
+        assert!(probed.get());
+    }
 
     #[test]
     fn round_trip_with_fds() {

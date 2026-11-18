@@ -121,3 +121,8 @@ pub fn wayland_message(data: &[u8]) {
         rest = &rest[size..];
     }
 }
+
+/// Processed udev packets and host database records.
+pub fn udev(data: &[u8]) {
+    crate::devices::fuzz(data);
+}
